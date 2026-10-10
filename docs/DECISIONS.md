@@ -110,3 +110,22 @@ Newest entries go at the bottom. Each entry records what was decided, why, and w
    - `DiagnosticKind` and `Strictness` serialize as camelCase.
 10. **Fixtures:** they are generated deterministically by `folioxide-testkit`, with offsets relative to the `%PDF-` header. `cargo xtask fixtures --check` is part of `cargo xtask ci`.
 11. **Oracle `objectCount`:** our count is the in-use ids from the merged xref that resolve to non-null objects. pikepdf's count is `len(pdf.objects)` minus nulls, because qpdf lists objects that an older revision used and a newer revision freed.
+
+## D10: M3 signature design decisions (expert proposal, accepted by the manager, 2026-10-10)
+All 19 open decisions in `docs/milestones/M3.md` §8 (D-1 … D-19) are accepted as recommended. The most important:
+1. **Reference validator:** pyHanko 0.37.0, with openssl cms and poppler pdfsig as secondary oracles. Our modification level is **never more lenient than pyHanko**. The cases where we are deliberately stricter are listed in M3 §0 and in the test table `DELIBERATE_DIFFERENCES` (D-9).
+2. **Vocabulary:** `Coverage` and `ModificationLevel` use pyHanko's names (D-4). ARCHITECTURE §A.6.7 is updated after M3.
+3. **Refusals:** signing is refused for files with junk before the header (D-2), for `structure_repaired()` files (D9.4/D9.8; a full save comes first), and for certified documents with P=1 (D-14). `/Lock` and required `/SV` are `Unsupported` (D-13).
+4. **Signing details:**
+   - RSA blinding uses a default-on `sys-rng` feature (getrandom `SysRng`), with an override `LocalSigner::with_rng` (D-1).
+   - `/Contents` sizing is exact rather than a heuristic, with a minimum of 8192 bytes (D-7).
+   - RSA keys: ≥ 2048 bits to sign, ≥ 1024 bits to verify (D-12).
+5. **Verification details:**
+   - The signer key usage must contain digitalSignature **or** nonRepudiation (D-10; pyHanko requires nonRepudiation).
+   - Trust path building is part of M3 (D-16).
+   - `verify` with pending edits gives `InvalidArgument` (D-8).
+6. **The oracle runner gains `rejected: true`** for negative signature cases (D-3; it changes D7.6). The runner then passes only when every oracle rejects the signature.
+7. **Form state:** `/NeedAppearances` is left untouched, with a warning (D-5). `/SigFlags 3` is set only when no signed field exists yet (D-6).
+8. **`PreparedSignature`** has an own versioned binary format, plus serde behind the `serde` feature (D-17).
+9. **Field naming:** auto-named fields never take over an existing empty signature field (D-18).
+10. **`/Contents` padding:** non-zero bytes after the CMS give a warning only (D-19).
