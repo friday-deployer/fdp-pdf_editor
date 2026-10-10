@@ -1,0 +1,36 @@
+# OpenSSL TSA configuration for the Folioxide fixture TSA (fixtures/pki/tsa.pem). TEST ONLY.
+#
+# Run from the repository root. FOLIOXIDE_TSA_DIR must name a writable directory: `openssl ts
+# -reply` keeps its serial-number file there (never in the repository).
+#
+#   export FOLIOXIDE_TSA_DIR="$(mktemp -d)"
+#   openssl ts -query -data doc.bin -sha256 -cert -out req.tsq
+#   openssl ts -reply -config tools/tsa/openssl-tsa.cnf -queryfile req.tsq -out resp.tsr
+#   openssl ts -verify -data doc.bin -in resp.tsr -CAfile fixtures/pki/tsa-root.pem
+#
+# Add `-token_out` to `-reply` to get the bare TimeStampToken, which is what PAdES B-T embeds
+# as the id-aa-signatureTimeStampToken attribute (docs/ARCHITECTURE.md §A.6.4).
+
+[ tsa ]
+default_tsa = folioxide_tsa
+
+[ folioxide_tsa ]
+dir                    = $ENV::FOLIOXIDE_TSA_DIR
+serial                 = $dir/tsaserial
+crypto_device          = builtin
+signer_cert            = fixtures/pki/tsa.pem
+signer_key             = fixtures/pki/tsa.key.pem
+signer_digest          = sha256
+# 1.2.3.4.x are the placeholder policy OIDs from the OpenSSL documentation; test use only.
+default_policy         = 1.2.3.4.1
+other_policies         = 1.2.3.4.5
+digests                = sha256, sha384, sha512
+accuracy               = secs:1
+clock_precision_digits = 0
+ordering               = no
+tsa_name               = yes
+# signing-certificate-v2 (ESSCertIDv2, RFC 5816) with SHA-256, for the signer certificate only.
+ess_cert_id_chain      = no
+ess_cert_id_alg        = sha256
+# Chain certificates added to responses (the TSA is issued directly by the root).
+certs                  = fixtures/pki/tsa-root.pem

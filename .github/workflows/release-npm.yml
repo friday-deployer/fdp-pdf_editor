@@ -1,0 +1,164 @@
+# Build the napi-rs addon for the 8 targets of docs/ARCHITECTURE.md §A.7 and, only when asked,
+# publish `folioxide` plus the `@folioxide/binding-<platform>` packages to npm (DECISIONS D5.3).
+#
+# Manual only. With `publish` unchecked this is a dry run that builds and uploads the binaries.
+# Publishing additionally needs the NPM_TOKEN repository secret.
+name: Release (npm)
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm (requires the NPM_TOKEN secret); unchecked = build only
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-npm
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build ${{ matrix.settings.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          # napi-rs v3 conventions: --use-napi-cross (prebuilt glibc 2.17 toolchain) for Linux gnu,
+          # -x (cargo-zigbuild, needs zig) for Linux musl, native toolchains elsewhere.
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: pnpm build --target x86_64-unknown-linux-gnu --use-napi-cross
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: pnpm build --target aarch64-unknown-linux-gnu --use-napi-cross
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: pnpm build --target x86_64-unknown-linux-musl -x
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: pnpm build --target aarch64-unknown-linux-musl -x
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            build: pnpm build --target x86_64-apple-darwin
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: pnpm build --target aarch64-apple-darwin
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: pnpm build --target x86_64-pc-windows-msvc
+          - host: windows-latest
+            target: aarch64-pc-windows-msvc
+            build: pnpm build --target aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.settings.host }}
+    defaults:
+      run:
+        working-directory: bindings/node
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain and the target
+        run: |
+          rustup toolchain install
+          rustup target add "${{ matrix.settings.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.settings.target }}
+      - uses: mlugg/setup-zig@v2
+        if: ${{ contains(matrix.settings.target, 'musl') }}
+        with:
+          version: 0.14.1
+      - uses: pnpm/action-setup@v5
+        with:
+          package_json_file: bindings/node/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: bindings/node/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Build
+        run: ${{ matrix.settings.build }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: bindings/node/*.node
+          if-no-files-found: error
+      # The generated JS loader and typings are the same for every target; publish the fresh ones.
+      - uses: actions/upload-artifact@v7
+        if: ${{ matrix.settings.target == 'x86_64-unknown-linux-gnu' }}
+        with:
+          name: binding-js
+          path: |
+            bindings/node/binding.js
+            bindings/node/binding.d.ts
+          if-no-files-found: error
+
+  publish:
+    name: publish to npm
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/node
+    steps:
+      - name: Require the NPM_TOKEN secret
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::the NPM_TOKEN secret is not set; refusing to publish"
+            exit 1
+          fi
+        working-directory: .
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v5
+        with:
+          package_json_file: bindings/node/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: bindings/node/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v8
+        with:
+          path: bindings/node/artifacts
+          pattern: bindings-*
+      - uses: actions/download-artifact@v8
+        with:
+          name: binding-js
+          path: bindings/node
+      - name: Move the binaries into npm/<platform>/
+        run: |
+          ./node_modules/.bin/napi create-npm-dirs
+          ./node_modules/.bin/napi artifacts --output-dir ./artifacts
+          missing=0
+          for dir in npm/*/; do
+            if ! ls "$dir"*.node >/dev/null 2>&1; then
+              echo "::error::no .node binary in $dir"
+              missing=1
+            fi
+          done
+          exit "$missing"
+      # `napi pre-publish` runs `npm publish` in every npm/<platform>/ directory and adds them to
+      # optionalDependencies; npm_config_access makes the scoped @folioxide/* packages public.
+      - name: Publish the platform packages and the main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          npm_config_access: public
+        run: |
+          ./node_modules/.bin/napi pre-publish -t npm --no-gh-release
+          npm publish --access public

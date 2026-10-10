@@ -1,0 +1,27 @@
+[package]
+name = "folioxide-sign"
+description = "Folioxide L5: PDF digital signatures (PAdES/CMS), timestamps, DocMDP and verification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# RC2-40 and 3DES PKCS#12 bags (PBES1); without it only modern PBES2/AES files load.
+pkcs12-legacy = ["p12-keystore/pbes1"]
+
+[dependencies]
+folioxide-syntax.workspace = true
+folioxide-model.workspace = true
+# Only for visible signature appearances (ARCHITECTURE §A.2 dependency direction).
+folioxide-content.workspace = true
+# RustCrypto stack. These types never appear in the public API (ARCHITECTURE §A.5 gap 5).
+rsa.workspace = true
+cms.workspace = true
+p12-keystore.workspace = true
+x509-cert.workspace = true
+der.workspace = true
+
+[lints]
+workspace = true

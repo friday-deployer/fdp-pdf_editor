@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bindings/node", "xtask"]
+# The cargo-fuzz crate has its own (empty) [workspace] table and is built with nightly only.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# MSRV for every crate (DECISIONS D5.1 as revised by D7.2).
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/friday-deployer/fdp-pdf_editor"
+
+# Every dependency version is pinned here (ARCHITECTURE §A.5). Members use `{ workspace = true }`.
+[workspace.dependencies]
+# Internal crates. Sub-crates carry no default features; the facade decides what is enabled.
+folioxide = { path = "crates/folioxide", version = "0.1.0" }
+folioxide-syntax = { path = "crates/folioxide-syntax", version = "0.1.0", default-features = false }
+folioxide-security = { path = "crates/folioxide-security", version = "0.1.0", default-features = false }
+folioxide-model = { path = "crates/folioxide-model", version = "0.1.0", default-features = false }
+folioxide-content = { path = "crates/folioxide-content", version = "0.1.0", default-features = false }
+folioxide-interactive = { path = "crates/folioxide-interactive", version = "0.1.0", default-features = false }
+folioxide-sign = { path = "crates/folioxide-sign", version = "0.1.0", default-features = false }
+folioxide-redact = { path = "crates/folioxide-redact", version = "0.1.0", default-features = false }
+folioxide-render = { path = "crates/folioxide-render", version = "0.1.0", default-features = false }
+folioxide-testkit = { path = "crates/folioxide-testkit", version = "0.1.0", default-features = false }
+
+# RustCrypto 2026 stack (M0 dependency spike, ARCHITECTURE §A.5 "Gaps" 2 and 5).
+# `rsa` and `cms` are pre-releases and pinned exactly: `pkcs12 0.2.0-pre.0` (via p12-keystore)
+# requires `cms = "=0.3.0-pre.1"`, so the whole graph must agree on that version.
+rsa = { version = "=0.10.0-rc.19", default-features = false, features = ["std", "encoding"] }
+cms = { version = "=0.3.0-pre.1", default-features = false }
+p12-keystore = { version = "0.4.0", default-features = false }
+x509-cert = { version = "0.3.0", default-features = false, features = ["pem"] }
+der = { version = "0.8.2", default-features = false, features = ["derive", "oid", "alloc", "pem"] }
+
+# Node-API (bindings/node only; never a dependency of a core crate, see ARCHITECTURE §A.8).
+# `dyn-symbols` is a napi default that we keep on purpose (§A.7 shows only "napi8"; proposed
+# decision in the M0 WP0.1 report). With it, napi-sys looks the `napi_*` functions up in the host
+# process when the addon loads instead of declaring them as `extern` symbols, so the addon has no
+# undefined Node-API symbols and every binary that links napi code (the cdylib, and any Rust unit
+# test of folioxide-node) links on Linux and macOS without a Node host. It is also the
+# configuration napi-rs ships and tests by default. Windows MSVC builds use this lookup either way.
+napi ={ version = "3.14.2", default-features = false, features = ["napi8", "dyn-symbols"] }
+napi-derive = { version = "3.6.12" }
+napi-build = { version = "2.6.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Library code must never panic on untrusted input (CLAUDE.md). CI runs clippy with `-D warnings`;
+# `clippy.toml` relaxes these four inside tests.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+
+[profile.release]
+# Smaller, faster Node addon builds (`pnpm build` uses the release profile).
+lto = true
+strip = "symbols"

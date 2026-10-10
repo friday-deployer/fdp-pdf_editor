@@ -1,0 +1,19 @@
+[package]
+name = "folioxide-model"
+description = "Folioxide L3: PDF document model, page tree, page operations, metadata and structure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Open and save encrypted documents through folioxide-security (ARCHITECTURE §A.2).
+encryption = ["dep:folioxide-security"]
+
+[dependencies]
+folioxide-syntax.workspace = true
+folioxide-security = { workspace = true, optional = true }
+
+[lints]
+workspace = true

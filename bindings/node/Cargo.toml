@@ -1,0 +1,33 @@
+[package]
+name = "folioxide-node"
+description = "Node.js binding (napi-rs) for the Folioxide PDF engine; published to npm as `folioxide`"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+folioxide.workspace = true
+napi.workspace = true
+napi-derive.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true
+
+# Same as [workspace.lints] except `unsafe_code`, which is `deny` instead of `forbid`: the
+# `#[napi]` macros expand to `unsafe` FFI glue wrapped in `#[allow(unsafe_code)]`, and `forbid`
+# cannot be overridden by an inner `allow`. `deny` still rejects any hand-written `unsafe` here.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"

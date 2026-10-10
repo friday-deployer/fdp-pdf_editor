@@ -1,0 +1,6 @@
+# The workspace warns on unwrap/expect/panic/indexing in library code (Cargo.toml [workspace.lints]).
+# Tests may use them freely: a panic is how a test fails.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

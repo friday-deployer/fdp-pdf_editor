@@ -1,0 +1,6 @@
+# Fixtures are read byte for byte (PDF offsets, PEM/DER, hashes): never convert line endings,
+# whatever core.autocrlf says on the checkout.
+* -text
+*.pdf binary
+*.p12 binary
+*.der binary

@@ -1,0 +1,37 @@
+{
+  "name": "@folioxide/binding-linux-arm64-gnu",
+  "version": "0.1.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "folioxide.linux-arm64-gnu.node",
+  "files": [
+    "folioxide.linux-arm64-gnu.node"
+  ],
+  "description": "Pure-Rust PDF editing engine for Node.js: signing, page operations, annotations, forms and content editing",
+  "keywords": [
+    "pdf",
+    "pades",
+    "signature",
+    "napi-rs",
+    "rust"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">= 20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/friday-deployer/fdp-pdf_editor.git",
+    "directory": "bindings/node"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

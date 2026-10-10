@@ -1,0 +1,16 @@
+[package]
+name = "folioxide-interactive"
+description = "Folioxide L5: PDF annotations with appearance streams, AcroForm fill, create and flatten"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+folioxide-syntax.workspace = true
+folioxide-model.workspace = true
+folioxide-content.workspace = true
+
+[lints]
+workspace = true

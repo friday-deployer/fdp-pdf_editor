@@ -1,0 +1,17 @@
+[package]
+name = "folioxide-redact"
+description = "Folioxide L5: true PDF redaction and editing of existing text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+folioxide-syntax.workspace = true
+folioxide-model.workspace = true
+folioxide-content.workspace = true
+folioxide-interactive.workspace = true
+
+[lints]
+workspace = true

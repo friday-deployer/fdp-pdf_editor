@@ -1,0 +1,5 @@
+[toolchain]
+# Development toolchain (DECISIONS D5.1). The core crates' MSRV is `rust-version` in Cargo.toml.
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

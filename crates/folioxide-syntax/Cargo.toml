@@ -1,0 +1,13 @@
+[package]
+name = "folioxide-syntax"
+description = "Folioxide L1: PDF objects, lexer, parser, xref, object streams, filters, lazy store and writers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

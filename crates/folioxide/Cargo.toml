@@ -1,0 +1,53 @@
+[package]
+name = "folioxide"
+description = "A pure-Rust PDF editing engine: signing, page operations, annotations, forms and content editing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["pdf", "pades", "signature", "editor"]
+categories = ["encoding", "parser-implementations", "cryptography"]
+
+[features]
+default = ["encryption", "signatures", "pkcs12-legacy", "fonts", "images", "interactive"]
+# Open and save encrypted documents.
+encryption = ["dep:folioxide-security", "folioxide-model/encryption"]
+# Digital signatures (pulls in the RustCrypto stack).
+signatures = ["dep:folioxide-sign"]
+# RC2-40 and 3DES PKCS#12 bags. Has no effect without `signatures`.
+pkcs12-legacy = ["folioxide-sign?/pkcs12-legacy"]
+# TrueType/OpenType embedding and subsetting; without it only the standard-14 fonts.
+fonts = ["folioxide-content/fonts"]
+# PNG decoding. JPEG passthrough is always available.
+images = ["folioxide-content/images"]
+# JPEG pixel decoding (pixel-level image redaction, rendering).
+jpeg-decode = ["folioxide-content/jpeg-decode"]
+# Complex-script shaping and bidi.
+shaping = ["folioxide-content/shaping"]
+# Annotations and forms.
+interactive = ["dep:folioxide-interactive"]
+# True redaction and editing of existing text (M10).
+redact = ["dep:folioxide-redact"]
+# Page rendering (hayro, later).
+render = ["dep:folioxide-render"]
+# `Serialize`/`Deserialize` on all DTOs. Placeholder until the first DTO lands (M2).
+serde = []
+# Path helpers, `SystemClock` and optional mmap. Placeholder until M2.
+std-fs = []
+
+[dependencies]
+folioxide-syntax.workspace = true
+folioxide-model.workspace = true
+folioxide-content.workspace = true
+folioxide-security = { workspace = true, optional = true }
+folioxide-interactive = { workspace = true, optional = true }
+folioxide-sign = { workspace = true, optional = true }
+folioxide-redact = { workspace = true, optional = true }
+folioxide-render = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

@@ -54,7 +54,7 @@ These are dev-only external processes and are never linked.
 - **Tauri readiness.** Core crates never depend on napi, Node or Tauri. `Document` and DTOs are `Send + Sync + 'static`. DTOs derive serde behind the `serde` feature with `camelCase` names.
 - **RustCrypto types stay out of public APIs.** Public signatures take and return DER bytes and our own enums, because several crypto crates are pre-releases.
 - **Spec references.** Cite ISO 32000-2 sections (e.g. `// §7.5.8.3`) in comments wherever behaviour is non-obvious.
-- **Tests.** Every feature gets unit tests plus round-trip/integration tests. Tests are deterministic and never touch the network. Generated fixtures beat committed binaries; any committed fixture must be under 200 KB and documented in `fixtures/README.md`.
+- **Tests.** Every feature gets unit tests plus round-trip/integration tests. Tests are deterministic and never touch the network. Integration test files (`tests/*.rs`) start with `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]`, because the clippy.toml test exemptions do not cover helper functions there. Generated fixtures beat committed binaries; any committed fixture must be under 200 KB and documented in `fixtures/README.md`.
 - **Docs.** Every public item has rustdoc. Every user-visible Node API gets JSDoc and a test in `bindings/node/test/`.
 - **Style.** Edition 2024, rustfmt defaults plus `rustfmt.toml`, clippy clean with `-D warnings`. `unsafe` is forbidden in core crates.
 
@@ -62,7 +62,7 @@ These are dev-only external processes and are never linked.
 - **Class:** `PdfDocument`, with 0-based page indices at the boundary.
 - **Sync and async:** heavy operations have `…Async` variants (napi `AsyncTask`). Sync methods `try_lock` and throw `E_BUSY` rather than block.
 - **Errors:** JS errors carry `err.code = "E_<ERROR_CODE>"`, for example `E_WRONG_PASSWORD`. Messages never contain key material or passwords.
-- **Tests:** Node's built-in runner (`node --test`) on `.mjs` files, plus TypeScript type tests run with `tsc --noEmit`.
+- **Tests:** Node's built-in runner (`node --test "test/**/*.test.mjs"`, run with `pnpm test`) on `.mjs` files, plus TypeScript type tests run with `tsc --noEmit`.
 
 ## Git and team workflow
 - **Branch:** `claude/eager-euler-ag4bjo`. One commit per QA-approved milestone, titled `M<n>: <title>`.

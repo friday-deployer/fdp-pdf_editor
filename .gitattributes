@@ -1,0 +1,8 @@
+# Normalize text files to LF in the repository and on checkout (rustfmt uses newline_style = "Unix",
+# and shell scripts must not get CRLF on Windows checkouts). Binary fixtures are handled in
+# fixtures/.gitattributes.
+* text=auto eol=lf
+*.pdf binary
+*.p12 binary
+*.der binary
+*.node binary

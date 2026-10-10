@@ -1,0 +1,18 @@
+[package]
+name = "folioxide-testkit"
+description = "Folioxide test support: byte-level PDF builder, fixture generators, test PKI and oracle output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# Tests write `<oracle dir>/<suite>/<name>.pdf` plus `<name>.expect.json` for `cargo xtask oracle`.
+emit = []
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+# Oracle tools for cross-validation (tools/oracles). Dev-only: these run as external
+# processes and are never linked into Folioxide. Install with `bash tools/setup-venv.sh`.
+#
+# Every package that tools/ imports directly is pinned exactly. Transitive dependencies
+# are resolved by pip within the ranges these packages declare.
+
+# The three oracles named in docs/ARCHITECTURE.md §A.5 (pikepdf is MPL-2.0: fine for an external tool).
+pyhanko==0.37.0
+pypdf==6.20.0
+pikepdf==10.16.0
+
+# Direct imports in tools/oracles.
+pyhanko-certvalidator==0.32.1   # ValidationContext for trust roots (validate_sig.py)
+asn1crypto==1.5.1               # CMS / X.509 parsing (pades_profile.py, extract_cms.py)
+PyYAML==6.0.3                   # CI self-check: every .github/workflows/*.yml parses

@@ -1,0 +1,76 @@
+# cargo-deny policy (https://embarkstudios.github.io/cargo-deny/). Run from the repo root:
+#   cargo deny check            # = advisories, bans, licenses, sources
+# The fuzz/ crate is outside the workspace and therefore outside this policy (ARCHITECTURE §A.5).
+
+[graph]
+# Check every feature of every workspace crate, for every target platform (empty `targets`).
+all-features = true
+targets = []
+
+[output]
+feature-depth = 1
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Marvin timing side channel in `rsa`; no patched release exists (rsa 0.9.x and 0.10.0-rc.x are affected). Accepted and documented per docs/DECISIONS.md D5.4: docs recommend ECDSA keys or the external KMS/HSM flow for server-side use. Re-check on every `rsa` release." },
+]
+
+[licenses]
+# Permissive licenses only (CLAUDE.md "Engineering rules", DECISIONS D6). Anything not listed is
+# rejected, which denies all copyleft licenses: GPL, AGPL, LGPL, MPL, EUPL, CDDL, ...
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+# The allow list is policy, not an inventory: do not warn about entries no crate uses yet.
+unused-allowed-license = "allow"
+exceptions = []
+
+[licenses.private]
+# Our own unpublished crates (xtask, folioxide-testkit, folioxide-node) are checked too.
+ignore = false
+registries = []
+
+[bans]
+# Duplicate versions are reported but do not fail the check (two RustCrypto generations coexist).
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies of unpublished crates may omit a version.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # Node-API stays in the binding: core crates never depend on napi (ARCHITECTURE §A.8).
+    { crate = "napi", wrappers = ["folioxide-node"], reason = "only bindings/node may depend on napi" },
+    { crate = "napi-derive", wrappers = ["folioxide-node"], reason = "only bindings/node may depend on napi" },
+    { crate = "napi-build", wrappers = ["folioxide-node", "napi"], reason = "only bindings/node may depend on napi" },
+    # A future Tauri app links `folioxide` from outside; the core never depends on Tauri (§A.8).
+    { crate = "tauri", reason = "the core must not depend on Tauri" },
+    # Pure Rust only: no C/C++ or assembly crypto backends (ARCHITECTURE §A.5 "Excluded").
+    { crate = "openssl", reason = "C library; pure-Rust rule" },
+    { crate = "openssl-sys", reason = "C library; pure-Rust rule" },
+    { crate = "ring", reason = "C and assembly; pure-Rust rule" },
+    { crate = "aws-lc-rs", reason = "C library; pure-Rust rule" },
+    { crate = "aws-lc-sys", reason = "C library; pure-Rust rule" },
+    # MPL-2.0 CMS implementation, rejected in ARCHITECTURE §A.5.
+    { crate = "cryptographic-message-syntax", reason = "MPL-2.0; rejected in ARCHITECTURE §A.5" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+# crates.io only: no other registries and no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

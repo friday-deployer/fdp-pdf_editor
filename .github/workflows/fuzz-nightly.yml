@@ -1,0 +1,81 @@
+# Nightly fuzzing with cargo-fuzz (docs/ARCHITECTURE.md §A.9, layer 4). The fuzz crate lives
+# outside the workspace (fuzz/Cargo.toml) and needs the nightly toolchain. Corpora and crash
+# artifacts are never committed; crashes are uploaded as workflow artifacts.
+name: Fuzz (nightly)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz each target
+        type: number
+        default: 600
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  targets:
+    name: list fuzz targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        name: Read the [[bin]] targets from fuzz/Cargo.toml
+        run: |
+          targets="$(python3 -I -c 'import json, tomllib; print(json.dumps([b["name"] for b in tomllib.load(open("fuzz/Cargo.toml", "rb")).get("bin", [])]))')"
+          echo "fuzz targets: $targets"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.targets) }}
+    env:
+      # Overrides rust-toolchain.toml (1.97.0) for every rustup proxy: cargo-fuzz needs nightly.
+      RUSTUP_TOOLCHAIN: nightly
+      FUZZ_TARGET: ${{ matrix.target }}
+      FUZZ_SECONDS: ${{ inputs.seconds || 600 }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build all fuzz targets
+        run: cargo +nightly fuzz build
+      - name: Seed the corpus from fixtures/
+        run: |
+          mkdir -p "fuzz/corpus/$FUZZ_TARGET"
+          find fixtures -type f -name '*.pdf' -size -1M -exec cp {} "fuzz/corpus/$FUZZ_TARGET/" \;
+          echo "seed files: $(find "fuzz/corpus/$FUZZ_TARGET" -type f | wc -l)"
+      - name: Fuzz for ${{ env.FUZZ_SECONDS }} seconds
+        run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_SECONDS"
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30

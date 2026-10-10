@@ -1,0 +1,70 @@
+{
+  "name": "folioxide",
+  "version": "0.1.0",
+  "description": "Pure-Rust PDF editing engine for Node.js: signing, page operations, annotations, forms and content editing",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/friday-deployer/fdp-pdf_editor.git",
+    "directory": "bindings/node"
+  },
+  "keywords": [
+    "pdf",
+    "pades",
+    "signature",
+    "napi-rs",
+    "rust"
+  ],
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "binding.js",
+    "binding.d.ts",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">= 20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "napi": {
+    "binaryName": "folioxide",
+    "packageName": "@folioxide/binding",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release --js binding.js --dts binding.d.ts",
+    "build:debug": "napi build --platform --js binding.js --dts binding.d.ts",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "test:types": "tsc --noEmit -p test"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.10.8",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "pnpm@10.28.0"
+}

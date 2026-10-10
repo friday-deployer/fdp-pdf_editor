@@ -1,0 +1,26 @@
+[package]
+name = "folioxide-content"
+description = "Folioxide L4: PDF content streams, fonts, images, text layout and text extraction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Placeholders for the facade feature flags (ARCHITECTURE §A.2). Their dependencies arrive with M7.
+# TrueType/OpenType embedding and subsetting.
+fonts = []
+# PNG decoding (JPEG passthrough is always available).
+images = []
+# JPEG pixel decoding.
+jpeg-decode = []
+# Complex-script shaping and bidi.
+shaping = []
+
+[dependencies]
+folioxide-syntax.workspace = true
+folioxide-model.workspace = true
+
+[lints]
+workspace = true

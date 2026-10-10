@@ -27,14 +27,29 @@ live in `.claude/agents/`; project conventions live in `/CLAUDE.md`; design and 
 - **QA**: independent verification against the milestone's acceptance criteria. Never fixes; reports.
 - **Helpers**: fixtures, boilerplate, doc touch-ups, command runs. Never design.
 
+## Where work happens (git worktrees)
+Since M1, developers never work in the main checkout, so the main branch only ever receives QA-approved,
+squashed milestone commits.
+- The manager creates an integration branch `wip/m<n>` from the main branch, with a worktree at
+  `/home/user/fdp-wt/m<n>`. Each parallel developer gets a branch `wip/m<n>-a`, `wip/m<n>-b`, … from the
+  integration branch, with a worktree at `/home/user/fdp-wt/m<n>-a`, ….
+- Developers commit freely on their own `wip/*` branch inside their worktree. Prefix every shell command with
+  `cd <worktree> &&` and use absolute paths under the worktree for all file tools.
+- At a stage boundary the manager merges the developer branches into `wip/m<n>`, then resets the developer
+  branches to the new integration head for the next stage.
+- QA runs against the integration worktree. Fix rounds happen in the integration worktree (or in the developer
+  worktrees, followed by a merge).
+- On PASS, the manager squash-merges `wip/m<n>` into the main branch as one commit `M<n>: <title>`, pushes,
+  and deletes the `wip/*` branches and worktrees.
+
 ## Milestone loop
 ```
 1. Plan     manager writes the milestone brief (scope, work packages, acceptance criteria) from docs/ROADMAP.md
-2. Build    developer(s) implement; parallel work runs in isolated git worktrees on disjoint modules/crates
-3. Merge    manager squash-merges worktree branches into the working tree (uncommitted)
+2. Build    developer(s) implement in their own worktrees on wip/* branches (disjoint modules/crates), in stages
+3. Merge    manager merges developer branches into the wip/m<n> integration branch after each stage
 4. QA gate  1–2 QA reviewers (e.g. one on spec/correctness, one on robustness/tests/API) + expert for high-risk areas
 5. Fix      developer fixes every Blocker/Major (Minor at manager's discretion); QA re-checks
-6. Commit   when all QA verdicts are PASS: manager commits ("M<n>: <title>") and pushes
+6. Commit   when all QA verdicts are PASS: manager squash-merges wip/m<n> into the main branch as "M<n>: <title>" and pushes
 7. Record   manager ticks the milestone in docs/ROADMAP.md and notes follow-ups
 ```
 

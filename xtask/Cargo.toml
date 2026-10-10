@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Folioxide developer tasks: cargo xtask fixtures | oracle [--suite <name>] | ci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Standard library only, so `cargo xtask` stays fast to build.
+[dependencies]
+
+[lints]
+workspace = true
