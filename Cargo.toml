@@ -9,7 +9,7 @@ version = "0.1.0"
 edition = "2024"
 # MSRV for every crate (DECISIONS D5.1 as revised by D7.2).
 rust-version = "1.89"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/friday-deployer/fdp-pdf_editor"
 
 # Every dependency version is pinned here (ARCHITECTURE §A.5). Members use `{ workspace = true }`.

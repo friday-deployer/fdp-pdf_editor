@@ -55,9 +55,4 @@ editing. The milestone plan is in `docs/ROADMAP.md` in the
 
 ## License
 
-Licensed under either of
-
-- the MIT license ([LICENSE-MIT](LICENSE-MIT)), or
-- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)),
-
-at your option.
+Licensed under the MIT license ([LICENSE](LICENSE)).

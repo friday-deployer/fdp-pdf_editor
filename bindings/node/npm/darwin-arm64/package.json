@@ -16,7 +16,7 @@
     "napi-rs",
     "rust"
   ],
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "engines": {
     "node": ">= 20"
   },

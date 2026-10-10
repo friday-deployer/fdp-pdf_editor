@@ -12,8 +12,7 @@ const packageJson = readJson(new URL('package.json', packageDir))
 // What `npm publish` puts in the `folioxide` tarball. Anything else (the `.node` binaries, which ship
 // in the platform packages, and the Rust sources, tests and lockfile) must stay out.
 const EXPECTED_TARBALL = [
-  'LICENSE-APACHE',
-  'LICENSE-MIT',
+  'LICENSE',
   'README.md',
   'binding.d.ts',
   'binding.js',
@@ -41,12 +40,12 @@ function npmPackFileList() {
   return result.files.map((file) => file.path).sort()
 }
 
-test('the npm tarball holds the facade, the generated loader, the README and both licenses', () => {
+test('the npm tarball holds the facade, the generated loader, the README and the license', () => {
   assert.deepEqual(npmPackFileList(), EXPECTED_TARBALL)
 })
 
-test('the packaged license texts are identical to the repository licenses', () => {
-  for (const name of ['LICENSE-MIT', 'LICENSE-APACHE']) {
+test('the packaged license text is identical to the repository license', () => {
+  for (const name of ['LICENSE']) {
     const packaged = readFileSync(new URL(name, packageDir), 'utf8')
     const original = readFileSync(new URL(name, repoRoot), 'utf8')
     assert.equal(packaged, original, `bindings/node/${name} must be a copy of the root ${name}`)

@@ -62,9 +62,4 @@ The oracle tools are dev-only external processes. They are never linked into the
 
 ## License
 
-Folioxide is dual-licensed under either of
-
-- the [MIT license](LICENSE-MIT), or
-- the [Apache License, Version 2.0](LICENSE-APACHE),
-
-at your option.
+Folioxide is licensed under the [MIT license](LICENSE).

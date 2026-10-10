@@ -37,8 +37,8 @@ Newest entries go at the bottom. Each entry records what was decided, why, and w
    - Re-check on every `rsa` release.
 5. **Tagged-PDF structure on merge or import:** stripped in v1 (`/StructParents` removed, StructTreeRoot not merged) and documented. Preserving it is on the backlog.
 
-## D6: License (manager, 2026-10-10)
-- The project license is `MIT OR Apache-2.0`, the Rust ecosystem convention.
+## D6: License (manager, 2026-10-10; *revised by D8*)
+- Originally `MIT OR Apache-2.0`. **Superseded by D8: the project is MIT-licensed.**
 - Dependencies must use permissive licenses, enforced by `cargo deny`.
 - GPL, AGPL, LGPL and MPL tools such as poppler, qpdf/pikepdf and veraPDF may be used only as **external test oracles** and are never linked.
 
@@ -65,3 +65,10 @@ Newest entries go at the bottom. Each entry records what was decided, why, and w
    - Signers: RSA-2048, RSA-3072, P-256 and P-384. The TSA certificate has a critical `timeStamping` EKU.
    - Validity runs from 2025-01-01 to 2075-12-31. `expired.pem` was valid only during 2025.
    - The `.p12` password and the encrypted-key password are both `folioxide`. These keys are for tests only.
+
+## D8: Project license is MIT (user, 2026-10-10)
+- Folioxide is licensed under **MIT** alone. The license text is in `LICENSE` at the repository root, and a copy
+  is in `bindings/node/LICENSE` for the npm package.
+- Every crate and npm package declares `license = "MIT"`.
+- The dependency policy is unchanged: permissive licenses only, enforced by `cargo deny`. Apache-2.0, BSD, ISC
+  and Zlib dependencies are compatible with an MIT project.

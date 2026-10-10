@@ -2,7 +2,7 @@
   "name": "folioxide",
   "version": "0.1.0",
   "description": "Pure-Rust PDF editing engine for Node.js: signing, page operations, annotations, forms and content editing",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/friday-deployer/fdp-pdf_editor.git",
@@ -33,8 +33,7 @@
     "binding.js",
     "binding.d.ts",
     "README.md",
-    "LICENSE-MIT",
-    "LICENSE-APACHE"
+    "LICENSE"
   ],
   "engines": {
     "node": ">= 20"

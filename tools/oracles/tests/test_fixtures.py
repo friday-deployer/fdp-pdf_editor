@@ -46,7 +46,7 @@ class FixtureTests(unittest.TestCase):
 
     def test_license_policy_is_stated(self):
         text = (FIXTURES / "README.md").read_text(encoding="utf-8")
-        self.assertIn("MIT OR Apache-2.0", text)
+        self.assertIn("licensed **`MIT`**", text)
         self.assertIn("External corpora are never committed", text)
         self.assertIn("test data only", text)
 

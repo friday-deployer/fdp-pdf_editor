@@ -3,7 +3,7 @@ name = "folioxide-fuzz"
 description = "cargo-fuzz targets for Folioxide (nightly only; not part of the workspace)"
 version = "0.0.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 publish = false
 
 [package.metadata]
