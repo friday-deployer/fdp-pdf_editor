@@ -37,7 +37,7 @@ def run(*argv):
 class RegistryTests(unittest.TestCase):
     def test_every_spec_key_is_either_wired_or_pending(self):
         wired = {"pages", "version", "info", "signatures", "textContains", "textAbsent", "prefixOf",
-                 "revisions"}
+                 "revisions", "objectCount"}
         self.assertEqual(set(run_suite.REGISTRY), wired)
         self.assertEqual(set(run_suite.SPEC_KEYS) - wired, set(NOT_IMPLEMENTED))
 
@@ -217,6 +217,94 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("one/a.pdf", out)
         self.assertIn("two/b.pdf", out)
+
+
+class SkipAndKnownFailureTests(unittest.TestCase):
+    """The meta keys ``oracleSkip`` and ``knownFailures`` (M1 brief WP1.5, oracle suite ``syntax``)."""
+
+    def test_skipped_case_runs_no_check_and_exits_0(self):
+        broken = pdfgen.shift_body(pdfgen.build_pdf())  # every structural check would fail
+        with temp_dir() as tmp:
+            write_case(tmp, "repaired", broken, {"oracleSkip": "the oracles must repair this file"})
+            write_case(tmp, "good", pdfgen.build_pdf(), {"pages": 1, "objectCount": 6})
+            report = tmp / "report.json"
+            code, out, _ = run("--json-report", report, tmp)
+            self.assertEqual(code, 0, out)
+            self.assertIn("SKIP    repaired.pdf", out)
+            self.assertIn("the oracles must repair this file", out)
+            self.assertIn("PASS    good.pdf      objectCount.pikepdf", out)
+            self.assertIn("1 passed, 0 failed, 0 error(s), 1 skipped", out)
+            data = {c["case"]: c for c in json.loads(report.read_text())}
+            self.assertEqual(data["repaired.pdf"]["status"], "SKIP")
+            self.assertEqual(data["repaired.pdf"]["checks"], [])
+            self.assertEqual(data["repaired.pdf"]["skipped"], "the oracles must repair this file")
+            self.assertEqual(data["good.pdf"]["status"], "PASS")
+            # --failures-only hides skipped cases too.
+            code, out, _ = run("--failures-only", tmp)
+            self.assertEqual(code, 0)
+            self.assertNotIn("SKIP    ", out)
+
+    def test_skipped_case_keys_are_still_validated(self):
+        for expect in ({"oracleSkip": ""}, {"oracleSkip": 1}, {"oracleSkip": "why", "pagez": 1},
+                       {"oracleSkip": "why", "knownFailures": {"structure.pypdf": "why"}}):
+            with self.subTest(expect=expect), temp_dir() as tmp:
+                write_case(tmp, "case", pdfgen.build_pdf(), expect)
+                code, out, _ = run(tmp)
+                self.assertEqual(code, 2, out)
+                self.assertIn("ERROR   case.pdf", out)
+
+    def test_object_count_mismatch_fails(self):
+        with temp_dir() as tmp:
+            write_case(tmp, "count", pdfgen.build_pdf(), {"objectCount": 7})
+            code, out, _ = run(tmp)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL    count.pdf  objectCount.pikepdf", out)
+        self.assertIn("expected 7, got 6", out)
+
+    def test_known_failure_passes_as_xfail(self):
+        # pypdf's strict mode warns about an update section whose first subsection is not 0.
+        # The update re-lists object 4 at its old offset, without the object 0 entry.
+        base = pdfgen.build_pdf()
+        startxref = int(base[base.rindex(b"startxref") + 9:].split()[0])
+        update = (b"xref\n4 1\n%010d 00000 n \ntrailer\n<< /Size 7 /Root 1 0 R /Prev %d >>\n"
+                  % (base.index(b"4 0 obj"), startxref))
+        data = base + update + b"startxref\n%d\n%%%%EOF\n" % len(base)
+        reason = "pypdf strict warns about update sections that do not start at 0"
+        with temp_dir() as tmp:
+            write_case(tmp / "plain", "update", data, {"pages": 1})
+            code, out, _ = run(tmp / "plain")
+            self.assertEqual(code, 1, out)
+            self.assertIn("FAIL    update.pdf  structure.pypdf", out)
+
+            write_case(tmp / "waived", "update", data,
+                       {"pages": 1, "knownFailures": {"structure.pypdf": reason}})
+            report = tmp / "report.json"
+            code, out, _ = run("--json-report", report, tmp / "waived")
+            self.assertEqual(code, 0, out)
+            self.assertIn("XFAIL   update.pdf  structure.pypdf", out)
+            self.assertIn(f"known failure: {reason} [", out)
+            self.assertIn("; 1 known failure(s)", out)
+            [case] = json.loads(report.read_text())
+            waived = {c["name"]: c["knownFailure"] for c in case["checks"]}
+            self.assertTrue(waived["structure.pypdf"])
+            self.assertFalse(waived["structure.pikepdf"])
+
+    def test_stale_known_failure_fails(self):
+        with temp_dir() as tmp:
+            write_case(tmp, "clean", pdfgen.build_pdf(),
+                       {"knownFailures": {"structure.pypdf": "no longer true"}})
+            code, out, _ = run(tmp)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL    clean.pdf  structure.pypdf", out)
+        self.assertIn("remove the entry", out)
+
+    def test_known_failure_of_a_check_that_does_not_run_is_an_error(self):
+        for known in ({"pages.pikepdf": "not requested"}, {"structure.pypdf": ""}, ["structure.pypdf"]):
+            with self.subTest(known=known), temp_dir() as tmp:
+                write_case(tmp, "case", pdfgen.build_pdf(), {"knownFailures": known})
+                code, out, _ = run(tmp)
+                self.assertEqual(code, 2, out)
+                self.assertIn("knownFailures", out)
 
 
 class IsolatedCliTests(unittest.TestCase):

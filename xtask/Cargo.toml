@@ -8,8 +8,10 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-# Standard library only, so `cargo xtask` stays fast to build.
+# Standard library plus the testkit's fixture generators (for `cargo xtask fixtures`), which
+# only add folioxide-syntax and its small dependencies, so `cargo xtask` stays fast to build.
 [dependencies]
+folioxide-testkit.workspace = true
 
 [lints]
 workspace = true

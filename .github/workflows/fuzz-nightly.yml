@@ -64,11 +64,19 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Build all fuzz targets
         run: cargo +nightly fuzz build
+      # Every committed PDF: fixtures/syntax, fixtures/qpdf and the resource-exhaustion seeds in
+      # fixtures/hostile. (`-size -1024k`, not `-size -1M`: find rounds sizes up to the unit, so
+      # `-1M` matches only empty files.)
       - name: Seed the corpus from fixtures/
         run: |
           mkdir -p "fuzz/corpus/$FUZZ_TARGET"
-          find fixtures -type f -name '*.pdf' -size -1M -exec cp {} "fuzz/corpus/$FUZZ_TARGET/" \;
-          echo "seed files: $(find "fuzz/corpus/$FUZZ_TARGET" -type f | wc -l)"
+          find fixtures -type f -name '*.pdf' -size -1024k -exec cp {} "fuzz/corpus/$FUZZ_TARGET/" \;
+          seeds="$(find "fuzz/corpus/$FUZZ_TARGET" -type f | wc -l)"
+          echo "seed files: $seeds"
+          if [ "$seeds" -eq 0 ]; then
+            echo "::error::no seed files were copied from fixtures/"
+            exit 1
+          fi
       - name: Fuzz for ${{ env.FUZZ_SECONDS }} seconds
         run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_SECONDS"
       - name: Upload crash artifacts

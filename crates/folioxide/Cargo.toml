@@ -31,8 +31,9 @@ interactive = ["dep:folioxide-interactive"]
 redact = ["dep:folioxide-redact"]
 # Page rendering (hayro, later).
 render = ["dep:folioxide-render"]
-# `Serialize`/`Deserialize` on all DTOs. Placeholder until the first DTO lands (M2).
-serde = []
+# `Serialize`/`Deserialize` on all DTOs (so far the syntax layer's `ErrorCode`, `Limits`,
+# `Diagnostic` and `OpenOptions`).
+serde = ["folioxide-syntax/serde"]
 # Path helpers, `SystemClock` and optional mmap. Placeholder until M2.
 std-fs = []
 

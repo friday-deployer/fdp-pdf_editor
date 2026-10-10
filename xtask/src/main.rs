@@ -2,7 +2,9 @@
 //!
 //! Run through the cargo alias in `.cargo/config.toml`:
 //!
-//! - `cargo xtask fixtures`: regenerates the generated fixtures (a no-op in M0).
+//! - `cargo xtask fixtures [--check]`: writes the generated fixtures to `fixtures/syntax/` and
+//!   `fixtures/hostile/` (and their tables in `fixtures/README.md`), or with `--check` fails if
+//!   the committed files differ.
 //! - `cargo xtask oracle [--suite <name>]`: runs the tests that emit oracle cases, then checks them
 //!   with the Python oracle runner (`tools/oracles/run_suite.py`) from the `.venv`.
 //! - `cargo xtask ci`: runs the gate commands from `CLAUDE.md` in order and prints a summary.
@@ -11,6 +13,7 @@
 //! environment error (for example a missing venv or tool).
 
 mod ci;
+mod fixtures;
 mod oracle;
 
 use std::ffi::OsStr;
@@ -21,7 +24,9 @@ const USAGE: &str = "\
 usage: cargo xtask <task>
 
 tasks:
-  fixtures                regenerate the generated fixtures (no-op in M0)
+  fixtures [--check]      write the generated fixtures to fixtures/syntax/ and
+                          fixtures/hostile/; with --check, fail if the committed files
+                          differ from the generators
   oracle [--suite <name>] run the emitting tests, then tools/oracles/run_suite.py on
                           target/oracle[/<name>]
   ci                      run the CLAUDE.md gate commands (fmt, clippy, test, deny, tree checks)
@@ -30,7 +35,7 @@ tasks:
 /// A parsed command line.
 #[derive(Debug, PartialEq, Eq)]
 enum Task {
-    Fixtures,
+    Fixtures { check: bool },
     Oracle { suite: Option<String> },
     Ci,
     Help,
@@ -71,7 +76,7 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             Outcome::Success
         }
-        Task::Fixtures => fixtures(),
+        Task::Fixtures { check } => fixtures::run(&root, check),
         Task::Oracle { suite } => oracle::run(&root, suite.as_deref()),
         Task::Ci => ci::run(&root),
     };
@@ -88,7 +93,11 @@ where
         return Err("missing task".to_owned());
     };
     let task = match task.as_str() {
-        "fixtures" => Task::Fixtures,
+        "fixtures" => match args.next().as_deref() {
+            None => return Ok(Task::Fixtures { check: false }),
+            Some("--check") => Task::Fixtures { check: true },
+            Some(other) => return Err(format!("unexpected argument {other:?} for `fixtures`")),
+        },
         "ci" => Task::Ci,
         "help" | "-h" | "--help" => Task::Help,
         "oracle" => {
@@ -129,12 +138,6 @@ fn is_valid_suite_name(suite: &str) -> bool {
         && suite
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// `cargo xtask fixtures`. M0 has no generated fixtures yet.
-fn fixtures() -> Outcome {
-    println!("xtask: fixtures: nothing to generate yet (M0)");
-    Outcome::Success
 }
 
 /// The workspace root: the parent of this crate's directory.
@@ -185,7 +188,11 @@ mod tests {
 
     #[test]
     fn parses_tasks() {
-        assert_eq!(parse(&["fixtures"]), Ok(Task::Fixtures));
+        assert_eq!(parse(&["fixtures"]), Ok(Task::Fixtures { check: false }));
+        assert_eq!(
+            parse(&["fixtures", "--check"]),
+            Ok(Task::Fixtures { check: true })
+        );
         assert_eq!(parse(&["ci"]), Ok(Task::Ci));
         assert_eq!(parse(&["help"]), Ok(Task::Help));
         assert_eq!(parse(&["--help"]), Ok(Task::Help));
@@ -211,6 +218,7 @@ mod tests {
             &["deploy"],
             &["ci", "--fast"],
             &["fixtures", "x"],
+            &["fixtures", "--check", "--check"],
             &["oracle", "--suite"],
             &["oracle", "--suite", "../etc"],
             &["oracle", "--suite="],

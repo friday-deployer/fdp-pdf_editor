@@ -12,14 +12,37 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4.13"
 folioxide-syntax = { path = "../crates/folioxide-syntax" }
+# `exercise` (open, resolve, decode, page count) for fuzz_parse_document. Test support only.
+folioxide-testkit = { path = "../crates/folioxide-testkit" }
 
 # An empty workspace table keeps this crate out of the root workspace (which also lists it under
 # `exclude`), so `cargo test --workspace` never needs nightly or libFuzzer.
 [workspace]
 
 [[bin]]
-name = "fuzz_smoke"
-path = "fuzz_targets/fuzz_smoke.rs"
+name = "fuzz_lexer"
+path = "fuzz_targets/fuzz_lexer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_filters"
+path = "fuzz_targets/fuzz_filters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_document"
+path = "fuzz_targets/fuzz_parse_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_document_default_limits"
+path = "fuzz_targets/fuzz_parse_document_default_limits.rs"
 test = false
 doc = false
 bench = false

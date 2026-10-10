@@ -133,3 +133,30 @@ def append_update(pdf: bytes, objects: dict[int, bytes]) -> bytes:
         + b" /Prev %d >>\nstartxref\n%d\n%%%%EOF\n" % (int(startxrefs[-1]), xref_offset)
     )
     return bytes(out)
+
+
+def append_free(pdf: bytes, numbers: tuple[int, ...]) -> bytes:
+    """Append an incremental update (§7.5.6) that frees ``numbers`` (generation 0 objects).
+
+    Each freed object gets a free entry with the next generation, 1 (§7.5.4). The new trailer
+    drops ``/Info`` (which may be among the freed objects) and keeps ``/Root`` and ``/Size``.
+    Like :func:`append_update`, the section starts with the object 0 entry.
+    """
+    trailer = pdf[pdf.rindex(b"trailer") :]
+    root = re.search(rb"/Root\s+(\d+\s+\d+\s+R)", trailer)
+    size = re.search(rb"/Size\s+(\d+)", trailer)
+    startxrefs = re.findall(rb"startxref\s+(\d+)", pdf)
+    if root is None or size is None or not startxrefs or not numbers:
+        raise ValueError("append_free needs a classic trailer with /Root and /Size, a startxref "
+                         "and at least one object number")
+    out = bytearray(pdf if pdf.endswith(b"\n") else pdf + b"\n")
+    xref_offset = len(out)
+    out += b"xref\n0 1\n0000000000 65535 f \n"
+    for num in sorted(numbers):
+        out += b"%d 1\n0000000000 00001 f \n" % num
+    out += (
+        b"trailer\n<< /Size %d /Root " % int(size.group(1))
+        + root.group(1)
+        + b" /Prev %d >>\nstartxref\n%d\n%%%%EOF\n" % (int(startxrefs[-1]), xref_offset)
+    )
+    return bytes(out)

@@ -105,7 +105,7 @@ pub(crate) fn run(root: &Path, suite: Option<&str>) -> Outcome {
 }
 
 /// The interpreter inside `<root>/.venv`.
-fn venv_python(root: &Path) -> PathBuf {
+pub(crate) fn venv_python(root: &Path) -> PathBuf {
     let venv = root.join(".venv");
     if cfg!(windows) {
         venv.join("Scripts").join("python.exe")

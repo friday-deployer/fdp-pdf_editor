@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
+import shlex
+import subprocess
 import unittest
 
 import yaml
@@ -71,6 +74,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("cargo install cargo-fuzz", runs)
         self.assertIn("cargo +nightly fuzz build", runs)
         self.assertIn("-max_total_time", runs)
+
+    def test_fuzz_nightly_seeds_every_fixture(self):
+        """The seeding step's `find` selects every committed PDF under fixtures/ (it once used
+        `-size -1M`, which matches only empty files, so the corpora started empty)."""
+        fuzz = load("fuzz-nightly.yml")
+        seed = [s["run"] for s in all_steps(fuzz) if s.get("name", "").startswith("Seed the corpus")]
+        self.assertEqual(len(seed), 1)
+        match = re.search(r"find (fixtures .*?) -exec ", seed[0])
+        self.assertIsNotNone(match, seed[0])
+        found = subprocess.run(["find", *shlex.split(match.group(1)), "-print"], cwd=REPO_ROOT,
+                               capture_output=True, text=True, check=True).stdout.split()
+        committed = sorted(p.relative_to(REPO_ROOT).as_posix()
+                           for p in (REPO_ROOT / "fixtures").rglob("*.pdf"))
+        self.assertGreater(len(committed), 0)
+        self.assertEqual(sorted(found), committed)
+        for group in ("syntax", "qpdf", "hostile"):
+            self.assertTrue(any(f.startswith(f"fixtures/{group}/") for f in found), group)
 
     def test_release_is_manual_and_publish_is_gated(self):
         release = load("release-npm.yml")

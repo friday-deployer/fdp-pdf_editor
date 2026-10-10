@@ -8,6 +8,7 @@ Dev-only helpers. Nothing here is linked into Folioxide: the oracles are externa
 | `setup-venv.sh` | creates `<repo>/.venv` with the pinned oracle packages (`requirements-dev.txt`); idempotent |
 | `requirements-dev.txt` | exact pins: pyHanko, pypdf, pikepdf, pyhanko-certvalidator, asn1crypto, PyYAML |
 | `gen-pki.sh` | generates the test PKI in `fixtures/pki/`; `--check` validates the committed files |
+| `fixtures/qpdf.py` | writes the qpdf-linearized fixtures in `fixtures/qpdf/` (oracle venv); `--check` regenerates and compares them |
 | `tsa/openssl-tsa.cnf` | `openssl ts -reply` configuration for the fixture TSA |
 | `oracles/` | cross-validation scripts and their self-tests |
 
@@ -18,6 +19,7 @@ Requirements: Python 3.11+ (CI uses 3.13), OpenSSL 3.x with the legacy provider,
 bash tools/setup-venv.sh                                         # once
 .venv/bin/python -I -m unittest discover -s tools/oracles/tests  # oracle self-tests
 bash tools/gen-pki.sh --check                                    # validate fixtures/pki
+.venv/bin/python -I tools/fixtures/qpdf.py --check               # validate fixtures/qpdf
 cargo xtask oracle [--suite <name>]                              # Rust-emitted cases
 ```
 
@@ -31,7 +33,7 @@ exits `2` only when nothing failed but something could not be evaluated.
 | Module | Checks |
 |---|---|
 | `oracles/run_suite.py` | the runner: `python -I tools/oracles/run_suite.py DIR...` |
-| `oracles/check_pdf.py` | structure (pdfinfo exit 0 and no syntax errors; pikepdf `check_pdf_syntax()`; pypdf `strict=True` reads every page), page count, effective version, Info entries |
+| `oracles/check_pdf.py` | structure (pdfinfo exit 0 and no syntax errors; pikepdf `check_pdf_syntax()`; pypdf `strict=True` reads every page), page count, effective version, Info entries, in-use object count (pikepdf) |
 | `oracles/validate_sig.py` | pyHanko `intact`/`valid`/`trusted`/coverage/modification/DocMDP/timestamp, cross-checked for every signature with the structural checks, `pdfsig -nocert` and `openssl cms -verify` / `openssl ts -verify` |
 | `oracles/extract_cms.py` | slices `/Contents` DER and the signed byte ranges out of the file for `openssl cms -verify` / `openssl ts -verify`; structural checks: ByteRange starts at 0, gap is the dictionary's own `/Contents`, only zero padding after the CMS |
 | `oracles/pades_profile.py` | PAdES baseline: SubFilter, content-type, message-digest, signing-certificate-v2 present, signing-time absent, B-B/B-T level |
@@ -40,7 +42,8 @@ exits `2` only when nothing failed but something could not be evaluated.
 ### `expect.json` reference
 
 Tests built with `folioxide-testkit/emit` write `target/oracle/<suite>/<name>.pdf` next to
-`<name>.expect.json`. Every case runs the structural checks; each key adds checks:
+`<name>.expect.json`. Every case that is not skipped runs the structural checks; each key adds
+checks:
 
 ```jsonc
 {
@@ -51,6 +54,9 @@ Tests built with `folioxide-testkit/emit` write `target/oracle/<suite>/<name>.pd
   "textAbsent": ["secret"],
   "prefixOf": "input.pdf",                      // incremental save kept every original byte
   "revisions": 2,                               // startxref count and pyHanko's revision count
+  "objectCount": 7,                             // in-use objects: pikepdf len(pdf.objects) minus its nulls
+  "knownFailures": {"structure.pypdf": "why"},  // still run; a failure is XFAIL, a pass is FAIL (stale)
+  "oracleSkip": "why",                          // SKIP: no check runs (files the oracles would repair)
   "trustRoots": ["fixtures/pki/root.pem"],      // trust anchors for "trusted"
   "signatures": [{
     "field": "Signature1",                      // match by name (else by position)
@@ -71,6 +77,11 @@ poppler cannot validate document timestamps) and OpenSSL. The cross-checks must 
 when `intact` and `valid` are both expected. OpenSSL validates the chain only for
 `"trusted": true`; otherwise it checks the digest and the signature value (`cms -verify
 -noverify`, or `ts -verify -partial_chain` anchored at the token's own certificates).
+
+`objectCount` counts the in-use objects of the merged cross-reference data that resolve to a
+non-null object; `check_pdf.check_object_count` documents exactly how pikepdf's count is
+adjusted. `oracleSkip` and `knownFailures` cannot be combined, and `knownFailures` may only name
+checks the case runs. The `syntax` suite (M1) uses all three.
 
 Relative paths resolve against the expect.json's directory first, then the repository root.
 The keys `encrypted`, `xmpContains`, `fields`, `annots`, `fontsEmbedded` and `images` are reserved

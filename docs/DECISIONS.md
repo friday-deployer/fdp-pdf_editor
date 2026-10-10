@@ -72,3 +72,41 @@ Newest entries go at the bottom. Each entry records what was decided, why, and w
 - Every crate and npm package declares `license = "MIT"`.
 - The dependency policy is unchanged: permissive licenses only, enforced by `cargo deny`. Apache-2.0, BSD, ISC
   and Zlib dependencies are compatible with an MIT project.
+
+## D9: Decisions from M1, the syntax layer (manager, 2026-10-10)
+1. **Filters:**
+   - `miniz_oxide` alone handles Flate in both directions: lenient partial inflate, and deflate. `flate2` is not used.
+   - LZW is our own decoder of about 100 lines, so we control `EarlyChange`, leniency and limits. `weezl` is not used.
+   - Filters are always lenient and report a `truncated` flag. The store turns that flag into a diagnostic (Lenient) or an error (Strict).
+   - The `Crypt` filter is the identity in the filter layer, because the security handler owns crypt filters.
+   - `DecodeLimits::max_chain_len` (default 16) bounds `/Filter` arrays.
+2. **Strictness:** `Strict` turns every repair that `Lenient` would make into an error. `LimitExceeded` is a policy outcome and is never downgraded to null, even in lenient mode.
+3. **References:** a reference whose generation does not match the xref resolves to null with a `WrongGeneration` diagnostic in both modes (§7.3.10).
+4. **Reconstructed files:** `XrefKind::Reconstructed` marks files rebuilt by a full scan. **Writers must do a full save** for them; incremental saves are refused.
+5. **Hybrid files (ISO 32000-2 §7.5.8.4):** within one section the table wins, free entries included; then that section's `/XRefStm`; then `/Prev`. This matches qpdf, poppler and pdf.js. Our writers leave compressed objects out of the table, as Acrobat does, and never list them as free.
+6. **Object streams:** a container must itself be an uncompressed object. Members that share one offset are read once: the first reads the value, the others are null with a diagnostic.
+7. **Hostile input stays linear:** opening, resolving every object and decoding every stream are linear in the file size on hostile input. This rests on parse bounds (next object or xref position), xref byte and entry budgets, a memo for shared indirect values, decode budgets charged once per source stream, and bounded reconstruction. Any later change to the store must keep this guarantee, and the tests in `store/tests.rs` enforce it.
+8. **Recovering damaged files is qpdf-compatible.**
+   - **Reference reader:** whenever a file's structure is damaged (bad final `startxref`, an update that no `startxref` reaches, missing xref), the store resolves objects the way **qpdf** does. qpdf is the reference reader for recovery.
+   - **Signalling:** recovery always sets `Store::structure_repaired()` and emits a diagnostic: `XrefReconstructed`, `UnreferencedUpdate` and so on. M3 signature verification treats a repaired structure as "content outside the signed revisions is possible".
+   - **What counts as an object definition during recovery:** a header at a line start, not inside a comment, not inside another parsed object, and keyed by (number, generation). Decoy text never shadows a valid chain.
+   - **Never trusted:** header text inside an object that parses successfully never changes what a valid chain resolves to. This covers strings in arrays and dictionaries, strings that do not start a line, and stream data. qpdf (and pdf.js) take such line-start headers in damaged files; we keep the valid chain by design.
+   - **How decoys are recognised:** one coverage pass, linear by construction, walks the line-start headers in file order.
+     - A parse that **succeeds** covers its bytes; header text inside it is ignored.
+     - A parse that **fails** covers only what it read. Headers inside that failed stretch are taken as definitions, as qpdf takes them.
+     - During this pass, hex strings end at their first invalid byte, as in qpdf. Value reads stay lenient.
+     - There is no budget and no cutoff.
+   - **Accepted differences from qpdf:**
+     - (a) a number deleted in a later revision after its last on-disk definition stays deleted, where qpdf, pdf.js and poppler would show it again if referenced;
+     - (b) the decoy cases above;
+     - (c) a container closed at an object keyword reads as truncated, where qpdf gives null;
+     - (c2) an object that holds a header taken from a failed stretch reads only up to that header, where qpdf reads it whole;
+     - (c3) qpdf's 10-byte first-token cut is not copied;
+     - (d) an object whose `endobj` is the last token in the file, which qpdf nulls ("EOF after endobj");
+     - (e) a table entry whose generation disagrees with its header is accepted and marked recovered.
+9. **Errors and names:**
+   - `Error` is a `#[non_exhaustive]` thiserror enum; callers match on `code()`.
+   - `ErrorCode` serializes as SCREAMING_SNAKE_CASE, and the JS code is `E_` plus that name.
+   - `DiagnosticKind` and `Strictness` serialize as camelCase.
+10. **Fixtures:** they are generated deterministically by `folioxide-testkit`, with offsets relative to the `%PDF-` header. `cargo xtask fixtures --check` is part of `cargo xtask ci`.
+11. **Oracle `objectCount`:** our count is the in-use ids from the merged xref that resolve to non-null objects. pikepdf's count is `len(pdf.objects)` minus nulls, because qpdf lists objects that an older revision used and a newer revision freed.

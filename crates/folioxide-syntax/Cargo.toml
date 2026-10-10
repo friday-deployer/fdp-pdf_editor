@@ -7,7 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# `Serialize`/`Deserialize` on `ErrorCode`, `Limits`, `Diagnostic` and the other DTO-like types.
+serde = ["dep:serde"]
+
 [dependencies]
+indexmap.workspace = true
+miniz_oxide.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+# Fixtures, mutations and oracle output for the integration tests (M1 WP1.5).
+folioxide-testkit.workspace = true
 
 [lints]
 workspace = true

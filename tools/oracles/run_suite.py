@@ -13,7 +13,8 @@ runs the baseline structural checks plus one check per expect key, and prints a 
 
 Exit codes:
 
-* ``0``: every check passed, or no cases were found (prints "no oracle cases")
+* ``0``: every check passed (skipped cases aside), or no cases were found (prints "no oracle
+  cases")
 * ``1``: at least one check failed, even when other cases ended in ERROR (a genuine failure is
   never reported as an environment problem; the ERROR rows are still printed)
 * ``2``: no check failed, but there was a usage or environment error: a missing DIR, tool or
@@ -30,15 +31,31 @@ Expect keys (§A.9). Implemented:
 * ``textContains`` / ``textAbsent`` (lists of strings): see ``text_check.py``
 * ``prefixOf`` (path): the PDF starts with every byte of that file (incremental-save integrity)
 * ``revisions`` (int): number of ``startxref`` keywords in the file, and pyHanko's revision count
+* ``objectCount`` (int, M1 brief WP1.5): in-use objects, compared with pikepdf's
+  ``len(pdf.objects)`` minus its null entries; see ``check_pdf.check_object_count`` for the
+  exact rules
 
 Not implemented yet (exit 2 until their milestone adds them): ``encrypted``, ``xmpContains``,
 ``fields``, ``annots``, ``fontsEmbedded``, ``images``.
 
-Meta key: ``trustRoots`` (list of paths) adds trust anchors for ``signatures``, on top of any
-``--trust-root``. Relative paths in expect.json (``prefixOf``, ``trustRoots``) are resolved
-against the expect.json's directory first, then against the repository root.
+Meta keys:
 
-Every case also runs the structural checks of ``check_pdf.py`` (pdfinfo, pikepdf, pypdf).
+* ``trustRoots`` (list of paths) adds trust anchors for ``signatures``, on top of any
+  ``--trust-root``. Relative paths in expect.json (``prefixOf``, ``trustRoots``) are resolved
+  against the expect.json's directory first, then against the repository root.
+* ``oracleSkip`` (non-empty string, the reason): the case is listed as SKIP and no check runs,
+  not even the structural ones. For files the oracles cannot read without repairing them, such
+  as the deliberately broken fixtures of the ``syntax`` suite (M1 brief WP1.5). The case's other
+  keys must still be known and implemented, but their values are not checked.
+* ``knownFailures`` (object: check name -> non-empty reason string): those checks still run, and
+  their failure is expected. A listed check that fails passes as ``XFAIL`` with the reason; one
+  that passes FAILs (the entry is stale and must be removed); naming a check the case does not
+  run is an error (exit 2). For documented limitations of one oracle on an otherwise readable
+  file, for example pypdf's strict mode on bytes before ``%PDF-``. Cannot be combined with
+  ``oracleSkip``.
+
+Every case that is not skipped also runs the structural checks of ``check_pdf.py`` (pdfinfo,
+pikepdf, pypdf).
 """
 
 from __future__ import annotations
@@ -77,10 +94,12 @@ from oracle_common import (  # noqa: E402
 
 EXPECT_SUFFIX = ".expect.json"
 
-#: Every expect key named in docs/ARCHITECTURE.md §A.9, in the order checks run.
+#: Every expect key named in docs/ARCHITECTURE.md §A.9, plus ``objectCount`` (M1 brief WP1.5),
+#: in the order checks run.
 SPEC_KEYS = (
     "pages",
     "version",
+    "objectCount",
     "encrypted",
     "info",
     "xmpContains",
@@ -95,7 +114,7 @@ SPEC_KEYS = (
     "revisions",
 )
 #: Keys that configure the run instead of naming a check.
-META_KEYS = frozenset({"trustRoots"})
+META_KEYS = frozenset({"trustRoots", "oracleSkip", "knownFailures"})
 
 
 @dataclass
@@ -107,6 +126,8 @@ class Case:
     expect_path: Path
     expect: dict[str, Any] = field(default_factory=dict)
     trust_roots: list[Path] = field(default_factory=list)
+    skip_reason: str | None = None
+    known_failures: dict[str, str] = field(default_factory=dict)
 
 
 CheckFn = Callable[[Case, Any], list[CheckResult]]
@@ -140,6 +161,11 @@ def _check_version(case: Case, value: Any) -> list[CheckResult]:
 @register("info")
 def _check_info(case: Case, value: Any) -> list[CheckResult]:
     return check_pdf.check_info(case.pdf, value)
+
+
+@register("objectCount")
+def _check_object_count(case: Case, value: Any) -> list[CheckResult]:
+    return check_pdf.check_object_count(case.pdf, value)
 
 
 @register("signatures")
@@ -200,11 +226,15 @@ class CaseOutcome:
     case_label: str
     results: list[CheckResult] = field(default_factory=list)
     error: str | None = None  # usage/environment problem: the case could not be evaluated
+    skipped: str | None = None  # the oracleSkip reason: no check ran
+    waived: set[str] = field(default_factory=set)  # checks that failed as listed in knownFailures
 
     @property
     def status(self) -> str:
         if self.error is not None:
             return "ERROR"
+        if self.skipped is not None:
+            return "SKIP"
         return "PASS" if all(r.ok for r in self.results) else "FAIL"
 
 
@@ -248,20 +278,64 @@ def load_expect(case: Case, default_roots: list[Path]) -> None:
     roots = expect.get("trustRoots", [])
     if not isinstance(roots, list) or not all(isinstance(r, str) for r in roots):
         raise ExpectError("'trustRoots' must be a list of paths")
+    skip = expect.get("oracleSkip")
+    if skip is not None and (not isinstance(skip, str) or not skip.strip()):
+        raise ExpectError(f"'oracleSkip' must be a non-empty reason string, got {skip!r}")
+    known = expect.get("knownFailures", {})
+    if not isinstance(known, dict) or not all(
+        isinstance(name, str) and name and isinstance(reason, str) and reason.strip()
+        for name, reason in known.items()
+    ):
+        raise ExpectError("'knownFailures' must map check names to non-empty reason strings")
+    if skip is not None and known:
+        raise ExpectError("'knownFailures' has no effect on a case with 'oracleSkip'; drop one")
     case.expect = expect
     case.trust_roots = list(default_roots) + [resolve_path(r, case.expect_path.parent) for r in roots]
+    case.skip_reason = skip
+    case.known_failures = dict(known)
+
+
+def apply_known_failures(case: Case, outcome: CaseOutcome, results: list[CheckResult]) -> list[CheckResult]:
+    """Turn the failures listed in ``knownFailures`` into passes, and their passes into failures.
+
+    Raises :class:`ExpectError` when a listed check did not run for this case.
+    """
+    out: list[CheckResult] = []
+    ran: set[str] = set()
+    for result in results:
+        reason = case.known_failures.get(result.name)
+        ran.add(result.name)
+        if reason is None:
+            out.append(result)
+        elif result.ok:
+            out.append(failed(result.name, f"passed, but knownFailures lists it ({reason}); "
+                                           "remove the entry"))
+        else:
+            outcome.waived.add(result.name)
+            out.append(passed(result.name, f"known failure: {reason} [{result.detail}]"))
+    missing = sorted(set(case.known_failures) - ran)
+    if missing:
+        raise ExpectError(f"'knownFailures' names check(s) {missing} that this case does not run")
+    return out
 
 
 def run_case(case: Case, default_roots: list[Path]) -> CaseOutcome:
     outcome = CaseOutcome(case.label)
+    results: list[CheckResult] = []
     try:
         load_expect(case, default_roots)
-        outcome.results.extend(check_pdf.structure_checks(case.pdf))
+        if case.skip_reason is not None:
+            outcome.skipped = case.skip_reason
+            return outcome
+        results.extend(check_pdf.structure_checks(case.pdf))
         for key in SPEC_KEYS:
             if key in case.expect:
-                outcome.results.extend(REGISTRY[key](case, case.expect[key]))
+                results.extend(REGISTRY[key](case, case.expect[key]))
+        outcome.results.extend(apply_known_failures(case, outcome, results))
     except (ExpectError, OracleEnvError) as exc:
         outcome.error = str(exc)
+        outcome.waived.clear()
+        outcome.results = results  # what ran before the error, for the JSON report
     return outcome
 
 
@@ -271,10 +345,15 @@ def print_table(outcomes: list[CaseOutcome], failures_only: bool) -> None:
         if o.error is not None:
             rows.append(("ERROR", o.case_label, "-", o.error))
             continue
+        if o.skipped is not None:
+            if not failures_only:
+                rows.append(("SKIP", o.case_label, "-", o.skipped))
+            continue
         for r in o.results:
             if failures_only and r.ok:
                 continue
-            rows.append(("PASS" if r.ok else "FAIL", o.case_label, r.name, r.detail))
+            status = ("XFAIL" if r.name in o.waived else "PASS") if r.ok else "FAIL"
+            rows.append((status, o.case_label, r.name, r.detail))
     if not rows:
         return
     w_case = max(len("CASE"), *(len(r[1]) for r in rows))
@@ -316,15 +395,17 @@ def main(argv: list[str] | None = None) -> int:
     outcomes.sort(key=lambda o: o.case_label)
 
     print_table(outcomes, args.failures_only)
-    counts = {s: sum(1 for o in outcomes if o.status == s) for s in ("PASS", "FAIL", "ERROR")}
+    counts = {s: sum(1 for o in outcomes if o.status == s) for s in ("PASS", "FAIL", "ERROR", "SKIP")}
     checks = sum(len(o.results) for o in outcomes)
+    waived = sum(len(o.waived) for o in outcomes)
     print(f"\noracle: {len(outcomes)} case(s), {checks} check(s): "
-          f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['ERROR']} error(s)")
+          f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['ERROR']} error(s), "
+          f"{counts['SKIP']} skipped; {waived} known failure(s)")
 
     if args.json_report is not None:
         report = [
-            {"case": o.case_label, "status": o.status, "error": o.error,
-             "checks": [r.to_json() for r in o.results]}
+            {"case": o.case_label, "status": o.status, "error": o.error, "skipped": o.skipped,
+             "checks": [{**r.to_json(), "knownFailure": r.name in o.waived} for r in o.results]}
             for o in outcomes
         ]
         args.json_report.parent.mkdir(parents=True, exist_ok=True)

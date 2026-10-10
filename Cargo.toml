@@ -26,6 +26,11 @@ folioxide-redact = { path = "crates/folioxide-redact", version = "0.1.0", defaul
 folioxide-render = { path = "crates/folioxide-render", version = "0.1.0", default-features = false }
 folioxide-testkit = { path = "crates/folioxide-testkit", version = "0.1.0", default-features = false }
 
+# folioxide-syntax object model and errors (M1 WP1.1, ARCHITECTURE §A.5).
+indexmap = { version = "2.14.2", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.21", default-features = false }
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+
 # RustCrypto 2026 stack (M0 dependency spike, ARCHITECTURE §A.5 "Gaps" 2 and 5).
 # `rsa` and `cms` are pre-releases and pinned exactly: `pkcs12 0.2.0-pre.0` (via p12-keystore)
 # requires `cms = "=0.3.0-pre.1"`, so the whole graph must agree on that version.
@@ -45,6 +50,14 @@ der = { version = "0.8.2", default-features = false, features = ["derive", "oid"
 napi ={ version = "3.14.2", default-features = false, features = ["napi8", "dyn-symbols"] }
 napi-derive = { version = "3.6.12" }
 napi-build = { version = "2.6.0" }
+
+# Syntax layer: stream filters (M1 WP1.2, ARCHITECTURE §A.5). `miniz_oxide` does both the lenient
+# partial inflate and the deflate encoder, so `flate2` is not needed; LZW is our own implementation.
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+
+# Property tests (M1 WP1.4, ARCHITECTURE §A.9 layer 3). Dev-dependency only. `std` without the
+# default `fork`/`timeout` features, which pull in rusty-fork and tempfile.
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

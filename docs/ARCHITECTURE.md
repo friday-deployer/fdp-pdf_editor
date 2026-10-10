@@ -163,7 +163,8 @@ pub enum Object {
 }
 pub struct PdfString { pub bytes: Vec<u8>, pub hex: bool }   // keep literal vs hex form (sig /Contents must stay hex)
 pub struct Name(Box<[u8]>);                                  // decoded bytes (#xx resolved); PartialEq<&[u8]>, consts for common keys
-pub struct Dict(IndexMap<Name, Object>);                     // preserves order (deterministic output, readable diffs)
+pub struct Dict(Box<IndexMap<Name, Object>>);                // preserves order (deterministic output, readable diffs);
+                                                             // boxed so that an Object is 32 bytes (arrays of numbers)
 pub struct Stream { pub dict: Dict, pub data: StreamData }
 pub enum StreamData {
     Source(Range<u64>),            // still-encoded bytes inside the source buffer (zero-copy; resolved through the doc)
@@ -174,43 +175,151 @@ pub enum StreamData {
 
 ### The document store (lazy, `Send + Sync`, no mandatory threads)
 
+The M1 shape (`folioxide_syntax::store`, re-exported at the crate root). Fields marked M2/M5 arrive with the edit API and decryption.
+
 ```rust
-pub type SharedBytes = Arc<dyn AsRef<[u8]> + Send + Sync>; // Vec<u8>, Arc<[u8]>, or Mmap (std-fs)
+pub type SharedBytes = Arc<dyn AsRef<[u8]> + Send + Sync>; // Vec<u8>, Box<[u8]>, &'static [u8], or Mmap (std-fs); shared_bytes(b)
 
 pub struct Store {
-    source: Option<SharedBytes>,
-    header_offset: u64,                    // junk before "%PDF-" shifts every offset (see risk register)
+    source: SharedBytes,
+    options: OpenOptions,                  // #[non_exhaustive] { strictness, limits }; password arrives in M5
+    header_offset: u64,                    // junk before "%PDF-": every offset in the file is relative to the header (Annex H)
+    version: (u8, u8),                     // from the header; (1, 4) when missing or malformed
     revisions: Vec<Revision>,              // oldest → newest
-    index: Vec<Slot>,                      // dense by object number (bounded by Limits::max_objects)
-    edits: BTreeMap<u32, Edit>,            // the dirty set: what an incremental save writes
-    next_num: u32,
-    decryptor: Option<Arc<dyn Decryptor>>, // implemented by folioxide-security
-    objstm_cache: HashMap<u32, OnceLock<Result<Arc<ObjStm>, ErrorCode>>>,
-    limits: Limits,
-    diagnostics: Mutex<Vec<Diagnostic>>,   // repairs and leniency warnings (std Mutex works without threads and on wasm)
+    trailer: Dict,                         // the newest trailer, repaired (/Root, /Encrypt from older trailers or a scan)
+    slots: Vec<Slot>,                      // the merged xref's IN-USE objects, SORTED by object number (binary search, O(1)
+                                           // fast path when numbering is dense); never sized from /Size; free entries take no
+                                           // slot (a free or unlisted number reads as null); at most object_cap (see Rules)
+    others: Vec<Slot>,                     // further generations of numbers in `slots`, sorted by (number, generation): a
+                                           // reconstruction keeps every generation it finds (`5 0 obj` and `5 1 obj` are
+                                           // different objects, §7.3.10, as in qpdf); a reference resolves to the one with its
+                                           // own generation. Empty for a file read through its xref data
+    max_object_number: u32,                // largest number any section lists, free entries included
+    offset_base: OffsetBase,               // HeaderRelative | Absolute: which position the file's offsets count from (Annex H)
+    structure_repaired: AtomicBool,        // set when opening repaired the xref structure (see structure_repaired())
+    by_position: Vec<u32>,                 // indices (`slots`, then `others`) of the in-file slots sorted by position: an
+                                           // object's parse region ends at the next object or xref section (`region_end`)
+    by_container: Vec<u32>,                // indices of the compressed slots sorted by (object stream, index): the objects
+                                           // one container settles when it is decoded again (see Rules)
+    section_starts: Vec<usize>,            // absolute positions of the xref sections read (tables, streams, /XRefStm)
+    objstm_cache: Mutex<ObjStmCache>,      // decoded containers: number → Arc<OnceLock<Result<Arc<ObjStm>, Error>>>,
+                                           // LRU within Limits::max_objstm_cache bytes (see Rules); the lock is held
+                                           // only to fetch or account a cell, never while decoding. Nested loads put
+                                           // their private (quiet) decodes here too; a blocking load replaces such an
+                                           // entry with its own decode, which reports diagnostics (never two copies)
+    peeked_objects: Mutex<HashMap<ObjectId, Option<Arc<Object>>>>,     // peek memo for nested loads (see Rules)
+    settled: Mutex<HashMap<u32, Result<Arc<Object>, Box<Error>>>>,  // compressed objects a settling pass loaded with their
+                                           // container, taken by their slot's first load (see Rules: settling never waits)
+    objstm_parsed: AtomicU64,              // memory of the objects parsed from object streams (ParseBudget estimate),
+                                           // at most LimitKind::ObjStmParsed
+    scan: OnceLock<ScanIndex>,             // one linear scan of the file, built at most once and only when needed
+                                           // (reconstruction, a wrong offset or /Length); also the parser's KeywordIndex
+    definitions: OnceLock<Definitions>,    // the object definitions among the scan's headers, by (number, generation):
+                                           // line-start headers outside every object that parses (see Rules), derived once
+    diagnostics: DiagnosticLog,            // bounded by Limits::max_diagnostics (std Mutex: works without threads and on wasm)
+    total_decoded: AtomicU64,              // enforces Limits::max_total_decoded: each SOURCE stream counts once (see Rules)
+    charged: Mutex<HashMap<(u64, u64), u64>>, // bytes charged per source stream (by data range): re-decodes are free,
+                                           // object-stream containers included (see Rules)
+    reconstruct_budget: AtomicU64,         // decoded bytes a reconstruction may still spend on object-stream headers
+    parsed_objects: AtomicUsize,           // #[doc(hidden)] parsed_object_count(), for the laziness test
+    // M2: edits: BTreeMap<u32, Edit>, next_num: u32 (the dirty set an incremental save writes)
+    // M5: decryptor: Option<Arc<dyn Decryptor>> (implemented by folioxide-security)
 }
-pub struct Slot { loc: Location, gen: u16, parsed: OnceLock<Result<Arc<Object>, ErrorCode>> }
-pub enum Location { Free { next_gen: u16 }, InFile { offset: u64 }, InObjStm { stream: u32, index: u32 }, Missing }
-pub enum Edit { Set(Object), Free }
-pub struct Revision {
-    pub startxref: u64,
-    pub eof_end: u64,            // offset after "%%EOF" + EOL; signatures cover [0, eof_end) of some revision
-    pub xref_kind: XrefKind,     // Table | Stream | Hybrid
-    pub trailer: Dict,
+struct Slot {                              // 48 bytes; one per in-use object
+    num: u32,
+    gen: u16,                              // 0 for compressed objects
+    recovered: AtomicBool,                 // its location did not come from the xref as written (recovered_objects())
+    loc: Location,
+    parsed: OnceLock<Result<Arc<Object>, Box<Error>>>, // the full Error (code, offset, message), boxed to keep the slot
+                                           // small. Lenient: an unreadable object is stored as Ok(null) and reported once;
+                                           // strict: the error is stored. LimitExceeded is an Err in both modes.
 }
-pub trait Decryptor: Send + Sync {
+enum Location {                            // in-use only: a free number has no slot, like an unlisted one (both null)
+    InFile { pos: u64 },                   // ABSOLUTE position in `source` (header offset already added)
+    InObjStm { stream: u32, index: u32 },  // entry `index` of object stream `stream`; generation 0
+}
+struct ObjStm {                            // a decoded, validated object stream (§7.5.7); data + 20 B per member
+    num: u32,
+    data: Vec<u8>,                         // the decoded container (≤ max_objstm_decoded, so 32-bit offsets)
+    members: Vec<Entry>,                   // one per header pair read, in header order (the xref index addresses it);
+                                           // at most object_cap pairs are read (the rest ignored: `capped`)
+    by_number: Vec<(u32, u32)>,            // (object number, index), sorted: lookups when the index is wrong
+    extends: Option<ObjectId>,             // /Extends, followed with loop detection and Limits::max_ref_chain
+    capped: bool,
+}
+struct Entry { num: u32, start: u32, end: u32 }      // 12 bytes; num 0 = invalid pair. end = the next member's offset
+                                                     // (start, for a second number at an offset already taken):
+                                                     // each member is parsed in its region
+
+#[non_exhaustive] pub struct Revision { // one LOGICAL section, in /Prev order (oldest first), not a byte range in file
+                                 // order: a linearized file's newest section is the first-page xref near the start
+    pub startxref: u64,          // offset of this revision's xref section RELATIVE TO THE HEADER (what a startxref or a
+                                 // later /Prev holds when offset_base is HeaderRelative; add header_offset for Absolute);
+                                 // the repaired value when the file's own offset was wrong
+    pub eof_end: u64,            // ABSOLUTE position after "%%EOF" + EOL; signatures cover [0, eof_end) of some revision.
+                                 // Found from the `startxref` whose value points at this section (the first one after
+                                 // it), so a linearized first-page section ends with the file, not at its dummy
+                                 // "startxref 0 %%EOF". Without one: the first %%EOF within 2 KB of the section; without
+                                 // %%EOF: the end of the startxref line, else of the section (of the file for the newest).
+                                 // NOT monotonic across revisions; an incremental save appends after source.len(),
+                                 // never after an eof_end
+    pub section_end: u64,        // ABSOLUTE end of the section itself (trailer dict, or xref stream object)
+    pub xref_stm: Option<u64>,   // hybrid only: offset (header-relative, like startxref) of the /XRefStm stream read
+    pub xref_kind: XrefKind,     // #[non_exhaustive] Table | Stream | Hybrid | Reconstructed (no trustworthy revision
+                                 // structure: write with a full save, not an incremental one)
+    pub trailer: Dict,           // as written; for an xref stream, the stream dictionary
+}
+#[non_exhaustive] pub enum OffsetBase { HeaderRelative, Absolute } // which position offsets count from: how the newest
+                                 // section was found
+                                 // (at offset + header_offset, or at the offset itself), else where the catalog's entry is
+#[non_exhaustive] pub enum XrefEntry {          // one entry as a section writes it (Store::revision_entries)
+    Free { gen: u16 },           // also an entry for the null object: an unknown xref-stream type (§7.5.8.3) or an
+                                 // in-use entry with an out-of-range generation/offset; it HIDES older entries, as any
+                                 // entry does (skipping it would let an older object show through: a reader differential)
+    InFile { pos: u64, gen: u16 }, // ABSOLUTE position
+    InObjStm { stream: u32, index: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Resolved<'a> {          // what deref() returns; Deref<Target = Object>, into_arc(), into_owned()
+    Direct(&'a Object),          // the input was not a reference: no clone, no Arc
+    Indirect(Arc<Object>),       // the shared object at the end of the reference chain (null if missing or free)
+}
+
+pub trait KeywordIndex {         // parser hook (ParseCtx::with_keyword_index): stream recovery asks it for the next
+    fn next_endstream(&self, from: usize) -> Option<usize>; // `endstream` / `endobj` instead of searching the buffer
+    fn next_endobj(&self, from: usize) -> Option<usize>;    // again for every broken stream (O(log n) per object). The
+}                                // store's ScanIndex implements it; positions are verified, so a wrong index can only
+                                 // make recovery slower, never produce a range outside the buffer
+
+pub trait Decryptor: Send + Sync {                           // M5
     fn decrypt_string(&self, id: ObjectId, data: &mut Vec<u8>) -> Result<()>;
     fn decrypt_stream(&self, id: ObjectId, dict: &Dict, data: Vec<u8>) -> Result<Vec<u8>>;
     fn encrypt_string(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>>;
     fn encrypt_stream(&self, id: ObjectId, dict: &Dict, data: &[u8]) -> Result<Vec<u8>>;
     fn is_exempt(&self, id: ObjectId) -> bool; // /Encrypt dict, xref streams, sig /Contents, unencrypted metadata
 }
+pub enum Edit { Set(Object), Free }                          // M2
 ```
 
+Public read API (M1): `Store::open(SharedBytes, &OpenOptions)`, `open_bytes(Vec<u8>, &OpenOptions)`, `resolve(&self, ObjectId) -> Result<Arc<Object>>`, `deref(&self, &'a Object) -> Result<Resolved<'a>>`, `stream_data(&self, &Stream) -> Result<StreamBytes { data, remaining, truncated }>`, `raw_stream_data(&self, &Stream) -> Result<Cow<[u8]>>`, `trailer()`, `root_id()`, `revisions()`, `revision_entries(k) -> Result<Vec<(u32, XrefEntry)>>` (re-reads one revision's section lazily: its entries as written, then its /XRefStm's, free ones included), `header_offset()`, `offset_base()`, `version()`, `object_ids()`, `max_object_number()`, `structure_repaired()`, `recovered_objects() -> Vec<ObjectId>`, `diagnostics()`, `dropped_diagnostics()`, `total_decoded()`, `source()`, `shared_source()`, `options()`, `limits()`. `Store: Send + Sync` is asserted in a test.
+
 ### Rules
-- **Read path:** `edits` first, then `Slot.parsed` (parsed once via `OnceLock` from the source), and an error becomes `Object::Null` plus a `Diagnostic`. The API is `resolve(&self, id) -> Result<Arc<Object>>` with `&self`, so concurrent readers are safe.
-- **Write path:** `set(&mut self, id, obj)`, `get_mut(&mut self, id) -> &mut Object` (copy-on-write into `edits`), `add(&mut self, obj) -> ObjectId`, `free(&mut self, id)`.
-- **Decryption happens at parse time, on a copy.** The source bytes stay ciphertext. This is what makes incremental saves of encrypted files possible.
+- **Opening reads structure only:** the header, the xref chain (`startxref` → `/Prev` → …, with `/XRefStm` for hybrids; loops and `Limits::max_xref_sections` cut the chain), the trailer, and the catalog (parsed once to check it is a dictionary; it stays cached). Encryption is checked before the catalog is parsed. Nothing else is parsed until it is resolved, and the file is scanned only when the xref data is unusable (full reconstruction) or turns out wrong. **Recovery matches qpdf 12** (pikepdf 10.16 is the oracle) wherever the structure is damaged: qpdf, pdf.js and poppler reconstruct a file whose last `startxref` does not lead to a section at its offset, and the last definition of each object by position wins. The store keeps more of the file's own structure, but only when it shows what that reconstruction shows (`Store::differs_from_reconstruction`): (a) when the last `startxref` leads to no section, the earlier `startxref` values are tried newest first (at most 8, lenient only), so a valid multi-revision file with a bogus tail keeps its revisions; (b) when the newest section is found near its offset or at its offset counted from byte 0 (concatenated files, where the second file's `startxref` leads near the first file's table), its chain is checked the same way. Such a chain is used only when nothing but junk follows its revisions (no object header or `trailer` at the start of a line: an appended update whose own `startxref` is the damaged one, or a second file, is `UnreferencedUpdate` and makes the file reconstructed) and before that tail every object definition is where the chain resolves it (`Store::shadowed_definition`: an orphan `N G obj` after the definition the table lists for `N G`, an uncompressed `N 0 obj` after the object stream an entry names, a definition after the section that frees the number, or a number no section lists, all make the file reconstructed; `structure_repaired()`). Such a chain also gets the other generations the reconstruction would show (`5 1 obj` besides the table's `5 0 obj`, added to `others` and `recovered_objects()`), so `5 1 R` resolves as in qpdf while `5 0 R` keeps the revision's object.
+- **What counts as an object definition** (`repair::definitions`, used by reconstruction, the shadow check, the scan fallback of `locate` and the update detection): an `N G obj` header **at the start of a line** (after optional white-space), the way qpdf and poppler rebuild a file, so header-like text in the middle of a line, and so inside a `%` comment, never counts; and **not inside an object that parses**. One **coverage pass** goes over the line-start candidates in file order and parses each one it reaches with the real parser (lenient, quiet; an indirect `/Length` is read from the last candidate for that object, parsed only up to the next header after it). A parse that **succeeds** (the parser knows where the object ends: a wrong `/Length` delimited by `endstream` or a missing `endobj` are fine) covers `[pos, end)`, and the candidates inside it (a header inside the object's string, dictionary or stream data) are text, skipped. A parse that **fails**, or only guesses where the object ends (a container closed by an object keyword, a stream without `endstream`, `stream` after a value that is not a dictionary), covers what it read, `[pos, where the lexer stopped)`, and the candidates inside it are **definitions taken unparsed**, as qpdf takes every line-start header: nothing tells whether the damaged object encloses them (when a header `N G obj` closed the containers, the stretch ends before that header, whose object is parsed in turn). The pass then resumes at the first candidate after the stretch. **Linear by construction, no budget:** the stretches never overlap, and a parse reads past its stretch at most one lookahead token (and the white-space and comments before it), or the header `N G obj` that closed its containers (`parser::parse_indirect_extent` reports how far a parse read, lookahead included; only an integer value has a lookahead, the one for `N G R`, which lexes a token only when its first byte can start a number, so it never reads a string past the object's end, and after such a number one more only when it starts with `R`). A token is read ahead only by the parse whose value it follows: the next parse starts at the first candidate after the stretch, not before that token, and reads again at most the number or header it starts with. So together the parses read the file about once (`Definitions::bytes_read`; tests `the_coverage_parses_read_the_file_about_once`, `resolving_damaged_objects_is_linear`, `an_extent_reads_past_the_value_only_its_lookahead`). A literal string that never closes stops after 4 KiB (`lexer::ParenIndex`: one pass sums the unescaped parentheses per 4 KiB block, with 64-way summaries above, which answers whether a string closes in about 4 KiB of work), so it takes the headers in those 4 KiB, not every header to the end of the file; past them, objects that parse still cover their text. (Reading such a string to the end of the file is linear too; stopping early matched qpdf as well or better on every probe: the objects after it read whole, and a header in a top-level string, which qpdf's token cut skips, stays text.) A hexadecimal string ends, and its parse fails, at its first byte that is neither a hexadecimal digit nor white-space, where qpdf's token ends (`ParseCtx::with_hex_ending_at_invalid_byte`, coverage parses only; value reads stay lenient, trap #14). Definitions are keyed by number **and generation**: another generation of `N` is another object (§7.3.10) and shadows nothing; the newest definition of each number is the entry the merged view shows, the others are kept (`others`). A definition inside stream data (by the scan's lexical state) still loses to a clean one. Every definition of the pass counts alike, for reconstruction and for the chain decision (`shadowed_definition`, `newer_data_after`). Text inside an object that parses is never a definition, so it never changes what a valid chain resolves to; where qpdf differs, see trap #14 (deliberate differences).
+- **An update that no `startxref` leads to** (object headers, `xref` or `trailer`, each at the start of a line, after the end of the newest revision: a save cut short before its `startxref`, content appended outside any revision, a second file appended to the first) is a `DiagnosticKind::UnreferencedUpdate` repair (`structure_repaired()`; an error in strict mode, whose message only says what was found), found by a linear look at the bytes after the last `eof_end`, without the full scan. What the store shows then matches qpdf 12, which looks for the last `startxref` only in the last 1054 bytes: when it is there, qpdf reads the chain and ignores the update (as poppler and pypdf do whatever the distance); when it is not, qpdf scans the file and still reads the chain when the last `startxref` comes after the last object header ("startxref was more than 1024 bytes before end of file"), so the store reconstructs only when the last `startxref` is more than 1054 bytes from the end **and** an object header (line start) follows it. (qpdf also requires the chain's `/Root` to have a `/Pages` dictionary before it keeps the chain; the store does not check that.) Junk after `%%EOF` (comments, binary data, another `%%EOF`, header-like text in a comment or in the middle of a line) is not an update and is not reported.
+- **Opening is linear in the file size, whatever the xref data claims** (`xref.rs` `XrefBudget`): all sections and every attempt together may parse at most `max(1 MiB, 4 × len)` source bytes (overlapping sections, unterminated trailers) and read at most `max(2^20, 4 × len)` entries (a `/Prev` chain of highly compressed xref streams); xref-stream rows are merged as they are decoded (no per-section copy), with an output cap from the rows left. At most `object_cap = min(max_objects, max(4096, len))` in-use objects are kept (the lowest numbers): a file cannot claim more objects than it has bytes. Exceeding a budget cuts the chain (lenient: a diagnostic, then the scan fills in; strict: `LimitExceeded`). Derived budgets are reported under their own `LimitKind` (`XrefEntries`, `XrefBytes`, `ObjectCap`, `ReconstructDecoded`, `ObjStmParsed`; `MaxObjects` when that field is the smaller bound), whose message says to raise `Limits::budget_scale`, which multiplies all of them (`Limits::budget(kind, len)` computes each). A reconstruction reads object streams for their member lists only, uncached, within `max(16 MiB, 16 × len)` decoded bytes, and parses trailer candidates only up to the next object header or `trailer` keyword.
+- **Object streams are bounded three ways** (their decoded data can be ~1000× the file): one container decodes to at most `Limits::max_objstm_decoded` (64 MiB; real ones are a few hundred KB) and lists at most `object_cap` members (20 B of tables each); the decoded containers kept take at most `Limits::max_objstm_cache` (64 MiB, LRU; the container in use is always kept), and a container decoded again after it was dropped *settles* its objects: the same pass loads every object the xref puts in it that is not loaded yet (`Store::settle_container`; a blocking load puts them in the `settled` memo, which each slot's first load takes, and a nested load fills the peek memo with the members found in the container itself), so however the cache thrashes, the loads of a container's own objects decode it at most twice for blocking loads and twice for nested ones (plus once when a blocking load replaces a nested load's quiet decode). Each container's source data therefore counts once against `max_total_decoded`, like any stream, and a long-lived store with scattered access never runs out of budget; only a dropped container decoded again to follow another one's `/Extends` (the xref names the wrong object stream: a damaged file) is charged again; and the objects parsed from object streams take at most `LimitKind::ObjStmParsed = max(64 MiB, 128 × len)` bytes over the life of the store (an estimate the parser charges as it builds: 32 B per value, string and name bytes, dictionary overheads), so `[0 0 0 …]` decoded from kilobytes cannot become gigabytes of objects. Real files measure 25–55 bytes per file byte even when they hold nothing but object streams.
+- **Xref precedence:** the newest section that lists an object number wins. Within a hybrid section the **table wins over its `/XRefStm` stream, free entries included**; the stream supplies only numbers the table does not list, before the `/Prev` section is consulted (§7.5.8.4: "if an entry is not found in any given standard cross-reference section, the search shall proceed to a cross-reference stream specified by the XRefStm entry before looking in the previous cross-reference section"). A hidden object's free entry in an *older* section is therefore overridden by the newer section's stream. Same as qpdf, poppler and pdf.js; see `merge_section` in `xref.rs`.
+- **Offsets:** every position stored in the store, in `StreamData::Source` ranges, and in diagnostics and errors is absolute in `source` (except objects inside object streams, which have no file position); only `Revision::startxref` and `Revision::xref_stm` are header-relative. An in-file offset is validated (`N G obj` must be there), then tried as absolute (writers that counted the junk before the header), then searched within ±64 bytes, then (lenient) looked up in the scan. `offset_base()` records which convention the file uses; M2 writes `/Prev` and new offsets in that base.
+- **Repair state is exposed, not hidden:** `structure_repaired()` is true when opening repaired the xref structure (a section found away from its offset, a damaged section, a `/Prev`/`/XRefStm` that leads nowhere or loops, a cut chain, an earlier `startxref` used, objects merged from the scan, a rebuilt trailer or replaced `/Root`, an update that no `startxref` leads to). `recovered_objects()` lists objects whose location did not come from the xref as written (scan, ±64-byte search, absolute-offset fallback, another object-stream member), and objects whose own bytes needed a repair that decides what they hold (a header generation that differs from the entry's, a `/Length` that does not end at `endstream`, a missing `endstream` or `endobj`, a `stream` keyword without CRLF/LF); objects join it as they are resolved. M3 uses both (A.6.7). An xref-stream entry of an unknown type is conforming (§7.5.8.3): it reads as null and hides older entries, with an `XrefUnknownEntryType` note in both modes, and is not a repair.
+- **Read path:** `edits` first (M2), then `Slot.parsed` (parsed once via `OnceLock` from the source). Lenient: an unreadable object becomes `Object::Null` plus a `Diagnostic`; strict: the error. `resolve(&self, id)` takes `&self`, so concurrent readers are safe; a free or missing object, or a generation that does not match the entry (plus a diagnostic), is `null`. Reference chains are followed only by `deref`, bounded by `Limits::max_ref_chain` with loop detection.
+- **Settling never waits on a slot.** A settling pass runs inside the `OnceLock` initialisation of the slot whose load decoded the container again, so it must not wait on another slot's `OnceLock`: two threads settling the same container would each wait for a slot the other is filling (QA round 3 deadlock). It parses the other members itself into the `settled` memo and skips filled slots; a thread that loads one of them meanwhile parses it too (a second parse, never a wait). The waits-for order is acyclic: a compressed object's load waits only on container cells; a container's decode waits only on the slot of its (uncompressed) stream object; an uncompressed object's load waits on nothing but the scan and definitions `OnceLock`s, whose initialisation waits on nothing. Test `settling_never_waits_on_another_slot` (8 threads, 6 × 60 members, a cache that keeps no container, 40 rounds).
+- **Nested loads never wait.** Loading one object can need another (an indirect `/Length`, a container, a `/Filter` or `/DecodeParms` reference). Those nested loads never block on a slot's or container's `OnceLock` (another thread may be filling it, or this very call path): they use a filled cell, else the **peek memo** (objects), else load a private copy. A call-path chain detects cycles (`5 0 obj << /Length 5 0 R >>`) and bounds nesting by `max_ref_chain` (at most 16 levels, to protect the stack). A private result that did not depend on the call path (no load below it was refused for a cycle or depth) goes into the peek memo, or for a container into the object-stream cache as a quiet entry, so a `/Length` or container that many streams share is loaded once, not once per stream.
+- **Linear-time resolution on hostile files:** each uncompressed object is parsed only within its **region**, which ends at the next object (the next in-file entry by position whose position really holds its own `N G obj` header, also tried after the skew that relocated this object) or xref section; when the next entries cannot be checked, the scan's next header decides. Overlapping objects (headers inside another object's string, comment or stream data) therefore cost each byte a bounded number of times, for resolving and for decoding. (Region bounds use every header-like text, line start or not; only definitions are filtered as described above. A definition taken unparsed inside what a damaged object's parse read bounds regions like any other, so an object that holds such a header reads only up to it.) Test `resolving_damaged_objects_is_linear` counts the region bytes of resolving every object of damaged runs (no `endobj`, one at the end, one per object) at two sizes. Object-stream members are bounded by the next member's offset the same way, and members of different numbers never share one region (all but the first at a shared offset read as unreadable).
+- **Uncompressed-container rule:** an object stream must itself be an uncompressed (in-file) object (it is a stream, §7.5.7). A container named by a compressed entry is rejected, which also guarantees that decoding one container never waits on another.
+- **Decryption happens at parse time, on a copy** (M5). The source bytes stay ciphertext. This is what makes incremental saves of encrypted files possible. Until M5, a trailer with `/Encrypt` makes `open` fail with `PasswordRequired` (`/Standard`) or `Unsupported` (any other handler).
+- **Write path (M2):** `set(&mut self, id, obj)`, `get_mut(&mut self, id) -> &mut Object` (copy-on-write into `edits`), `add(&mut self, obj) -> ObjectId`, `free(&mut self, id)`.
 - **Full save** (`save(&SaveOptions)`):
   1. Walk the graph from the trailer (`/Root`, `/Info`, `/Encrypt`) and garbage-collect unreachable objects.
   2. Optionally renumber densely.
@@ -228,19 +337,32 @@ pub trait Decryptor: Send + Sync {
   - A `/Dest` that points to a page not being imported becomes `Null`.
   - Imported AcroForm fields are merged into the target's `/AcroForm /Fields`, renamed `name#2` on collision.
   - Optional dedup by content hash (SHA-256 of the canonical serialization) runs in `optimize`.
-- **`Limits`** (configurable through `OpenOptions`, with safe defaults):
+- **`Limits`** (`#[non_exhaustive]`, configurable through `OpenOptions`, with safe defaults and `with_*` setters):
 
 ```rust
 pub struct Limits {
-    pub max_objects: u32,              // 10_000_000
-    pub max_nesting_depth: u16,        // 256 for arrays/dicts (parser AND recursive walkers)
+    pub max_objects: u32,              // 10_000_000; effective cap per file min(max_objects, max(4096, len)) in-use objects
+                                       // (~50 B each); the xref reader reads at most max(2^20, 4 × len) entries
+    pub max_nesting_depth: u16,        // 256 for arrays/dicts (parser AND recursive walkers); clamped to
+                                       // Limits::MAX_NESTING_DEPTH = 512, because Object's derived Clone/Drop/PartialEq/Debug
+                                       // recurse (~200 KiB of stack at 512 in release builds, ~600 KiB in debug)
     pub max_decoded_stream: usize,     // 512 MiB per stream (Flate/LZW bombs)
-    pub max_total_decoded: u64,        // 4 GiB per document session
-    pub max_xref_sections: u32,        // 4096 (/Prev chain; loop detection by offset set)
+    pub max_total_decoded: u64,        // 4 GiB per document: each SOURCE stream counts once (its largest decode; a decode
+                                       // stopped by a limit counts what it was allowed), so re-decoding is free for a
+                                       // long-lived store while many bombs still stop here; caller-owned data
+                                       // (StreamData::Encoded/Decoded) is bounded per stream only
+    pub max_xref_sections: u32,        // 4096 (/Prev chain; loop detection by offset set); also reported when the sections
+                                       // together need more than max(1 MiB, 4 × len) bytes of parsing
     pub max_page_tree_depth: u16,      // 64, cycle detection by ObjectId set
     pub max_string_len: usize,         // 128 MiB
     pub max_image_pixels: u64,         // 1 << 28, checked with checked_mul on W*H*BPC*comps
-    pub max_ref_chain: u16,            // 32 for Ref→Ref→… (e.g. indirect /Length)
+    pub max_ref_chain: u16,            // 32 for Ref→Ref→… (e.g. indirect /Length) and /Extends chains
+    pub max_diagnostics: u32,          // 10_000 stored per document; the rest are only counted
+    pub max_objstm_decoded: usize,     // 64 MiB per object stream (and ≤ max_decoded_stream); a larger one is refused
+    pub max_objstm_cache: usize,       // 64 MiB of decoded object streams kept (LRU); a re-decode settles the container
+    pub budget_scale: u32,             // 1; multiplies every budget derived from the file length (Limits::budget):
+                                       // xref entries/bytes, object_cap, reconstruction decode, objects parsed from
+                                       // object streams. Derived budgets have their own LimitKind
 }
 ```
 
@@ -290,9 +412,9 @@ All rows were verified on the crates.io API on 2026-10-10 unless marked. Version
 | Ordered dict | `indexmap` | 2.14.2 | Apache-2.0 OR MIT | |
 | Errors | `thiserror` | 2.0.21 | MIT OR Apache-2.0 | |
 | DTO serialization | `serde` | 1.0.229 | MIT OR Apache-2.0 | optional (`serde` feature) |
-| Deflate | `flate2` | 1.1.10 | MIT OR Apache-2.0 | default `rust_backend`, i.e. `miniz_oxide` |
+| Deflate | ~~`flate2`~~ (not used, D9.1) | — | — | `miniz_oxide` alone does inflate and deflate |
 | Deflate (lenient / partial decode) | `miniz_oxide` | 0.9.1 | MIT OR Zlib OR Apache-2.0 | used directly for "decode as much as possible" on truncated streams |
-| LZW | `weezl` | 0.2.1 | MIT OR Apache-2.0 | `/EarlyChange` handling is ours |
+| LZW | ~~`weezl`~~ (not used, D9.1) | — | — | own decoder in `filters::lzw` (`/EarlyChange`, leniency, limits) |
 | CCITT decode | `hayro-ccitt` | 0.4.0 | Apache-2.0 OR MIT | only needed for redaction and rendering |
 | MD5 (R2–R4 keys) | `md-5` | 0.11.0 | MIT OR Apache-2.0 | |
 | SHA-1 | `sha1` | 0.11.0 | MIT OR Apache-2.0 | legacy verification only |
@@ -503,13 +625,15 @@ pub fn load_pem(key_pem: &str, certs_pem: &str, key_password: Option<&str>) -> R
    - **no revocation and no network**
 8. **Modified after signing:**
    - `coverage = WholeFile` if `b + c == file_len`, otherwise `Revision(k)`.
-   - For each later revision, compute changed object IDs from the xref sections after the signed revision, then classify with a whitelist modelled on pyHanko's DiffPolicy:
+   - For each later revision, compute changed object IDs from the xref sections after the signed revision (`Store::revision_entries(k)`). For a hybrid section the changed set is the UNION of the table's entries and its `/XRefStm` stream's, whatever a particular reader would take from either (otherwise a change can hide in the half another reader prefers: a shadow attack), and it includes every free entry and every entry that reads as null. Then classify with a whitelist modelled on pyHanko's DiffPolicy:
      - new signature fields and their widgets, `/AcroForm` `/Fields` and `/SigFlags`, page `/Annots` additions of signature widgets → `Signing`
      - `/DSS` and its streams, `/DocTimeStamp` → `LtvOnly`
      - field `/V`, `/AS` and `/AP` changes → `FormFilling`
      - annotation CRUD → `Annotations`
      - anything else → `Other`
    - `docmdpOk = level ≤ allowed(P)`. The report includes the list of changed objects.
+   - **Repairs are modifications we cannot attribute:** if `Store::structure_repaired()` is true, or `Store::recovered_objects()` (taken after resolving every object the verifier reads) is not empty, or the newest trailer's `/Root` is not listed in any section after the signed revision while it differs from the signed revision's `/Root`, then `modification = Other` plus a warning naming the repair. Scan-based recovery can show objects that sit after the last `%%EOF` or in no xref section; an xref-based diff would never see them.
+   - Revisions are logical sections in `/Prev` order and `eof_end` need not be monotonic (linearized files); step 2 matches `b + c` against the `eof_end` of *any* revision.
 
 ```rust
 pub struct SignatureReport { pub field_name: String, pub sub_filter: String, pub intact: bool, pub signature_valid: bool,
@@ -616,9 +740,10 @@ export function signPdf(doc: PdfDocument, opts: {
 2. **Integration tests** (`crates/*/tests/*.rs`): round trips such as open → modify → save → reopen → deep-equal.
 3. **Property tests** (`proptest`):
    - arbitrary `Object` trees serialize and parse back to equality
-   - random byte mutations of valid fixtures never panic (`no_panic_on_mutated_input`, a stable-toolchain stand-in for fuzzing)
+   - random byte mutations of valid fixtures never panic (`no_panic_on_mutated_input`, a stable-toolchain stand-in for fuzzing), with a per-mutation time budget and a peak-memory ceiling
+   - resource exhaustion at the **default** limits: `folioxide_testkit::fixtures::hostile` builds files that amplify work or memory (`/Prev` chains of compressed xref streams, overlapping sections, outsized `/Index`, object-stream bombs on the reconstruction path and in the cache, object-stream headers with millions of members, a huge array in an object stream, unterminated trailers), and `tests/hostile_default_limits.rs` bounds the work deterministically (rows, sections, objects kept, `Store::total_decoded`), in time (`budget::within`) and in peak RSS (each test runs in a process of its own, under a ceiling of its own). Small instances of every shape are committed in `fixtures/hostile/` as fuzz seeds
    - incremental save always keeps the prefix
-4. **Fuzzing** (`fuzz/`, cargo-fuzz on nightly in CI): targets `fuzz_lexer`, `fuzz_parse_document` (open plus resolve all objects plus page count), `fuzz_filters`, `fuzz_content_stream`, `fuzz_cms_parse`, `fuzz_xmp`. Seed corpus is `fixtures/` plus testkit output. Corpora and crash artifacts are not committed. **Verify that nightly is installable in CI**, since only stable 1.97 is installed locally.
+4. **Fuzzing** (`fuzz/`, cargo-fuzz on nightly in CI): targets `fuzz_lexer`, `fuzz_parse_document` (open plus resolve all objects plus page count; reduced decoding limits) and `fuzz_parse_document_default_limits` (the same with `Limits::default()`; both with a per-input work budget and a hang watchdog), `fuzz_filters`, `fuzz_content_stream`, `fuzz_cms_parse`, `fuzz_xmp`. Seed corpus is `fixtures/` plus testkit output. Corpora and crash artifacts are not committed. **Verify that nightly is installable in CI**, since only stable 1.97 is installed locally.
 5. **Golden tests:** deterministic save mode, so tests can compare bytes for writer output (plus `insta`, if adopted; its version is not verified).
 6. **Node tests:** `node --test` covering the API surface, error codes, async variants, and the TSA/KMS callbacks with a JS mock.
 
@@ -679,9 +804,9 @@ Found in `/usr/bin`: `pdfinfo`, `pdfsig`, `pdftotext`, `pdffonts`, `pdfimages`, 
 | 9 | Encryption | Exempt from encryption: `/Encrypt` dict, xref streams, **signature `/Contents`**, metadata when `EncryptMetadata false`, streams with an `/Identity` crypt filter. The `/ID` array is never encrypted | §7.6.2, §7.6.6 | `Decryptor::is_exempt`. Test `sign_encrypted_doc_pyhanko_valid` |
 | 10 | Page tree | Inheritable `/Resources`, `/MediaBox`, `/CropBox`, `/Rotate`; `/Count` wrong; cycles; `/Rotate` not a multiple of 90; missing MediaBox (default to Letter + diagnostic) | §7.7.3.3–4 | Materialize inherited attributes on import, split and extract. Tests `inherited_resources_materialized_on_extract`, `page_tree_cycle` |
 | 11 | Page ops | Dangling `/Dest` and outline entries after deletion; `/Annots /P`; AcroForm field name collisions on merge; StructTreeRoot (tagged PDF) not mergeable in v1 | §12.3.2, §14.7 | Prune dests to Null. Rename `name#2`. Strip structure on import and document it |
-| 12 | Incremental | Original lacks a final EOL; previous revision used an xref stream; hybrid; `/ID[0]` must stay; linearized files (appending is fine but linearization becomes invalid, which is OK) | §7.5.6 | Same xref kind as before. Tests `incremental_prefix_preserved_all_fixtures` |
-| 13 | Signatures | Placeholder overflow (TSA tokens and long chains); ByteRange width changes the file; signing over `[0x31]`-retagged attrs; ESSCertIDv2 DEFAULT omission; ECDSA raw vs DER; sig dict in an ObjStm or a compressed stream; Contents encrypted; certification not first; signing a `P=1` doc | §12.8.1, RFC 5652 §5.4, RFC 5035 | A.6. Tests `placeholder_overflow_retries`, `ecdsa_p1363_accepted`, `certify_twice_rejected` |
-| 14 | Verification | ByteRange gap not matching the actual `/Contents` (wrapping attack); multiple sig dicts sharing ranges; trailing garbage after `%%EOF` (incremental "shadow" attacks) | — | A.6.7 steps 2 and 8 |
+| 12 | Incremental | Original lacks a final EOL; previous revision used an xref stream; hybrid; `/ID[0]` must stay; linearized files (appending is fine but linearization becomes invalid, which is OK); junk before the header (offsets may count from the header or from byte 0); a repaired structure | §7.5.6, Annex H | Same xref kind as before. Append after `source.len()`, never after an `eof_end`. Write `/Prev` and new offsets in `Store::offset_base()` (header-relative + `header_offset` for `Absolute`). Refuse an incremental save of a store whose `structure_repaired()` is true (full save first). Tests `incremental_prefix_preserved_all_fixtures` |
+| 13 | Signatures | Placeholder overflow (TSA tokens and long chains); ByteRange width changes the file; signing over `[0x31]`-retagged attrs; ESSCertIDv2 DEFAULT omission; ECDSA raw vs DER; sig dict in an ObjStm or a compressed stream; Contents encrypted; certification not first; signing a `P=1` doc; junk before the header (`/ByteRange` is file-absolute, §12.8.1, while xref offsets count from the header) | §12.8.1, RFC 5652 §5.4, RFC 5035 | A.6. `sign()` refuses an incremental signature when `header_offset > 0` or `structure_repaired()` (proposed: a full save first, which drops the junk). Tests `placeholder_overflow_retries`, `ecdsa_p1363_accepted`, `certify_twice_rejected` |
+| 14 | Verification | ByteRange gap not matching the actual `/Contents` (wrapping attack); multiple sig dicts sharing ranges; trailing garbage after `%%EOF` (incremental "shadow" attacks); hybrid table vs `/XRefStm` differentials; xref-stream entries of unknown type (null, §7.5.8.3); objects found only by scan-based recovery; content hidden behind a short or wrong `/Length` (or a missing `endstream`/`endobj`) in a later revision (Mladenov et al. shadow attacks); an appended update whose own `startxref` is damaged; with a damaged last `startxref`, object definitions that no xref section lists or that come after the definition (or deletion) the earlier chain takes, which reconstructing readers (qpdf, pdf.js, poppler) show; an update with no `startxref` at all (a save cut short, or content appended after the signed revision) | — | A.6.7 steps 2 and 8: changed set = table ∪ `/XRefStm` incl. free/null entries (`Store::revision_entries`); `structure_repaired()` / `recovered_objects()` (location repairs and object-level `/Length`/`endstream`/`endobj`/generation repairs) → `Other` + warning. An earlier `startxref` is used only when its chain shows what a reconstruction shows (`Store::shadowed_definition`), otherwise the file is reconstructed (last definition wins). Data after the last revision is `UnreferencedUpdate` (a repair); reconstructed as qpdf does when the last `startxref` is more than 1054 bytes before the end. Header-like text that is no definition (comments, mid-line, inside an object that parses) never makes a valid chain reconstructed, and another generation never shadows. **Deliberate differences** (measured with qpdf 12.4.2 / pikepdf 10.16): a header at the start of a line inside an object that parses (in a string inside an array or a dictionary, in a string that does not start a line or whose first line is longer than 10 bytes, or in stream data) is text here, so with a damaged last `startxref` a valid chain keeps its object and the object holding the text reads whole, and a reconstruction does not take it either; qpdf, whose rebuild takes every line-start header except one swallowed by a top-level string token at the start of a line (its 10-byte token cut), and pdf.js (by its source) take those headers in damaged files and show the text's object (tests `header_text_never_shadows_a_valid_chain`, `damaged_objects_never_let_header_text_after_them_shadow_a_valid_chain`, `an_object_after_damaged_objects_reads_whole`). They agree for comments, mid-line text, a string token at the start of a line, other generations, and a header at the top level after damaged objects (`a_definition_after_damaged_objects_still_shadows_a_valid_chain`). Headers inside what a damaged object's parse read (the first 4 KiB of a string that never closes, a hexadecimal string up to its first invalid byte, an array up to the nesting limit) are definitions taken unparsed, as qpdf takes them, and count like any other: they can make a valid chain reconstructed, and they bound the region of the object before them (`headers_inside_a_damaged_object_count_as_qpdf_counts_them`). Two differences remain there: an object that holds such a header reads only up to it (null when that cuts it), where qpdf, which does not bound an object by the next header, reads it whole; and qpdf's 10-byte first-token cut is not copied (a top-level string token at the start of a line swallows the headers on its following lines in qpdf's line scan): a header inside such a string, in a stretch that a damaged object read, is a definition here and not in qpdf (probes `Q_unterminated_*`, `R4_unterm40_str_*`: 5 reads "evil" here, "good" in qpdf). Parser leniency: a container interrupted by an object keyword is closed there (`<< /A (x) 5 0 obj … /B 1 >>` reads as `<< /A (x) >>`, `[ 1 2 5 0 obj (evil) endobj ]` as `[1 2 5 0]`), while qpdf skips the stray tokens and keeps reading the dictionary (`/B` too) or reads the array as null; a value read skips an invalid character in a hexadecimal string with a diagnostic (§7.3.4.3 allows only hexadecimal digits and white-space; `<41 42 zz 43>` reads as `(ABC)`), while qpdf ends the token there as bad: the object `<41 42 zz 43>` reads as null, `<< /A <41 42 zz 43> /B 1 >>` as `<< /B 1 >>` and `[ <41zz42> 1 2 ]` as an array of 5 (here `(ABC)`, `<< /A (ABC) /B 1 >>`, `[(AB) 1 2]`; probes `V5I_hexinvalid`, `L7_hex_invalid`). The coverage parses of `repair::definitions` end a hexadecimal string at its first invalid byte, as qpdf does, while value reads stay lenient: read leniently there, one stray character ran the string on to the next `>` anywhere in the file, the parse succeeded, and every top-level header in between was text, which hid an orphan redefinition after the damaged object (probe `P13_hexswallow`: `7 0 obj <41 zz`, then 6 and an orphan `5 0 obj`; with a damaged last `startxref` or no cross-reference data, 5 now reads "orphan" and 6 "six", as in qpdf; test `a_hex_string_with_an_invalid_byte_hides_no_definition_after_it`). **Accepted differential:** a number deleted in a later revision *after* its last on-disk definition keeps the chain and stays deleted (null), while qpdf, pdf.js and poppler reconstruct a file with a damaged last `startxref` and show the old definition again if something still references it (the store follows the revisions; the manager records the decision in DECISIONS.md). Tests `an_appended_update_with_a_bad_startxref_is_not_hidden`, `an_earlier_chain_that_hides_a_definition_is_not_used`, `header_text_never_shadows_a_valid_chain`, `a_definition_after_damaged_objects_still_shadows_a_valid_chain`, `headers_inside_a_damaged_object_count_as_qpdf_counts_them`, `a_reconstruction_keys_objects_by_number_and_generation`, `an_update_that_no_startxref_leads_to_is_reported`, `concatenated_files_read_as_qpdf_reads_them` |
 | 15 | Fonts / encoding | Simple fonts: `/Encoding` base + `/Differences`, symbolic flag, TrueType cmap (3,0) vs (3,1); Type0 with non-Identity CMaps; missing ToUnicode; subset fonts lacking glyphs for new text; Type3 fonts | §9.6–9.10 | Editing existing text only when every new char maps to an existing glyph in the same font; otherwise overlay with a new embedded font. Report `Unsupported` clearly |
 | 16 | Fonts / embedding | `/W` widths in glyph space ÷ unitsPerEm × 1000; CIDToGIDMap Identity requires CID == new GID after subsetting; subset tag `ABCDEF+` (6 uppercase letters); ToUnicode for ligatures (one GID → many chars); CFF in FontFile3 `/OpenType` needs PDF 1.6+ | §9.7, §9.9 | Tests checked with `pdffonts` and a `pdftotext` round trip |
 | 17 | Text strings | PDFDocEncoding vs UTF-16BE BOM vs UTF-8 BOM (2.0 only); dates `D:YYYYMMDDHHmmSSOHH'mm` (trailing `'` optional) | §7.9.2, §7.9.4 | Codec tests; write UTF-16BE when any char is not in PDFDocEncoding |

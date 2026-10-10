@@ -3,8 +3,11 @@
 //! 1. `cargo fmt --all -- --check`
 //! 2. `cargo clippy --workspace --all-targets -- -D warnings`
 //! 3. `cargo test --workspace`
-//! 4. `cargo deny check` (skipped with a notice when cargo-deny is not installed)
-//! 5. tree checks (ARCHITECTURE §A.5 gap 2 and §A.8):
+//! 4. `cargo xtask fixtures --check` (run in process): the committed `fixtures/syntax` and
+//!    `fixtures/hostile` files and their `fixtures/README.md` tables match the generators (M1
+//!    acceptance criterion 6)
+//! 5. `cargo deny check` (skipped with a notice when cargo-deny is not installed)
+//! 6. tree checks (ARCHITECTURE §A.5 gap 2 and §A.8):
 //!    - no package named like `napi` or `tauri` in the normal dependency tree of `folioxide`
 //!      (with default features and with all features)
 //!    - exactly one `cms` version in the workspace graph
@@ -16,12 +19,13 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Stdio;
 
-use crate::{Outcome, cargo, display_command, run_status};
+use crate::{Outcome, cargo, display_command, fixtures, run_status};
 
 /// Name fragments that must never appear in the core dependency tree (Tauri readiness).
 const FORBIDDEN_IN_CORE: [&str; 2] = ["napi", "tauri"];
 
 /// The result of one gate.
+#[derive(Debug, PartialEq, Eq)]
 enum StepResult {
     Pass,
     Fail(String),
@@ -43,6 +47,7 @@ pub(crate) fn run(root: &Path) -> Outcome {
         ("fmt", cargo_step(root, &["fmt", "--all", "--", "--check"])),
         ("clippy", cargo_step(root, &CLIPPY)),
         ("test", cargo_step(root, &["test", "--workspace"])),
+        ("fixtures --check", fixtures_step(root)),
         ("deny", deny_step(root)),
         ("tree: no napi/tauri in folioxide", core_tree_step(root)),
         ("tree: one cms version", cms_step(root)),
@@ -75,6 +80,27 @@ fn cargo_step(root: &Path, args: &[&str]) -> StepResult {
         Ok(true) => StepResult::Pass,
         Ok(false) => StepResult::Fail(format!("`{}` failed", display_command(&command))),
         Err(message) => StepResult::Fail(message),
+    }
+}
+
+/// `cargo xtask fixtures --check`, run in this process (the generators are linked into xtask, so
+/// this checks exactly the generators `cargo xtask fixtures` would write with).
+fn fixtures_step(root: &Path) -> StepResult {
+    println!("xtask: running `cargo xtask fixtures --check`");
+    fixtures_result(fixtures::run(root, true))
+}
+
+/// The gate result for an outcome of `cargo xtask fixtures --check`.
+fn fixtures_result(outcome: Outcome) -> StepResult {
+    match outcome {
+        Outcome::Success => StepResult::Pass,
+        Outcome::Failure => StepResult::Fail(
+            "committed fixtures differ from their generators (run `cargo xtask fixtures`)"
+                .to_owned(),
+        ),
+        Outcome::EnvError => StepResult::Fail(
+            "could not read the generated fixtures or fixtures/README.md".to_owned(),
+        ),
     }
 }
 
@@ -202,6 +228,19 @@ cms v0.3.0-pre.1 (*)
 
 der v0.8.2 (*)
 ";
+
+    #[test]
+    fn fixtures_outcomes_map_to_gate_results() {
+        assert_eq!(fixtures_result(Outcome::Success), StepResult::Pass);
+        let StepResult::Fail(why) = fixtures_result(Outcome::Failure) else {
+            panic!("a fixture mismatch must fail the gate");
+        };
+        assert!(why.contains("cargo xtask fixtures"), "{why}");
+        assert!(matches!(
+            fixtures_result(Outcome::EnvError),
+            StepResult::Fail(_)
+        ));
+    }
 
     #[test]
     fn parses_tree_lines() {

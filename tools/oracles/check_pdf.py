@@ -16,10 +16,12 @@ Value checks compare an expectation against every parser that exposes the value:
   from pdfinfo, pikepdf and pypdf
 * ``info``: Info dictionary entries from pdfinfo (standard keys only), pikepdf and pypdf.
   Values are text; dates are compared raw (``D:20261010120000Z``); ``null`` means "absent".
+* ``objectCount``: the number of in-use objects, from pikepdf (see :func:`check_object_count`
+  for exactly what is compared)
 
 CLI::
 
-    check_pdf.py FILE [--pages N] [--version 1.7] [--info Title=Text]... [--json]
+    check_pdf.py FILE [--pages N] [--version 1.7] [--info Title=Text]... [--object-count N] [--json]
 """
 
 from __future__ import annotations
@@ -292,6 +294,55 @@ def check_info(path: Path, expected: Any) -> list[CheckResult]:
     return results
 
 
+def pikepdf_object_count(pdf: Any) -> tuple[int, int]:
+    """``(len(pdf.objects), number of those that are null)`` for an open ``pikepdf.Pdf``.
+
+    pikepdf turns a null object into Python ``None`` (and other scalars into Python values), so
+    a null entry is one that ``is None``.
+    """
+    objects = list(pdf.objects)
+    return len(objects), sum(1 for obj in objects if obj is None)
+
+
+def check_object_count(path: Path, expected: Any) -> list[CheckResult]:
+    """Compare Folioxide's in-use object count with pikepdf's (M1 brief WP1.5).
+
+    **What Folioxide writes** (``objectCount`` in expect.json): the number of in-use objects in
+    the merged cross-reference data of every revision (``Store::object_ids()``: the newest entry
+    for each object number wins, free entries and object 0 are excluded) that resolve to
+    something other than ``null``. Objects inside object streams count one by one, and the
+    object stream containers and cross-reference streams count too when the cross-reference
+    data lists them, as writers do.
+
+    **What pikepdf gives**: ``len(pdf.objects)``, which is qpdf's ``getAllObjects()``: every
+    object qpdf has in its cache after resolving the whole cross-reference table, with objects
+    inside object streams, object stream containers and listed cross-reference streams counted
+    individually, like ours.
+
+    **Adjustment**: entries that are null are subtracted. qpdf also lists an object number that
+    an older revision had in use and a newer one freed; it resolves to null (seen with qpdf
+    12.4 for ``fixtures/syntax/multi-revision.pdf``, whose third revision frees the ``/Info``
+    object 6). An in-use object whose value is literally ``null`` is excluded on both sides.
+
+    The comparison is only meaningful for files that qpdf reads without repair; the ``syntax``
+    suite marks the others ``oracleSkip``.
+    """
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        raise ExpectError(f"'objectCount' must be a non-negative integer, got {expected!r}")
+    pikepdf = import_module("pikepdf")
+
+    def via_pikepdf() -> CheckResult:
+        with captured_logs("pikepdf"), pikepdf.open(path) as pdf:
+            total, nulls = pikepdf_object_count(pdf)
+        actual = total - nulls
+        detail = f"len(pdf.objects) {total} - {nulls} null = {actual}"
+        if actual != expected:
+            detail = f"expected {expected!r}, got {actual!r} ({detail})"
+        return CheckResult("objectCount.pikepdf", actual == expected, detail)
+
+    return [_guard("objectCount.pikepdf", via_pikepdf)]
+
+
 # --------------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------------
@@ -315,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pages", type=int)
     parser.add_argument("--version")
     parser.add_argument("--info", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--object-count", type=int, metavar="N")
     parser.add_argument("--json", action="store_true", help="print results as JSON")
     args = parser.parse_args(argv)
     if not args.pdf.is_file():
@@ -327,6 +379,8 @@ def main(argv: list[str] | None = None) -> int:
         results += check_version(args.pdf, args.version)
     if args.info:
         results += check_info(args.pdf, _parse_info(args.info))
+    if args.object_count is not None:
+        results += check_object_count(args.pdf, args.object_count)
 
     if args.json:
         print(json.dumps([r.to_json() for r in results], indent=2))

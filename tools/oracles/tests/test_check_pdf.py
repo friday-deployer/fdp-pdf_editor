@@ -116,6 +116,59 @@ class ValueTests(unittest.TestCase):
         self.assertEqual(check_pdf.effective_version("2.0", None), "2.0")
 
 
+class ObjectCountTests(unittest.TestCase):
+    """``objectCount``: pikepdf's ``len(pdf.objects)`` minus its null entries."""
+
+    def setUp(self):
+        self._tmp = temp_dir()
+        self.dir = self._tmp.__enter__()
+
+    def tearDown(self):
+        self._tmp.__exit__(None, None, None)
+
+    def write(self, name, data):
+        path = self.dir / name
+        path.write_bytes(data)
+        return path
+
+    def test_counts_every_object(self):
+        # Catalog, page tree, font, Info, and a page plus its content stream per page.
+        path = self.write("three.pdf", pdfgen.build_pdf(page_texts=("one", "two", "three")))
+        [result] = check_pdf.check_object_count(path, 10)
+        self.assertTrue(result.ok, result)
+        self.assertEqual(result.name, "objectCount.pikepdf")
+        self.assertEqual(result.detail, "len(pdf.objects) 10 - 0 null = 10")
+        [wrong] = check_pdf.check_object_count(path, 9)
+        self.assertFalse(wrong.ok)
+        self.assertIn("expected 9, got 10", wrong.detail)
+
+    def test_objects_freed_by_a_later_revision_are_not_counted(self):
+        # qpdf still lists the freed Info dictionary 4, as a null object.
+        path = self.write("freed.pdf", pdfgen.append_free(pdfgen.build_pdf(), (4,)))
+        import pikepdf
+
+        with pikepdf.open(path) as pdf:
+            self.assertEqual(check_pdf.pikepdf_object_count(pdf), (6, 1))
+        [result] = check_pdf.check_object_count(path, 5)
+        self.assertTrue(result.ok, result)
+        self.assertEqual(result.detail, "len(pdf.objects) 6 - 1 null = 5")
+        self.assertTrue(all(r.ok for r in check_pdf.structure_checks(path)))
+
+    def test_redefined_objects_count_once(self):
+        updated = pdfgen.append_update(pdfgen.build_pdf(), {4: b"<< /Title (Updated) >>",
+                                                            7: b"<< /Extra true >>"})
+        path = self.write("updated.pdf", updated)
+        self.assertTrue(check_pdf.check_object_count(path, 7)[0].ok)
+
+    def test_unreadable_file_fails_and_bad_expectations_raise(self):
+        path = self.write("broken.pdf", b"%PDF-1.7\nnot a pdf\n")
+        [result] = check_pdf.check_object_count(path, 1)
+        self.assertFalse(result.ok)
+        for bad in ("5", -1, True, None, 5.0):
+            with self.subTest(objectCount=bad), self.assertRaises(ExpectError):
+                check_pdf.check_object_count(path, bad)
+
+
 class CliTests(unittest.TestCase):
     def run_main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -130,9 +183,12 @@ class CliTests(unittest.TestCase):
             bad = tmp / "bad.pdf"
             bad.write_bytes(pdfgen.shift_body(pdfgen.build_pdf()))
             code, out, _ = self.run_main(str(good), "--pages", "1", "--version", "1.7",
-                                         "--info", "Title=Folioxide oracle self-test")
+                                         "--info", "Title=Folioxide oracle self-test",
+                                         "--object-count", "6")
             self.assertEqual(code, 0, out)
             self.assertIn("PASS  structure.pikepdf", out)
+            self.assertIn("PASS  objectCount.pikepdf", out)
+            self.assertEqual(self.run_main(str(good), "--object-count", "5")[0], 1)
             self.assertEqual(self.run_main(str(good), "--pages", "2")[0], 1)
             self.assertEqual(self.run_main(str(bad))[0], 1)
             self.assertEqual(self.run_main(str(tmp / "missing.pdf"))[0], 2)

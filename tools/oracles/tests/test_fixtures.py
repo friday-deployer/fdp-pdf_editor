@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import subprocess
+import sys
 import unittest
 
 from _support import REPO_ROOT
@@ -52,6 +54,17 @@ class FixtureTests(unittest.TestCase):
 
     def test_pki_readme_marks_keys_as_test_only(self):
         self.assertIn("test-only", (FIXTURES / "pki" / "README.md").read_text(encoding="utf-8"))
+
+    def test_qpdf_fixtures_are_reproducible(self):
+        """fixtures/qpdf matches what the pinned pikepdf/libqpdf write, and is linearized."""
+        script = REPO_ROOT / "tools" / "fixtures" / "qpdf.py"
+        result = subprocess.run([sys.executable, "-I", str(script), "--check"],
+                                capture_output=True, text=True, check=False)
+        if result.returncode == 2:
+            # Not the oracle venv (pikepdf missing or other versions): nothing to compare.
+            self.skipTest(result.stderr.strip())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("2 files in fixtures/qpdf match", result.stdout)
 
 
 if __name__ == "__main__":

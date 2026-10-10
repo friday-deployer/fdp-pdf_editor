@@ -60,3 +60,11 @@ squashed milestone commits.
 - **Nit**: style or naming.
 
 A milestone may only be committed with zero open Blockers/Majors.
+
+## Lessons learned
+- **M0:** keep a fix round per QA verdict, and hand manager-owned items (docs, decisions) to the manager rather than to developers.
+- **M1:** recovery and leniency features need an explicit *reference behaviour* agreed before implementation. For damaged files that reference is qpdf, plus our "a valid chain is never shadowed by text inside a parsed object" rule. Without it, QA rounds keep finding reader differentials one at a time.
+- **M1:** prefer designs that are linear **by construction** (non-overlapping coverage) over budgets and cutoffs. Budgets produced a chain of new edge cases, and three patches in a row each introduced a regression.
+- **M1:** when two consecutive fix rounds introduce regressions, stop patching. The manager decides on a simpler design, with the expert, before the next round.
+- **M1:** the expert's differential probes (our store against pikepdf/qpdf on crafted files) were the most effective QA tool for the syntax layer. Reuse them, and keep them in `/tmp` or the scratchpad, never in the repo.
+

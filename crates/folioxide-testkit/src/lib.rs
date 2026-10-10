@@ -1,25 +1,47 @@
 //! # folioxide-testkit: test support (not published)
 //!
 //! Shared helpers for Folioxide's tests. It is a dev-dependency only (`publish = false`) and never
-//! part of the shipped library. It will hold:
+//! part of the shipped library.
 //!
-//! - a byte-level PDF builder that can produce deliberately broken files (wrong xref offsets,
-//!   `/Prev` loops, junk before the header, wrong `/Length`, truncated Flate, ...)
-//! - fixture generators, reproducible through `cargo xtask fixtures`
-//! - a loader for the test PKI in `fixtures/pki/` and a mock RFC 3161 timestamp authority
-//! - the oracle-output emitter used by `cargo xtask oracle`
+//! - [`builder`]: [`PdfBuilder`], a byte-level PDF builder that records true offsets, so it can
+//!   produce well-formed files and deliberately broken ones (wrong xref offsets, `/Prev` loops,
+//!   junk before the header, wrong `/Length`, zero-width `/W` fields, hybrid files, ...)
+//! - [`fixtures`]: fixture generators. [`fixtures::syntax::all`] and
+//!   [`fixtures::hostile::seeds`] are reproduced byte for byte under `fixtures/syntax/` and
+//!   `fixtures/hostile/` by `cargo xtask fixtures` (checked with `--check`);
+//!   [`fixtures::hostile`] builds resource-exhaustion files at test time; [`fixtures::qpdf`]
+//!   reads the linearized files qpdf wrote into `fixtures/qpdf/`
+//! - [`budget`]: wall-clock budgets ([`budget::within`]) and resident-memory readings for
+//!   resource-exhaustion tests
+//! - [`mutate`]: seeded, deterministic byte mutations for no-panic robustness tests
+//! - [`emit`]: the oracle-output emitter used by `cargo xtask oracle`
+//! - [`exercise`]: opens a document and uses all of it, checking the store's documented
+//!   guarantees (for `no_panic_on_mutated_input` and the `fuzz_parse_document` fuzz target)
+//!
+//! Later milestones add a loader for the test PKI in `fixtures/pki/` and a mock RFC 3161
+//! timestamp authority.
 //!
 //! ## Oracle output
 //!
 //! With the `emit` feature, tests write `<suite dir>/<name>.pdf` plus `<name>.expect.json`, which
 //! `tools/oracles/run_suite.py` then checks with external tools (`docs/ARCHITECTURE.md` §A.9).
-//! [`oracle_dir`] gives the suite directory. `cargo xtask oracle` passes the absolute base
-//! directory in the [`ORACLE_DIR_ENV`] environment variable.
-//!
-//! **Status:** M0 provides the oracle-directory convention only; nothing is emitted yet.
+//! [`oracle_dir`] gives the suite directory and [`emit_case`] writes one case. `cargo xtask
+//! oracle` passes the absolute base directory in the [`ORACLE_DIR_ENV`] environment variable.
+
+pub mod budget;
+pub mod builder;
+pub mod emit;
+pub mod exercise;
+pub mod fixtures;
+pub mod mutate;
+
+pub use builder::{
+    LengthSpec, ObjStmOpts, PdfBuilder, XrefEntry, XrefEol, XrefOpts, XrefStreamOpts,
+};
+pub use emit::{ExpectJson, emit_case};
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// `true` when this crate is compiled with the `emit` feature, as under `cargo xtask oracle`.
 ///
@@ -72,13 +94,7 @@ fn oracle_dir_from(base: Option<&OsStr>, suite: &str) -> Option<PathBuf> {
 
 /// `<workspace>/target/oracle`, derived from this crate's location (`<workspace>/crates/folioxide-testkit`).
 fn default_oracle_base() -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // Two levels up is the workspace root. Lexical, so the result has no `..` components.
-    let root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or(manifest_dir);
-    root.join("target").join("oracle")
+    fixtures::workspace_root().join("target").join("oracle")
 }
 
 #[cfg(test)]

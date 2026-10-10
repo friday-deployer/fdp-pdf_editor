@@ -7,8 +7,8 @@ and the acceptance criteria for each milestone follow it.
 | Milestone | Title | Status |
 |---|---|---|
 | M0 | Project scaffolding | ✅ done |
-| M1 | Syntax layer, read path | ⏳ in progress |
-| M2 | Writers, document model v1, Node open/save | pending |
+| M1 | Syntax layer, read path | ✅ done |
+| M2 | Writers, document model v1, Node open/save | ⏳ in progress |
 | M3 | Signatures I: PAdES B-B, external signing, verification | pending |
 | M4 | Signatures II: B-T timestamps, certification, visible signatures | pending |
 | M5 | Encryption ∥ page operations | pending |
