@@ -75,6 +75,19 @@
 //! [`Store::recovered_objects`] and [`Store::offset_base`], and read each revision's own entries
 //! with [`Store::revision_entries`].
 //!
+//! # Edits
+//!
+//! Edits (M2) are layered on top of the lazy store, which never changes what it read from the
+//! source: [`Store::set`], [`Store::get_mut`] (copy-on-write), [`Store::add`] and
+//! [`Store::free`] record replaced, added and freed objects, and [`Store::set_trailer_entry`]
+//! changes `/Root`, `/Info` or `/ID`. Every public read sees the edits first ([`Store::resolve`],
+//! [`Store::deref`], and through them [`Store::stream_data`]'s `/Filter` and `/DecodeParms`
+//! references); the store's own loads (indirect `/Length` values, object stream containers) read
+//! the source only, so an edit never changes how the source is parsed. An `Arc` handed out before
+//! an edit stays a snapshot. Edits take `&mut self`, so they need no locks and the guarantees
+//! above (`Send + Sync`, no waits between slots, linear resolution) are unchanged. The writers
+//! ([`crate::writer`]) save the result as a full rewrite or as an incremental update.
+//!
 //! # Encryption
 //!
 //! Decryption arrives in M5. Until then, a document whose trailer has `/Encrypt` fails to open
@@ -103,6 +116,11 @@ use crate::xref::{
 };
 
 pub use crate::xref::{OffsetBase, Revision, XrefEntry, XrefKind};
+
+mod edit;
+mod memory;
+
+pub(crate) use edit::{COMPUTED_TRAILER_KEYS, Edit, next_generation};
 
 /// The bytes of a PDF file, shared between the [`Store`] and its users.
 ///
@@ -671,6 +689,12 @@ pub struct Store {
     reconstruct_budget: AtomicU64,
     /// Objects parsed so far (for laziness tests).
     parsed_objects: AtomicUsize,
+    /// The estimated heap memory of the objects the slots cache (see
+    /// [`Store::memory_estimate`]): each slot's object is charged once, when its first load
+    /// stores it.
+    cached_bytes: AtomicU64,
+    /// The estimated heap memory of the edits (see [`Store::memory_estimate`]).
+    edit_weights: Mutex<memory::EditWeights>,
     /// Object streams decoded so far for their objects (for cache tests).
     #[cfg(test)]
     objstm_decodes: AtomicUsize,
@@ -679,6 +703,22 @@ pub struct Store {
     #[cfg(test)]
     region_bytes: AtomicU64,
     null: Arc<Object>,
+    /// The edits (M2): replaced and added objects, and freed ones, by identifier. Every public
+    /// read looks here first; the writers save them (see [`Edit`]).
+    edits: BTreeMap<ObjectId, Edit>,
+    /// The number [`Store::add`] gives the next new object: one more than any number the source
+    /// lists or an edit added, so numbers are never reused.
+    next_num: u32,
+    /// One more than the largest object number (below [`Limits::max_objects`]) that the source's
+    /// objects and trailers refer to, found by one walk over the source on first need (see
+    /// [`Store::next_object_number`]): a new object never takes the number of a dangling
+    /// reference.
+    referenced_floor: OnceLock<u32>,
+    /// Set when [`Store::set_trailer_entry`] or [`Store::remove_trailer_entry`] changed the
+    /// trailer.
+    trailer_edited: bool,
+    /// Whether the store was opened from a file (false for [`Store::new_empty`]).
+    has_source: bool,
 }
 
 impl fmt::Debug for Store {
@@ -690,6 +730,7 @@ impl fmt::Debug for Store {
             .field("revisions", &self.revisions.len())
             .field("slots", &self.slots.len())
             .field("others", &self.others.len())
+            .field("edits", &self.edits.len())
             .field("options", &self.options)
             .finish_non_exhaustive()
     }
@@ -725,8 +766,17 @@ impl Store {
     /// - [`ErrorCode::Syntax`]: in strict mode, a missing `%PDF-` header.
     /// - [`ErrorCode::LimitExceeded`]: a [`Limits`] value was exceeded.
     pub fn open(source: SharedBytes, options: &OpenOptions) -> Result<Store> {
+        let mut store = Store::blank(source, options);
+        store.has_source = true;
+        store.read_structure()?;
+        store.next_num = store.max_object_number.saturating_add(1);
+        Ok(store)
+    }
+
+    /// A store over `source` with nothing read yet: no revisions, no objects, no edits.
+    fn blank(source: SharedBytes, options: &OpenOptions) -> Store {
         let len = (*source).as_ref().len();
-        let mut store = Store {
+        Store {
             source,
             options: options.clone(),
             header_offset: 0,
@@ -752,14 +802,19 @@ impl Store {
             charged: Mutex::new(HashMap::new()),
             reconstruct_budget: AtomicU64::new(repair::reconstruct_budget(&options.limits, len)),
             parsed_objects: AtomicUsize::new(0),
+            cached_bytes: AtomicU64::new(0),
+            edit_weights: Mutex::new(memory::EditWeights::default()),
             #[cfg(test)]
             objstm_decodes: AtomicUsize::new(0),
             #[cfg(test)]
             region_bytes: AtomicU64::new(0),
             null: Arc::new(Object::Null),
-        };
-        store.read_structure()?;
-        Ok(store)
+            edits: BTreeMap::new(),
+            next_num: 1,
+            referenced_floor: OnceLock::new(),
+            trailer_edited: false,
+            has_source: false,
+        }
     }
 
     /// Opens a PDF file held in a vector; see [`Store::open`].
@@ -1463,6 +1518,7 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
         *self.objstm_parsed.get_mut() = 0;
+        *self.cached_bytes.get_mut() = 0;
         let len = self.bytes().len();
         let cap = usize::try_from(xref::object_cap(self.limits(), len)).unwrap_or(usize::MAX);
         let mut slots: Vec<Slot> = Vec::with_capacity(entries.len().min(cap));
@@ -1532,6 +1588,8 @@ impl Store {
     /// The newest trailer dictionary (§7.5.5), or the cross-reference stream dictionary that
     /// serves as one (§7.5.8.2). When it was damaged, the repaired version: `/Root` (and
     /// `/Encrypt`) taken from an older trailer, or `/Root` set to the catalog found by a scan.
+    /// Changes made with [`Store::set_trailer_entry`] and [`Store::remove_trailer_entry`] are
+    /// included; [`Revision::trailer`] keeps each section's trailer as written.
     pub fn trailer(&self) -> &Dict {
         &self.trailer
     }
@@ -1638,6 +1696,28 @@ impl Store {
         ids
     }
 
+    /// The first in-use object (by number) of the merged cross-reference data whose entry gives a
+    /// position that does not hold its `N G obj` header with its number and generation: a
+    /// wrong offset, which the store repairs when the object is loaded (the ±64-byte search, the
+    /// scan; see [`Store::recovered_objects`]) but which makes qpdf and poppler reconstruct the
+    /// whole file. Checked eagerly, in `O(1)` per entry (no parsing), for the incremental writer:
+    /// an update appended to such a file can mean something else to those readers (DECISIONS
+    /// D9.8), so it needs a full save. Compressed objects are not checked.
+    pub(crate) fn first_misplaced_object(&self) -> Option<ObjectId> {
+        let bytes = self.bytes();
+        self.slots.iter().find_map(|slot| {
+            let Location::InFile { pos } = slot.loc else {
+                return None;
+            };
+            let id = ObjectId::new(slot.num, slot.r#gen);
+            let found = usize::try_from(pos)
+                .ok()
+                .and_then(|p| object_header_at(bytes, p))
+                .map(|(found, _)| found);
+            (found != Some(id)).then_some(id)
+        })
+    }
+
     /// Which position the offsets in the file count from: the header (as the standard says, and
     /// always when the header is at byte 0), or byte 0 (a writer that counted the junk before the
     /// header). Taken from how the newest section was found, or from where the catalog is.
@@ -1661,23 +1741,33 @@ impl Store {
         self.version
     }
 
-    /// The identifiers of all in-use objects in the merged cross-reference data, by number
-    /// (then generation: a reconstructed file can define several generations of one number,
-    /// which are different objects, §7.3.10). Compressed objects have generation 0. Object 0 is
-    /// never included.
+    /// The identifiers of all in-use objects, by number (then generation: a reconstructed file
+    /// can define several generations of one number, which are different objects, §7.3.10): the
+    /// in-use objects of the merged cross-reference data, without those freed by
+    /// [`Store::free`], plus those added by [`Store::add`]. Compressed objects have generation
+    /// 0. Object 0 is never included.
     pub fn object_ids(&self) -> Vec<ObjectId> {
         let mut ids: Vec<ObjectId> = self
             .slots
             .iter()
             .chain(&self.others)
             .map(|s| ObjectId::new(s.num, s.r#gen))
+            .filter(|id| !matches!(self.edits.get(id), Some(Edit::Free)))
             .collect();
+        ids.extend(
+            self.edits
+                .iter()
+                .filter(|(_, edit)| matches!(edit, Edit::Set(_)))
+                .map(|(&id, _)| id),
+        );
         ids.sort_unstable_by_key(|id| (id.num, id.r#gen));
+        ids.dedup();
         ids
     }
 
-    /// The largest object number in the merged cross-reference data (in use or free), or 0
-    /// when there is none. New objects are numbered after it.
+    /// The largest object number in the merged cross-reference data of the source (in use or
+    /// free), or 0 when there is none. Objects added with [`Store::add`] are numbered after it
+    /// (see [`Store::next_object_number`]).
     pub fn max_object_number(&self) -> u32 {
         self.max_object_number
     }
@@ -1751,18 +1841,35 @@ impl Store {
 
     // ---- resolving ----------------------------------------------------------------------------
 
-    /// The object `id`, parsed on first use and cached.
+    /// The object `id`: its edit, if it was set, added or freed (see [`Store::set`]), otherwise
+    /// the source's object, parsed on first use and cached.
     ///
     /// A free or missing object is `null` (§7.3.10: a reference to an undefined object is a
-    /// reference to `null`). A generation that does not match the cross-reference entry gives
-    /// `null` and a [`DiagnosticKind::WrongGeneration`] diagnostic. A reference stored as the
-    /// object's value is returned as is; use [`Store::deref`] to follow reference chains.
+    /// reference to `null`), and so is an object freed by [`Store::free`]. A generation that
+    /// does not match the cross-reference entry gives `null` and a
+    /// [`DiagnosticKind::WrongGeneration`] diagnostic. A reference stored as the object's value
+    /// is returned as is; use [`Store::deref`] to follow reference chains.
+    ///
+    /// The returned `Arc` is a snapshot: a later edit of the object does not change it.
     ///
     /// # Errors
     /// In lenient mode only [`ErrorCode::LimitExceeded`]; an unreadable object is `null` plus a
     /// [`DiagnosticKind::ObjectUnreadable`] diagnostic. In strict mode, also the error that made
     /// the object unreadable (and any repair the object needed).
     pub fn resolve(&self, id: ObjectId) -> Result<Arc<Object>> {
+        if !self.edits.is_empty() {
+            match self.edits.get(&id) {
+                Some(Edit::Set(object)) => return Ok(Arc::clone(object)),
+                Some(Edit::Free) => return Ok(self.null()),
+                None => {}
+            }
+        }
+        self.resolve_source(id)
+    }
+
+    /// [`Store::resolve`] without the edits: the source's object `id`. The store's own loads
+    /// use it (an object stream container), so an edit never changes how the source is read.
+    pub(crate) fn resolve_source(&self, id: ObjectId) -> Result<Arc<Object>> {
         let Some(slot) = self.slot_of(id) else {
             return Ok(self.null());
         };
@@ -1770,7 +1877,14 @@ impl Store {
             return Ok(self.null());
         }
         slot.parsed
-            .get_or_init(|| self.load_slot(slot))
+            .get_or_init(|| {
+                let loaded = self.load_slot(slot);
+                if let Ok(object) = &loaded {
+                    self.cached_bytes
+                        .fetch_add(memory::heap_size(object), Ordering::Relaxed);
+                }
+                loaded
+            })
             .clone()
             .map_err(|err| *err)
     }
@@ -2572,7 +2686,8 @@ impl Store {
                 None => Arc::new(self.load(slot, chain, Mode::Peek(chain), true)?),
             }
         } else {
-            self.resolve(id)?
+            // The source's container, whatever an edit made of its object.
+            self.resolve_source(id)?
         };
         let Object::Stream(stream) = &*object else {
             return Err(Error::new(

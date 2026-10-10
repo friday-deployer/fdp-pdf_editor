@@ -129,3 +129,50 @@ All 19 open decisions in `docs/milestones/M3.md` §8 (D-1 … D-19) are accepted
 8. **`PreparedSignature`** has an own versioned binary format, plus serde behind the `serde` feature (D-17).
 9. **Field naming:** auto-named fields never take over an existing empty signature field (D-18).
 10. **`/Contents` padding:** non-zero bytes after the CMS give a warning only (D-19).
+
+## D11: Decisions from M2, writers and document model (manager, 2026-10-10)
+1. **Edits:**
+   - Edits are layered on the lazy store and keyed by `ObjectId`. `Edit` is crate-private and holds `Arc<Object>`. Every public read sees edits first.
+   - The store's own loads (indirect `/Length`, object-stream containers) read the source only, so editing them never changes how the source is parsed.
+   - `add` returns `Result<ObjectId>` (`LimitExceeded` at `max_objects`). Trailer edits are limited to `/Root`, `/Info` and `/ID`.
+2. **Full save:**
+   - GC starts from every carried trailer entry. References to objects that are not in use are written as `null`. Stream `/Length` is always written directly and never followed.
+   - With renumbering, numbers are dense from 1. Object streams hold at most 100 objects. The source's own xref and object-stream containers and the linearization dictionary are dropped.
+   - `/ID` comes from the options, otherwise the first trailer element plus an MD5 of the body. MD5 is a private RFC 1321 implementation tested against the RFC vectors; there is no RNG in the core.
+3. **Incremental save:** never touches the source; follows the previous xref kind; tables are zero-indexed; never uses object streams.
+   - Edited `Decoded` streams are Flate-encoded, but source data is never recompressed.
+   - `/Prev` is written in the file's offset base.
+   - Saves are refused for reconstructed or `structure_repaired()` stores, so `OffsetBase::Absolute` files are full-save-only.
+   - `incremental_update()` returns the absolute span of every written object and the xref position (used by M3).
+   - The new file length is `source.len() + suffix.len()`. After reopening, the new revision's `eof_end` equals it.
+4. **Strictness in the model:** strictness governs the syntax layer only. Document-model repairs (wrong `/Count`, invalid kids, bad boxes or `/Rotate`, wrong Info types) are diagnostics in both modes. Exceeding a limit is an error in both modes. Model diagnostics have their own `DiagnosticKind`s.
+5. **Inheritance:** inherited page attributes follow the path the page-tree walk took, as poppler and qpdf do. A `/Parent` that disagrees gets a diagnostic. Setters write the inherited value onto the leaf before changing it.
+6. **PDFDocEncoding matches qpdf exactly:**
+   - Undefined C0 codes 0x00–0x17 pass through.
+   - 0x7F, 0x9F and 0xAD decode to U+FFFD.
+   - Encoding writes only defined codes, and anything else goes to UTF-16BE with a BOM.
+7. **`PageInfo` size:** `width`/`height` are the effective size (crop box after rotation). `mediaBox`, `cropBox` and `rotation` are exposed separately.
+8. **`Document::new()`** produces a valid zero-page PDF that qpdf and pypdf accept. poppler `pdfinfo` rejects zero-page files ("Invalid page count 0"), so that oracle row is a `knownFailure`.
+9. **DTOs:** `Rect`, `PdfDate`, `DocInfo` and the other DTOs are `#[non_exhaustive]` (§A.8 #4) and are built through constructors outside their crates.
+10. **Object numbering:** `Store::next_object_number()` (and so `add`) numbers above every number that any xref section lists, any edit uses, or any source object or trailer **refers to**, as qpdf's fixDanglingReferences does. New objects therefore never collide with dangling references, and never reuse freed numbers.
+11. **Where incremental updates are refused:** they are also refused (`Unsupported`, "full save required") when an in-use object is not at the offset its xref entry gives, because poppler would rebuild such a file and lose the update. `Store::check_incremental()` tells callers ahead of time.
+12. **Page setters:**
+    - They write on the page object itself, never on a `/Pages` ancestor.
+    - `set_media_box` re-clips a crop box that reaches outside the new media box.
+    - `set_crop_box(None)` means "crop box = media box".
+    - Invalid rectangles give `InvalidArgument`.
+13. **Serde and JSON shapes, shared by Node and Tauri:**
+    - `Rotation` is a number of degrees. `PdfDate` is a PDF date string. `Trapped` is `"true" | "false" | "unknown"`.
+    - `InfoUpdate` has three states per field: absent keeps, `null` removes, a value sets. `custom` is a map of `string | null`.
+    - `DocInfo` leaves absent entries out.
+    - All names are camelCase.
+14. **Text strings written by `set_info`:** literal when the text fits PDFDocEncoding, otherwise hex UTF-16BE with a BOM. A value whose bytes already match is no change.
+15. **Node native memory:**
+    - Documents report `Store::memory_estimate()` to V8, and `close()` or `[Symbol.dispose]` (`using`) frees a document at once. After that every method throws `E_CLOSED`.
+    - **Bounded memory in long-running loops requires `close()` or `using`.** GC alone is not enough (README "Memory", ARCHITECTURE §A.7).
+16. **Edit and save rules:**
+    - Object-stream containers cannot be edited or freed while they hold members in use that no edit has replaced (§7.5.7).
+    - `SaveOptions::validate()` accepts only real PDF versions (1.0–1.7, 2.0).
+    - Signature dictionaries are recognised by `/Type /Sig`, `/ByteRange`, or `/Contents` plus `/Filter` or `/SubFilter`, and are never packed into object streams.
+17. **Known limitation:** a name holding a NUL byte (non-conformant input such as `/A#00B`) is copied as `#00`, which qpdf rejects. Garbage in, garbage out; a later sanitising option may rewrite such names.
+18. **Build profile:** `[profile.dev] debug = "line-tables-only"` keeps per-worktree build directories small.

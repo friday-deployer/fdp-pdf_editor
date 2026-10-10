@@ -120,6 +120,22 @@ pub enum DiagnosticKind {
     /// strict mode refuses the file. Header-like text in a comment or in the middle of a line
     /// is no update.
     UnreferencedUpdate,
+    /// The document model found the page tree damaged (§7.7.3.2) and read around it: a wrong
+    /// `/Count`, a cycle or a kid listed twice, a kid that is not a page-tree node, a `/Parent`
+    /// that does not name the node listing the kid, a missing `/Pages` or `/Kids`. Recorded
+    /// in both modes (strictness governs the syntax layer only).
+    PageTree,
+    /// The document model ignored or replaced an invalid page attribute (§7.7.3.3, §14.11.2):
+    /// a missing or malformed `/MediaBox` (US Letter assumed), a box outside the media box, a
+    /// `/Rotate` that is not a multiple of 90, a `/Resources` that is not a dictionary.
+    PageAttribute,
+    /// The document model ignored or replaced an invalid entry of the document information
+    /// dictionary (§14.3.3): an entry of the wrong type, a date that does not parse, an
+    /// `/Info` that is not a dictionary.
+    Metadata,
+    /// The document model ignored an invalid entry of the document catalog (§7.7.2), such as a
+    /// `/Version` that is not a version name.
+    Catalog,
     /// Anything else. Always the last variant.
     Other,
 }
@@ -159,6 +175,10 @@ impl DiagnosticKind {
         DiagnosticKind::CryptFilterIgnored,
         DiagnosticKind::XrefUnknownEntryType,
         DiagnosticKind::UnreferencedUpdate,
+        DiagnosticKind::PageTree,
+        DiagnosticKind::PageAttribute,
+        DiagnosticKind::Metadata,
+        DiagnosticKind::Catalog,
         DiagnosticKind::Other,
     ];
 
@@ -198,6 +218,10 @@ impl DiagnosticKind {
             DiagnosticKind::CryptFilterIgnored => "cryptFilterIgnored",
             DiagnosticKind::XrefUnknownEntryType => "xrefUnknownEntryType",
             DiagnosticKind::UnreferencedUpdate => "unreferencedUpdate",
+            DiagnosticKind::PageTree => "pageTree",
+            DiagnosticKind::PageAttribute => "pageAttribute",
+            DiagnosticKind::Metadata => "metadata",
+            DiagnosticKind::Catalog => "catalog",
             DiagnosticKind::Other => "other",
         }
     }

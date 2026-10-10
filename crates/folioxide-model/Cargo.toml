@@ -10,10 +10,22 @@ repository.workspace = true
 [features]
 # Open and save encrypted documents through folioxide-security (ARCHITECTURE §A.2).
 encryption = ["dep:folioxide-security"]
+# `Serialize`/`Deserialize` on the DTOs (`DocInfo`, `InfoUpdate`, `PageInfo`, `Rect`,
+# `Rotation`, `PdfDate`, `Trapped`), `camelCase` (ARCHITECTURE §A.8).
+serde = ["dep:serde"]
 
 [dependencies]
 folioxide-syntax.workspace = true
 folioxide-security = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Fixtures for the integration tests (M2 WP2.2).
+folioxide-testkit.workspace = true
+# The crate itself with its `serde` feature, so that `cargo test` and `cargo clippy
+# --all-targets` always build and test the DTOs' serde support (M2 WP2.3), and JSON to test it.
+folioxide-model = { workspace = true, features = ["serde"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

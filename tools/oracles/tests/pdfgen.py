@@ -23,12 +23,21 @@ def build_pdf(
     page_texts: tuple[str, ...] = ("Hello Folioxide",),
     info: dict[str, str] | None = None,
     catalog_version: str | None = None,
+    page_entries: tuple[str, ...] | None = None,
+    tree_entries: str = "",
 ) -> bytes:
     """Return the bytes of a minimal PDF with one text line per page.
 
     ``info`` maps Info dictionary keys (without the slash) to text values. ``catalog_version``
     adds ``/Version`` to the catalog, which overrides an older header version (§7.7.2).
+    ``page_entries`` (one string per page) replaces each page's ``/MediaBox [0 0 612 792]`` with
+    other dictionary entries, and ``tree_entries`` is added to the page tree root, which the
+    pages inherit ``/MediaBox``, ``/CropBox`` and ``/Rotate`` from (§7.7.3.4).
     """
+    if page_entries is None:
+        page_entries = ("/MediaBox [0 0 612 792]",) * len(page_texts)
+    if len(page_entries) != len(page_texts):
+        raise ValueError("page_entries needs one string per page")
     if info is None:
         info = {
             "Title": "Folioxide oracle self-test",
@@ -47,18 +56,19 @@ def build_pdf(
         catalog += b" /Version /" + catalog_version.encode("ascii")
     objects[1] = catalog + b" >>"
     kids = b" ".join(b"%d 0 R" % pid for pid in page_ids)
-    objects[2] = b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % page_count
+    tree = b" " + tree_entries.encode("ascii") if tree_entries else b""
+    objects[2] = b"<< /Type /Pages /Kids [" + kids + b"] /Count %d" % page_count + tree + b" >>"
     objects[3] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
     objects[4] = (
         b"<< "
         + b" ".join(b"/" + k.encode("ascii") + b" " + _pdf_string(v) for k, v in info.items())
         + b" >>"
     )
-    for pid, text in zip(page_ids, page_texts, strict=True):
+    for pid, text, entries in zip(page_ids, page_texts, page_entries, strict=True):
         content = b"BT /F1 24 Tf 72 720 Td " + _pdf_string(text) + b" Tj ET\n"
         objects[pid] = (
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
-            b" /Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % (pid + 1)
+            b"<< /Type /Page /Parent 2 0 R " + entries.encode("ascii")
+            + b" /Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % (pid + 1)
         )
         objects[pid + 1] = b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream"
 

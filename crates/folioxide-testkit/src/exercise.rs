@@ -2,12 +2,17 @@
 //!
 //! [`exercise`] opens bytes with [`Store::open`], then resolves every in-use object twice,
 //! follows every reference found inside them, reads and decodes every stream, and counts the
-//! pages ([`page_count`]). Along the way it checks the guarantees that the store documents (see
-//! [`Report::violations`]). It never panics itself, so a panic during [`exercise`] always comes
-//! from the code under test.
+//! pages ([`page_count`]) ([`exercise_store`]); then it saves the document with a full rewrite
+//! and reopens the output ([`Report::full_save`]). [`exercise_edits`] does all of that and then
+//! edits the document (a new `/Title` in the Info dictionary) and saves it again, with a full
+//! rewrite and, when [`Store::check_incremental`] allows it, an incremental update, reopening
+//! each output. Along the way it checks the guarantees that the store and the writers document
+//! (see [`Report::violations`]). It never panics itself, so a panic during [`exercise`] always
+//! comes from the code under test.
 //!
-//! The `no_panic_on_mutated_input` test of `folioxide-syntax` runs it on every mutation of the
-//! committed fixtures, and the `fuzz_parse_document` fuzz target on every fuzzer input.
+//! The `no_panic_on_mutated_input` test of `folioxide-syntax` runs [`exercise_edits`] on every
+//! mutation of the committed fixtures, and the `fuzz_parse_document` fuzz targets run
+//! [`exercise`] on every fuzzer input.
 //!
 //! ```
 //! use folioxide_syntax::OpenOptions;
@@ -29,8 +34,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use folioxide_syntax::{
-    ErrorCode, LimitKind, Object, ObjectId, OpenOptions, Store, StreamData, Strictness, keys,
+    Dict, ErrorCode, IncrementalOptions, LimitKind, Object, ObjectId, OpenOptions, SaveOptions,
+    Store, StreamData, Strictness, keys,
 };
+
+use crate::graph::{GraphOptions, compare_graphs};
 
 /// The most distinct references [`exercise`] follows with [`Store::deref`] per document, so a
 /// file with millions of references still finishes quickly.
@@ -103,15 +111,85 @@ pub struct Report {
     ///   `Unsupported`, and decoded data never exceeds
     ///   [`folioxide_syntax::Limits::max_decoded_stream`];
     /// - [`Store::total_decoded`] stays within [`folioxide_syntax::Limits::max_total_decoded`],
-    ///   and [`Store::diagnostics`] within [`folioxide_syntax::Limits::max_diagnostics`].
+    ///   and [`Store::diagnostics`] within [`folioxide_syntax::Limits::max_diagnostics`];
+    /// - a full save ([`Store::save`]) of a lenient store fails only with `LimitExceeded`; its
+    ///   output opens in strict mode with the store's limits (or fails only with
+    ///   `LimitExceeded`), and its object graph (dictionaries, arrays, references and values;
+    ///   stream data aside) equals the store's modulo renumbering ([`crate::graph`]);
+    /// - ([`exercise_edits`]) [`Store::check_incremental`] refuses only with `Unsupported` or
+    ///   `InvalidArgument`; when it accepts, a lenient incremental save fails only with
+    ///   `LimitExceeded`, and its output starts with the source, opens with the store's options
+    ///   (or fails only with `LimitExceeded`) without a repaired structure, has one more
+    ///   revision, and its graph equals the edited store's with the same numbers.
     pub violations: Vec<String>,
+    /// The full save of the document as read: the output's length, or the error code. `None`
+    /// when it was not attempted (the open failed).
+    pub full_save: Option<Result<usize, ErrorCode>>,
+    /// [`exercise_edits`]: the error code when editing the document failed (strict mode, a
+    /// limit); the edited saves are not attempted then.
+    pub edit_error: Option<ErrorCode>,
+    /// [`exercise_edits`]: the full save of the edited document (as [`Report::full_save`]).
+    pub edited_full_save: Option<Result<usize, ErrorCode>>,
+    /// [`exercise_edits`]: the code with which [`Store::check_incremental`] refused an
+    /// incremental update (a reconstructed or repaired structure, an object away from its
+    /// offset).
+    pub incremental_refusal: Option<ErrorCode>,
+    /// [`exercise_edits`]: the incremental update of the edited document: the length of the
+    /// output (source included), or the error code; `None` when it was not attempted.
+    pub incremental_save: Option<Result<usize, ErrorCode>>,
 }
 
-/// Opens `bytes` with `options` and uses everything in the document; see the [module
-/// documentation](self).
+/// Opens `bytes` with `options`, uses everything in the document ([`exercise_store`]), and saves
+/// it with a full rewrite ([`Report::full_save`]); see the [module documentation](self).
 pub fn exercise(bytes: &[u8], options: &OpenOptions) -> Report {
+    match open(bytes, options) {
+        Ok(store) => {
+            let mut report = exercise_store(&store);
+            report.full_save = Some(check_full_save(&store, "full save", &mut report));
+            report
+        }
+        Err(report) => *report,
+    }
+}
+
+/// [`exercise`], then an edit (a new `/Title` in the Info dictionary, which is created and
+/// linked from the trailer when the document has none) and two saves of the edited document: a
+/// full rewrite and, when [`Store::check_incremental`] accepts the source, an incremental update.
+/// Each output is reopened and checked (see [`Report::violations`]).
+pub fn exercise_edits(bytes: &[u8], options: &OpenOptions) -> Report {
+    let mut store = match open(bytes, options) {
+        Ok(store) => store,
+        Err(report) => return *report,
+    };
+    let mut report = exercise_store(&store);
+    report.full_save = Some(check_full_save(&store, "full save", &mut report));
+    if let Err(err) = edit(&mut store) {
+        report.edit_error = Some(err.code());
+        return report;
+    }
+    report.edited_full_save = Some(check_full_save(&store, "edited full save", &mut report));
+    match store.check_incremental() {
+        Ok(()) => report.incremental_save = Some(check_incremental(&store, &mut report)),
+        Err(err) => {
+            if !matches!(
+                err.code(),
+                ErrorCode::Unsupported | ErrorCode::InvalidArgument
+            ) {
+                violation(
+                    &mut report,
+                    format!("check_incremental refused with undocumented code {err}"),
+                );
+            }
+            report.incremental_refusal = Some(err.code());
+        }
+    }
+    report
+}
+
+/// Opens `bytes`, or returns the report of a failed open.
+fn open(bytes: &[u8], options: &OpenOptions) -> Result<Store, Box<Report>> {
     match Store::open_bytes(bytes.to_vec(), options) {
-        Ok(store) => exercise_store(&store),
+        Ok(store) => Ok(store),
         Err(err) => {
             let mut report = Report {
                 open_error: Some(err.code()),
@@ -125,9 +203,142 @@ pub fn exercise(bytes: &[u8], options: &OpenOptions) -> Report {
                     err.code()
                 ));
             }
-            report
+            Err(Box::new(report))
         }
     }
+}
+
+/// The title [`exercise_edits`] sets.
+pub const EDITED_TITLE: &str = "Edited by folioxide-testkit";
+
+/// Sets `/Title` in the document information dictionary (§14.3.3): in the one the trailer's
+/// `/Info` leads to, or in a new one linked from the trailer.
+fn edit(store: &mut Store) -> folioxide_syntax::Result<()> {
+    let title = Object::literal_string(EDITED_TITLE);
+    if let Some(info) = store
+        .trailer()
+        .get_ref(keys::INFO)
+        .filter(|&id| store.contains(id))
+        && let Some(dict) = store.get_mut(info)?.as_dict_mut()
+    {
+        dict.insert("Title", title);
+        return Ok(());
+    }
+    let mut dict = Dict::new();
+    dict.insert("Title", title);
+    let info = store.add(dict.into())?;
+    store.set_trailer_entry(keys::INFO, info.into())
+}
+
+/// Records a violation, keeping at most [`MAX_VIOLATIONS`].
+fn violation(report: &mut Report, message: String) {
+    if report.violations.len() < MAX_VIOLATIONS {
+        report.violations.push(message);
+    }
+}
+
+/// Saves `store` with a full rewrite (default options), reopens the output and checks it; see
+/// [`Report::violations`].
+fn check_full_save(store: &Store, label: &str, report: &mut Report) -> Result<usize, ErrorCode> {
+    let lenient = store.options().strictness == Strictness::Lenient;
+    let out = match store.save(&SaveOptions::default()) {
+        Ok(out) => out,
+        Err(err) => {
+            if lenient && err.code() != ErrorCode::LimitExceeded {
+                violation(report, format!("lenient {label} failed: {err}"));
+            }
+            return Err(err.code());
+        }
+    };
+    // The writer's output is well-formed: it opens in strict mode.
+    let strict = OpenOptions::default()
+        .with_strictness(Strictness::Strict)
+        .with_limits(*store.limits());
+    match Store::open_bytes(out.clone(), &strict) {
+        Ok(saved) => {
+            let comparison = compare_graphs(store, &saved, &graph_options(false));
+            if let Some(diff) = comparison.first() {
+                violation(
+                    report,
+                    format!("the {label} output differs from the document: {diff}"),
+                );
+            }
+        }
+        Err(err) if err.code() == ErrorCode::LimitExceeded => {}
+        Err(err) => violation(
+            report,
+            format!("the {label} output does not open in strict mode: {err}"),
+        ),
+    }
+    Ok(out.len())
+}
+
+/// Appends an incremental update to `store`'s source, reopens the output and checks it; see
+/// [`Report::violations`].
+fn check_incremental(store: &Store, report: &mut Report) -> Result<usize, ErrorCode> {
+    let lenient = store.options().strictness == Strictness::Lenient;
+    let out = match store.save_incremental(&IncrementalOptions::default()) {
+        Ok(out) => out,
+        Err(err) => {
+            if lenient && err.code() != ErrorCode::LimitExceeded {
+                violation(
+                    report,
+                    format!("lenient incremental save failed after check_incremental: {err}"),
+                );
+            }
+            return Err(err.code());
+        }
+    };
+    if !out.starts_with(store.source()) {
+        violation(
+            report,
+            "the incremental output does not start with the source".to_owned(),
+        );
+    }
+    match Store::open_bytes(out.clone(), store.options()) {
+        Ok(saved) => {
+            if saved.structure_repaired() {
+                violation(
+                    report,
+                    format!(
+                        "the incremental output's structure needed a repair: {:?}",
+                        saved.diagnostics().first()
+                    ),
+                );
+            } else if saved.revisions().len() != store.revisions().len() + 1 {
+                violation(
+                    report,
+                    format!(
+                        "the incremental output has {} revisions, not {} + 1",
+                        saved.revisions().len(),
+                        store.revisions().len()
+                    ),
+                );
+            }
+            let comparison = compare_graphs(store, &saved, &graph_options(true));
+            if let Some(diff) = comparison.first() {
+                violation(
+                    report,
+                    format!("the incremental output differs from the edited document: {diff}"),
+                );
+            }
+        }
+        Err(err) if err.code() == ErrorCode::LimitExceeded => {}
+        Err(err) => violation(
+            report,
+            format!("the incremental output does not open: {err}"),
+        ),
+    }
+    Ok(out.len())
+}
+
+/// The graph comparison of a saved document: structure and values, not stream data (decoding
+/// limits are per store, so a stream one store has no budget left for may decode in the other).
+fn graph_options(same_numbers: bool) -> GraphOptions {
+    GraphOptions::default()
+        .with_same_numbers(same_numbers)
+        .with_stream_data(false)
+        .with_max_differences(1)
 }
 
 /// Uses everything in an opened `store`; see the [module documentation](self).
@@ -434,7 +645,7 @@ mod tests {
         for info in syntax::infos() {
             for strictness in [Strictness::Lenient, Strictness::Strict] {
                 let options = OpenOptions::default().with_strictness(strictness);
-                let report = exercise(&(info.generate)(), &options);
+                let report = exercise_edits(&(info.generate)(), &options);
                 assert!(
                     report.violations.is_empty(),
                     "{} {strictness:?}: {:?}",
@@ -444,8 +655,57 @@ mod tests {
                 if report.open_error.is_none() {
                     assert_eq!(report.pages, Some(info.pages), "{}", info.name);
                 }
+                if strictness == Strictness::Lenient && report.open_error.is_none() {
+                    // Every fixture that opens leniently saves, as read and edited.
+                    assert!(matches!(report.full_save, Some(Ok(_))), "{}", info.name);
+                    assert!(
+                        matches!(report.edited_full_save, Some(Ok(_))),
+                        "{}",
+                        info.name
+                    );
+                    assert!(
+                        report.incremental_save.is_some() != report.incremental_refusal.is_some(),
+                        "{}",
+                        info.name
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn saves_are_reported() {
+        // The document as read, edited, and appended to.
+        let report = exercise_edits(&syntax::minimal(), &OpenOptions::default());
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        let source = syntax::minimal().len();
+        assert!(matches!(report.full_save, Some(Ok(len)) if len > 0));
+        assert!(matches!(report.edited_full_save, Some(Ok(_))));
+        assert!(matches!(report.incremental_save, Some(Ok(len)) if len > source));
+        assert_eq!(
+            (report.edit_error, report.incremental_refusal),
+            (None, None)
+        );
+        // `exercise` saves the document as read only.
+        let report = exercise(&syntax::minimal(), &OpenOptions::default());
+        assert!(matches!(report.full_save, Some(Ok(_))));
+        assert_eq!(report.edited_full_save, None);
+        assert_eq!(report.incremental_save, None);
+        // A reconstructed file takes a full save only.
+        let report = exercise_edits(&syntax::missing_xref(), &OpenOptions::default());
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert!(matches!(report.edited_full_save, Some(Ok(_))));
+        assert_eq!(report.incremental_refusal, Some(ErrorCode::Unsupported));
+        assert_eq!(report.incremental_save, None);
+        // Nothing is saved when the open fails.
+        let report = exercise_edits(&syntax::encrypted(), &OpenOptions::default());
+        assert_eq!(report.open_error, Some(ErrorCode::PasswordRequired));
+        assert_eq!(report.full_save, None);
+        // A strict store whose objects cannot be read fails to save, which is no violation.
+        let strict = OpenOptions::default().with_strictness(Strictness::Strict);
+        let report = exercise_edits(&syntax::stream_length_wrong(), &strict);
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert!(matches!(report.full_save, Some(Err(_))), "{report:?}");
     }
 
     #[test]

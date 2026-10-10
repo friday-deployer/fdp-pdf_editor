@@ -34,6 +34,11 @@ Expect keys (§A.9). Implemented:
 * ``objectCount`` (int, M1 brief WP1.5): in-use objects, compared with pikepdf's
   ``len(pdf.objects)`` minus its null entries; see ``check_pdf.check_object_count`` for the
   exact rules
+* ``boxes`` (list, M2 brief acceptance criterion 5): one entry per page in the JSON shape of
+  Folioxide's ``PageInfo`` (``{"index", "width", "height", "mediaBox", "cropBox",
+  "rotation"}``), compared with ``pdfinfo -box -f 1 -l N``, one check per page and value
+  (``boxes[0].rotation.pdfinfo``, ...); see ``check_pdf.check_boxes``, which also lists the
+  poppler quirks that cases waive with ``knownFailures``
 
 Not implemented yet (exit 2 until their milestone adds them): ``encrypted``, ``xmpContains``,
 ``fields``, ``annots``, ``fontsEmbedded``, ``images``.
@@ -94,12 +99,13 @@ from oracle_common import (  # noqa: E402
 
 EXPECT_SUFFIX = ".expect.json"
 
-#: Every expect key named in docs/ARCHITECTURE.md §A.9, plus ``objectCount`` (M1 brief WP1.5),
-#: in the order checks run.
+#: Every expect key named in docs/ARCHITECTURE.md §A.9, plus ``objectCount`` (M1 brief WP1.5)
+#: and ``boxes`` (M2 brief, acceptance criterion 5), in the order checks run.
 SPEC_KEYS = (
     "pages",
     "version",
     "objectCount",
+    "boxes",
     "encrypted",
     "info",
     "xmpContains",
@@ -166,6 +172,11 @@ def _check_info(case: Case, value: Any) -> list[CheckResult]:
 @register("objectCount")
 def _check_object_count(case: Case, value: Any) -> list[CheckResult]:
     return check_pdf.check_object_count(case.pdf, value)
+
+
+@register("boxes")
+def _check_boxes(case: Case, value: Any) -> list[CheckResult]:
+    return check_pdf.check_boxes(case.pdf, value)
 
 
 @register("signatures")

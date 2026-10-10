@@ -10,6 +10,8 @@
 pub mod hostile;
 pub mod qpdf;
 pub mod syntax;
+// M2 WP2.2: document-model fixtures, generated at test time.
+pub mod model;
 
 use std::path::{Path, PathBuf};
 

@@ -12,11 +12,15 @@
 //! shape in [`folioxide_testkit::fixtures::hostile`] are mutated [`MUTATIONS_PER_BASE`] times
 //! with [`folioxide_testkit::mutate`]: bit flips, byte changes, truncations, insertions, chunk
 //! duplication and deletion, and PDF tokens, one to four per mutation. Each mutation is opened with [`Store::open`](folioxide_syntax::Store::open),
-//! every object is resolved, every reference followed and every stream decoded
-//! ([`folioxide_testkit::exercise`]). For every mutation:
+//! every object is resolved, every reference followed and every stream decoded, the document is
+//! saved with a full rewrite, then edited (a new Info `/Title`) and saved again with a full
+//! rewrite and, when [`Store::check_incremental`](folioxide_syntax::Store::check_incremental)
+//! accepts it, an incremental update; every output is reopened and compared with the document
+//! ([`folioxide_testkit::exercise::exercise_edits`], M2 brief WP2.4). For every mutation:
 //!
-//! - nothing may panic, and the store's documented guarantees must hold
-//!   ([`folioxide_testkit::exercise::Report::violations`], which include the object cap);
+//! - nothing may panic, and the store's and the writers' documented guarantees must hold
+//!   ([`folioxide_testkit::exercise::Report::violations`], which include the object cap and
+//!   the checks of every saved output);
 //! - it must finish within [`MUTATION_BUDGET`] (the slowest take a few milliseconds in a debug
 //!   build, so a mutation over budget means quadratic or worse work on a small input). A
 //!   mutation still running after [`hang_limit`] is a hang: a watchdog saves the input and
@@ -46,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use folioxide_syntax::{ErrorCode, Limits, OpenOptions, Strictness};
 use folioxide_testkit::budget::peak_rss;
-use folioxide_testkit::exercise::{Report, exercise};
+use folioxide_testkit::exercise::{Report, exercise_edits};
 use folioxide_testkit::fixtures::{self, hostile, qpdf, syntax};
 use folioxide_testkit::mutate::Mutator;
 
@@ -163,6 +167,11 @@ struct Tally {
     open_errors: Vec<(ErrorCode, usize)>,
     objects: usize,
     streams: usize,
+    /// Full saves (of the document as read, then edited) that succeeded.
+    full_saves: usize,
+    /// Incremental updates that succeeded, and those `check_incremental` refused.
+    incremental_saves: usize,
+    incremental_refusals: usize,
     slowest: (Duration, String),
     failures: Vec<Failure>,
 }
@@ -178,6 +187,12 @@ impl Tally {
         }
         self.objects += report.objects;
         self.streams += report.streams;
+        self.full_saves += [&report.full_save, &report.edited_full_save]
+            .into_iter()
+            .filter(|save| matches!(save, Some(Ok(_))))
+            .count();
+        self.incremental_saves += usize::from(matches!(report.incremental_save, Some(Ok(_))));
+        self.incremental_refusals += usize::from(report.incremental_refusal.is_some());
     }
 
     fn merge(&mut self, other: Tally) {
@@ -191,6 +206,9 @@ impl Tally {
         }
         self.objects += other.objects;
         self.streams += other.streams;
+        self.full_saves += other.full_saves;
+        self.incremental_saves += other.incremental_saves;
+        self.incremental_refusals += other.incremental_refusals;
         if other.slowest.0 > self.slowest.0 {
             self.slowest = other.slowest;
         }
@@ -221,7 +239,7 @@ fn run_base(
         let options = options(index);
         let started = Instant::now();
         set_busy(busy, Some((base, index, started)));
-        let outcome = catch_unwind(AssertUnwindSafe(|| exercise(&input, &options)));
+        let outcome = catch_unwind(AssertUnwindSafe(|| exercise_edits(&input, &options)));
         let elapsed = started.elapsed();
         set_busy(busy, None);
         if elapsed > tally.slowest.0 {
@@ -385,8 +403,8 @@ fn no_panic_on_mutated_input() {
     let peak = peak_rss();
     eprintln!(
         "no_panic_on_mutated_input: {} mutations of {} bases in {:.1?} ({} threads): {} opened \
-         ({} objects, {} streams), open errors {:?}; slowest {:.1?} ({}), budget {:.1?}; peak \
-         resident memory {}",
+         ({} objects, {} streams), open errors {:?}; {} full saves, {} incremental updates \
+         ({} refused); slowest {:.1?} ({}), budget {:.1?}; peak resident memory {}",
         tally.mutations,
         bases.len(),
         started.elapsed(),
@@ -395,6 +413,9 @@ fn no_panic_on_mutated_input() {
         tally.objects,
         tally.streams,
         tally.open_errors,
+        tally.full_saves,
+        tally.incremental_saves,
+        tally.incremental_refusals,
         tally.slowest.0,
         tally.slowest.1,
         budget,
@@ -416,6 +437,22 @@ fn no_panic_on_mutated_input() {
         "only {} of {} mutations opened",
         tally.opened,
         tally.mutations
+    );
+    // ... and they are saved (WP2.4): nearly all with a full rewrite, twice (as read and
+    // edited); an incremental update only when the mutation left the cross-reference structure
+    // intact (most mutations move offsets, which makes it a full-save-only file), about one in
+    // ten.
+    assert!(
+        tally.full_saves > tally.opened,
+        "{} full saves of {} opened mutations",
+        tally.full_saves,
+        tally.opened
+    );
+    assert!(
+        tally.incremental_saves * 20 > tally.opened,
+        "{} incremental updates of {} opened mutations",
+        tally.incremental_saves,
+        tally.opened
     );
     if let Some(peak) = peak {
         assert!(

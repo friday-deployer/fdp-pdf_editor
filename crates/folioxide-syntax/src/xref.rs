@@ -92,6 +92,13 @@ pub struct Revision {
     /// the first `%%EOF` shortly after the section counts. Without a `%%EOF` (a damaged file): the
     /// end of the `startxref` line, or the end of the section, or for the newest revision the end
     /// of the file.
+    ///
+    /// An incremental update is appended after the whole source, never after an `eof_end`: the
+    /// new file is [`IncrementalUpdate::start`](crate::IncrementalUpdate::start) (the source's
+    /// length) plus the update's length, and its new newest revision ends there. That equals the
+    /// newest revision's `eof_end` plus the update's length only when nothing follows the
+    /// source's last `%%EOF` (see [`IncrementalUpdate`](crate::IncrementalUpdate), which also
+    /// gives the absolute position of every object the update writes).
     pub eof_end: u64,
     /// The absolute position just past the section itself: past the trailer dictionary of a
     /// table, or past the cross-reference stream object.

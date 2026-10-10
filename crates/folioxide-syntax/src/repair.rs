@@ -131,6 +131,27 @@ pub(crate) struct ScanIndex {
 }
 
 impl ScanIndex {
+    /// The heap memory the index holds, in bytes (see [`Store::memory_estimate`]).
+    ///
+    /// [`Store::memory_estimate`]: crate::Store::memory_estimate
+    pub fn heap_size(&self) -> u64 {
+        fn vec<T>(items: &Vec<T>) -> u64 {
+            (items.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64)
+        }
+        [
+            vec(&self.endstream),
+            vec(&self.endobj),
+            vec(&self.trailers),
+            vec(&self.headers),
+            vec(&self.candidates),
+            vec(&self.objstm),
+            vec(&self.catalogs),
+            vec(&self.xref_streams),
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
+    }
+
     /// The first `endstream` at or after `from`.
     pub fn next_endstream(&self, from: usize) -> Option<usize> {
         next_at_or_after(&self.endstream, from)
@@ -273,6 +294,22 @@ pub(crate) struct Definitions {
 }
 
 impl Definitions {
+    /// The heap memory the definitions hold, in bytes (see [`Store::memory_estimate`]): each
+    /// map entry with its key, its value and a control byte.
+    ///
+    /// [`Store::memory_estimate`]: crate::Store::memory_estimate
+    pub fn heap_size(&self) -> u64 {
+        fn map<K, V>(map: &HashMap<K, V>) -> u64 {
+            let entry = std::mem::size_of::<(K, V)>() + 1;
+            (map.capacity() as u64).saturating_mul(entry as u64)
+        }
+        let positions =
+            (self.positions.capacity() as u64).saturating_mul(std::mem::size_of::<usize>() as u64);
+        map(&self.by_id)
+            .saturating_add(map(&self.by_num))
+            .saturating_add(positions)
+    }
+
     fn add(&mut self, candidate: &Candidate) {
         let found = Found {
             r#gen: candidate.id.r#gen,

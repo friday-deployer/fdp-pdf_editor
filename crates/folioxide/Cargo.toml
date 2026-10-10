@@ -31,9 +31,10 @@ interactive = ["dep:folioxide-interactive"]
 redact = ["dep:folioxide-redact"]
 # Page rendering (hayro, later).
 render = ["dep:folioxide-render"]
-# `Serialize`/`Deserialize` on all DTOs (so far the syntax layer's `ErrorCode`, `Limits`,
-# `Diagnostic` and `OpenOptions`).
-serde = ["folioxide-syntax/serde"]
+# `Serialize`/`Deserialize` on all DTOs: the syntax layer's (`ErrorCode`, `Limits`, `Diagnostic`,
+# `OpenOptions`, `SaveOptions`, …) and the model's (`DocInfo`, `InfoUpdate`, `PageInfo`, `Rect`,
+# `Rotation`, `PdfDate`, `Trapped`).
+serde = ["folioxide-syntax/serde", "folioxide-model/serde"]
 # Path helpers, `SystemClock` and optional mmap. Placeholder until M2.
 std-fs = []
 
@@ -46,6 +47,10 @@ folioxide-interactive = { workspace = true, optional = true }
 folioxide-sign = { workspace = true, optional = true }
 folioxide-redact = { workspace = true, optional = true }
 folioxide-render = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The `serde` test checks the DTOs implement the traits (run with `--features serde`).
+serde.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

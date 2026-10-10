@@ -19,6 +19,13 @@ napi-derive.workspace = true
 [build-dependencies]
 napi-build.workspace = true
 
+[dev-dependencies]
+# The unit tests check that the binding's DTOs have the JSON shape of the core's serde DTOs
+# (ARCHITECTURE §A.7, §A.8: Node and Tauri see the same JSON).
+folioxide = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+
 # Same as [workspace.lints] except `unsafe_code`, which is `deny` instead of `forbid`: the
 # `#[napi]` macros expand to `unsafe` FFI glue wrapped in `#[allow(unsafe_code)]`, and `forbid`
 # cannot be overridden by an inner `allow`. `deny` still rejects any hand-written `unsafe` here.

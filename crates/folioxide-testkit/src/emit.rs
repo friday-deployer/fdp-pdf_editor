@@ -176,6 +176,62 @@ pub fn write_case(dir: &Path, name: &str, pdf: &[u8], expect: &ExpectJson) -> io
     Ok(pdf_path)
 }
 
+/// Writes a supporting file `name` of `suite` when the `emit` feature is enabled, next to the
+/// cases: for example the source of an incremental update that a case's `prefixOf` names (a
+/// relative `prefixOf` path is resolved against the case's directory first). The runner only
+/// takes files with a sibling `<name>.expect.json` as cases, so a supporting file is never one
+/// unless such a file exists. Returns the path, or `None` without the feature (nothing is
+/// written).
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidInput`] if `suite` is not a valid suite name or `name` is not a valid
+/// file name (see [`is_valid_file_name`]), and any I/O error from writing.
+pub fn emit_file(suite: &str, name: &str, bytes: &[u8]) -> io::Result<Option<PathBuf>> {
+    if !EMIT_ENABLED {
+        return Ok(None);
+    }
+    let dir = oracle_dir(suite).ok_or_else(|| invalid(format!("invalid suite name {suite:?}")))?;
+    write_file(&dir, name, bytes).map(Some)
+}
+
+/// Writes `<dir>/<name>`, creating `dir`, whether or not the `emit` feature is enabled. Returns
+/// the path.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidInput`] if `name` is not a valid file name (see
+/// [`is_valid_file_name`]), and any I/O error from writing.
+pub fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    if !is_valid_file_name(name) {
+        return Err(invalid(format!("invalid file name {name:?}")));
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(name);
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// Whether `name` is a valid supporting file name for [`emit_file`]: a single path component of
+/// ASCII letters, digits, `-`, `_` and `.`, which neither starts with `.` nor ends with
+/// [`EXPECT_SUFFIX`] (so it cannot escape the suite directory, be hidden, or pose as a case's
+/// expectation).
+///
+/// ```
+/// use folioxide_testkit::emit::is_valid_file_name;
+///
+/// assert!(is_valid_file_name("minimal.source.pdf"));
+/// assert!(!is_valid_file_name("../minimal.pdf"));
+/// assert!(!is_valid_file_name(".hidden"));
+/// assert!(!is_valid_file_name("case.expect.json"));
+/// ```
+pub fn is_valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.ends_with(EXPECT_SUFFIX)
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -228,6 +284,36 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_file_writes_supporting_files_and_rejects_bad_names() {
+        let dir =
+            std::env::temp_dir().join(format!("folioxide-testkit-file-{}", std::process::id()));
+        let path = write_file(&dir, "case-1.source.pdf", b"%PDF-1.4\n").unwrap();
+        assert_eq!(path, dir.join("case-1.source.pdf"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.4\n");
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            ".x",
+            "x.expect.json",
+            "é",
+        ] {
+            let err = write_file(&dir, bad, b"").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        let result = emit_file("../bad", "x.pdf", b"");
+        if EMIT_ENABLED {
+            assert!(result.is_err());
+        } else {
+            assert!(matches!(result, Ok(None)));
+        }
     }
 
     #[test]

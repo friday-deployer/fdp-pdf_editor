@@ -8,7 +8,7 @@
     "noEmit": true,
     "noUnusedLocals": true,
     "skipLibCheck": false,
-    "types": []
+    "types": ["node"]
   },
   "files": ["types.test-d.ts"]
 }

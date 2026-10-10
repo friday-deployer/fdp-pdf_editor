@@ -33,7 +33,7 @@ exits `2` only when nothing failed but something could not be evaluated.
 | Module | Checks |
 |---|---|
 | `oracles/run_suite.py` | the runner: `python -I tools/oracles/run_suite.py DIR...` |
-| `oracles/check_pdf.py` | structure (pdfinfo exit 0 and no syntax errors; pikepdf `check_pdf_syntax()`; pypdf `strict=True` reads every page), page count, effective version, Info entries, in-use object count (pikepdf) |
+| `oracles/check_pdf.py` | structure (pdfinfo exit 0 and no syntax errors; pikepdf `check_pdf_syntax()`; pypdf `strict=True` reads every page), page count, effective version, Info entries, in-use object count (pikepdf), page boxes and rotation (`pdfinfo -box`) |
 | `oracles/validate_sig.py` | pyHanko `intact`/`valid`/`trusted`/coverage/modification/DocMDP/timestamp, cross-checked for every signature with the structural checks, `pdfsig -nocert` and `openssl cms -verify` / `openssl ts -verify` |
 | `oracles/extract_cms.py` | slices `/Contents` DER and the signed byte ranges out of the file for `openssl cms -verify` / `openssl ts -verify`; structural checks: ByteRange starts at 0, gap is the dictionary's own `/Contents`, only zero padding after the CMS |
 | `oracles/pades_profile.py` | PAdES baseline: SubFilter, content-type, message-digest, signing-certificate-v2 present, signing-time absent, B-B/B-T level |
@@ -55,6 +55,8 @@ checks:
   "prefixOf": "input.pdf",                      // incremental save kept every original byte
   "revisions": 2,                               // startxref count and pyHanko's revision count
   "objectCount": 7,                             // in-use objects: pikepdf len(pdf.objects) minus its nulls
+  "boxes": [{"mediaBox": [0, 0, 595, 842], "cropBox": [0, 0, 595, 842], "rotation": 90,
+             "width": 842, "height": 595}], // per page (PageInfo JSON): pdfinfo -box -f 1 -l N
   "knownFailures": {"structure.pypdf": "why"},  // still run; a failure is XFAIL, a pass is FAIL (stale)
   "oracleSkip": "why",                          // SKIP: no check runs (files the oracles would repair)
   "trustRoots": ["fixtures/pki/root.pem"],      // trust anchors for "trusted"
@@ -80,7 +82,10 @@ when `intact` and `valid` are both expected. OpenSSL validates the chain only fo
 
 `objectCount` counts the in-use objects of the merged cross-reference data that resolve to a
 non-null object; `check_pdf.check_object_count` documents exactly how pikepdf's count is
-adjusted. `oracleSkip` and `knownFailures` cannot be combined, and `knownFailures` may only name
+adjusted. `boxes` has one entry per page in Folioxide's `PageInfo` JSON shape and one check per
+page and value (`boxes[0].rotation.pdfinfo`); `check_pdf.check_boxes` documents the poppler quirks
+(raw `/Rotate 45`, an ignored `/Rotate 90.0`, oversized crop boxes) that cases waive with
+`knownFailures`. `oracleSkip` and `knownFailures` cannot be combined, and `knownFailures` may only name
 checks the case runs. The `syntax` suite (M1) uses all three.
 
 Relative paths resolve against the expect.json's directory first, then the repository root.

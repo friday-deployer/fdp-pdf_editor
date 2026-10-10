@@ -17,6 +17,8 @@
 //! - [`emit`]: the oracle-output emitter used by `cargo xtask oracle`
 //! - [`exercise`]: opens a document and uses all of it, checking the store's documented
 //!   guarantees (for `no_panic_on_mutated_input` and the `fuzz_parse_document` fuzz target)
+//! - [`graph`]: graph equality of two documents modulo renumbering, with a readable difference
+//!   (writer and model round-trip tests)
 //!
 //! Later milestones add a loader for the test PKI in `fixtures/pki/` and a mock RFC 3161
 //! timestamp authority.
@@ -34,6 +36,8 @@ pub mod emit;
 pub mod exercise;
 pub mod fixtures;
 pub mod mutate;
+// M2 WP2.4: graph equality of two documents (writer acceptance).
+pub mod graph;
 
 pub use builder::{
     LengthSpec, ObjStmOpts, PdfBuilder, XrefEntry, XrefEol, XrefOpts, XrefStreamOpts,

@@ -13,10 +13,11 @@
 //! Every other Folioxide crate depends on this one; it depends on no other Folioxide crate.
 //! See `docs/ARCHITECTURE.md` §A.3 for the data model.
 //!
-//! **Status:** M1 in progress. Available: the object model, errors, limits and diagnostics, the
-//! lexer, the object parser, the primitive serializer, the stream filters, and the lazy
-//! [`Store`] with cross-reference parsing, object streams and repair. The document writers
-//! follow in M2.
+//! **Status:** M2 in progress. Available: the object model, errors, limits and diagnostics, the
+//! lexer, the object parser, the primitive serializer, the stream filters, the lazy [`Store`]
+//! with cross-reference parsing, object streams and repair, its edit layer ([`Store::set`],
+//! [`Store::add`], [`Store::free`], ...), and the [`writer`]s: a full rewrite ([`save`]) and
+//! incremental updates ([`save_incremental`]).
 //!
 //! ```
 //! use folioxide_syntax::{parse_object, serialize_object, ParseCtx};
@@ -41,6 +42,7 @@ pub mod object;
 pub mod parser;
 pub mod serialize;
 pub mod store;
+pub mod writer;
 
 mod objstm;
 mod repair;
@@ -61,4 +63,9 @@ pub use parser::KeywordIndex;
 pub use store::{
     OffsetBase, OpenOptions, Resolved, Revision, SharedBytes, Store, StreamBytes, XrefEntry,
     XrefKind, shared_bytes,
+};
+// M2 WP2.1: the writers.
+pub use writer::{
+    IncrementalOptions, IncrementalUpdate, SaveOptions, StreamCompression, XrefStyle,
+    incremental_suffix, incremental_update, save, save_incremental,
 };

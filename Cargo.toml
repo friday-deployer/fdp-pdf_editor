@@ -30,6 +30,8 @@ folioxide-testkit = { path = "crates/folioxide-testkit", version = "0.1.0", defa
 indexmap = { version = "2.14.2", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.21", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+# JSON for the tests of the serde DTOs (M2 WP2.3). Dev-dependency only.
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 
 # RustCrypto 2026 stack (M0 dependency spike, ARCHITECTURE §A.5 "Gaps" 2 and 5).
 # `rsa` and `cms` are pre-releases and pinned exactly: `pkcs12 0.2.0-pre.0` (via p12-keystore)
@@ -70,6 +72,11 @@ unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 indexing_slicing = "warn"
+
+[profile.dev]
+# Line tables are enough for backtraces, and full debug info made each worktree's target/ several
+# GB (M2: the disk filled up during QA). Tests inherit this profile.
+debug = "line-tables-only"
 
 [profile.release]
 # Smaller, faster Node addon builds (`pnpm build` uses the release profile).

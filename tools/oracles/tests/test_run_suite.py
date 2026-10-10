@@ -37,7 +37,7 @@ def run(*argv):
 class RegistryTests(unittest.TestCase):
     def test_every_spec_key_is_either_wired_or_pending(self):
         wired = {"pages", "version", "info", "signatures", "textContains", "textAbsent", "prefixOf",
-                 "revisions", "objectCount"}
+                 "revisions", "objectCount", "boxes"}
         self.assertEqual(set(run_suite.REGISTRY), wired)
         self.assertEqual(set(run_suite.SPEC_KEYS) - wired, set(NOT_IMPLEMENTED))
 

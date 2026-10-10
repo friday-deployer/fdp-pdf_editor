@@ -10,8 +10,337 @@
 export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-wasip1'
 
 /**
+ * A PDF document opened from bytes or created empty.
+ *
+ * Page indices are 0-based. Every error is thrown (or rejected) with `err.code` set to an
+ * `E_*` code; see the package's `index.d.ts` for the full list.
+ */
+export declare class PdfDocument {
+  /**
+   * Opens a PDF file from its bytes, which are copied once. Opening reads the file's
+   * structure only; pages and metadata are read when first asked for.
+   *
+   * Damaged files are repaired (each repair is recorded in `diagnostics()`) unless
+   * `options.strict` is true.
+   *
+   * Throws `E_XREF` or `E_SYNTAX` for data that is not a readable PDF file,
+   * `E_PASSWORD_REQUIRED` for an encrypted file (encryption arrives in a later release),
+   * `E_UNSUPPORTED` for an unsupported security handler, `E_LIMIT_EXCEEDED` when a resource
+   * limit is hit.
+   */
+  static open(data: Uint8Array, options?: OpenOptions | undefined | null): PdfDocument
+  /**
+   * Like `open`, on the libuv thread pool: the bytes are copied before it returns, so the
+   * caller may reuse the buffer at once.
+   */
+  static openAsync(data: Uint8Array, options?: OpenOptions | undefined | null): Promise<PdfDocument>
+  /**
+   * A new, empty PDF 1.7 document: a catalog and a page tree with no pages. It has no
+   * original file, so it can be saved with `save` only (an incremental update needs a file
+   * to append to).
+   */
+  static create(): PdfDocument
+  /**
+   * Frees the document's native memory now, instead of when the object is garbage-collected
+   * (which may be much later: the object itself is small). Afterwards every method throws
+   * `E_CLOSED`. An asynchronous operation already started finishes first (its promise
+   * resolves as usual), and the memory is freed when it ends. Closing twice does nothing.
+   */
+  close(): void
+  /** Whether `close()` was called. */
+  get isClosed(): boolean
+  /**
+   * An estimate of the native memory the document holds, in bytes (the file, what was read
+   * from it, and the changes), as last reported to V8: it grows as pages are read and when
+   * the document is saved, and is 0 once the document is closed. Never `E_BUSY`.
+   */
+  get nativeMemory(): number
+  /** The number of pages (the pages the page tree really has, not its `/Count`). */
+  get pageCount(): number
+  /**
+   * The PDF version, such as `"1.7"`: the header's, or the catalog's `/Version` when that
+   * is later.
+   */
+  get version(): string
+  /** Whether the document has changes not saved yet (always true for a new document). */
+  get isModified(): boolean
+  /**
+   * The repairs and leniency decisions recorded so far, oldest first: opening, then
+   * whatever reading pages and metadata found.
+   */
+  diagnostics(): Array<Diagnostic>
+  /**
+   * The size, boxes and rotation of the page at `index` (0-based).
+   *
+   * Throws `E_PAGE_OUT_OF_RANGE` when there is no such page, `E_INVALID_ARGUMENT` when
+   * `index` is not an integer.
+   */
+  getPage(index: number): PageInfo
+  /**
+   * The document information dictionary (title, author, dates, …), decoded. Entries the
+   * document does not have are left out.
+   */
+  getInfo(): DocInfo
+  /**
+   * Changes the document information dictionary: in `update`, a field that is absent keeps
+   * the entry, `null` removes it and a value sets it. Nothing is set automatically (not
+   * even `/ModDate`).
+   *
+   * Throws `E_INVALID_ARGUMENT` for a date that is not a PDF date string, a `trapped` value
+   * other than `'true'`, `'false'` and `'unknown'`, or an invalid custom key.
+   */
+  setInfo(update: InfoUpdate): void
+  /**
+   * Sets the rotation of the page at `index` to `degrees` clockwise: a multiple of 90,
+   * negative ones included (`-90` is the same as 270). The value is written on the page
+   * itself, so the other pages keep theirs.
+   */
+  setPageRotation(index: number, degrees: number): void
+  /**
+   * Sets the media box or the crop box of the page at `index`, written on the page itself.
+   * A crop box is clipped to the media box; `null` removes the crop box (it becomes the
+   * media box). A media box cannot be removed.
+   *
+   * Throws `E_INVALID_ARGUMENT` for an unknown box, a box with no area or a coordinate that
+   * is not finite, a crop box outside the media box, or `null` for the media box.
+   */
+  setPageBox(index: number, kind: PageBox, rect: Rect | null): void
+  /**
+   * Writes the whole document again (a full rewrite) and returns the new file.
+   *
+   * Throws `E_INVALID_ARGUMENT` for invalid options, or the error of the writer.
+   */
+  save(options?: SaveOptions | undefined | null): Buffer
+  /** Like `save`, on the libuv thread pool. */
+  saveAsync(options?: SaveOptions | undefined | null): Promise<Buffer>
+  /**
+   * Returns the original file with the changes appended as an incremental update (ISO
+   * 32000-2 §7.5.6): the original bytes are kept byte for byte. Without changes, the
+   * original file. With `options.suffixOnly`, only the appended bytes.
+   *
+   * Throws `E_INVALID_ARGUMENT` for a document made with `create()` (there is no original
+   * file), and `E_UNSUPPORTED` when opening repaired the file's structure (other readers
+   * could see an update to it differently): save such a file with `save`.
+   */
+  saveIncremental(options?: IncrementalSaveOptions | undefined | null): Buffer
+  /** Like `saveIncremental`, on the libuv thread pool. */
+  saveIncrementalAsync(options?: IncrementalSaveOptions | undefined | null): Promise<Buffer>
+}
+
+/**
+ * A record of one repair or leniency decision made while reading the document (the core
+ * `Diagnostic`).
+ */
+export interface Diagnostic {
+  /**
+   * The byte offset of the problem in the buffer being parsed (the file, or a decoded object
+   * stream), or `null` when it is not tied to a position.
+   */
+  offset: number | null
+  /**
+   * The category, a stable `camelCase` identifier such as `"streamLength"` or
+   * `"xrefReconstructed"`.
+   */
+  kind: string
+  /** A human-readable description. */
+  message: string
+}
+
+/**
+ * The document information dictionary (§14.3.3), decoded (the core `DocInfo`).
+ *
+ * Entries the dictionary does not have (or has with the wrong type) are left out. Text is
+ * decoded from PDFDocEncoding or UTF-16; dates are PDF date strings in the full form
+ * `D:YYYYMMDDHHmmSSOHH'mm'` (`fromPdfDate` in the JavaScript facade turns one into a `Date`).
+ */
+export interface DocInfo {
+  /** `/Title`: the document's title. */
+  title?: string
+  /** `/Author`: the name of the person who created the document. */
+  author?: string
+  /** `/Subject`: the subject of the document. */
+  subject?: string
+  /** `/Keywords`: keywords associated with the document. */
+  keywords?: string
+  /** `/Creator`: the application that created the original document. */
+  creator?: string
+  /** `/Producer`: the application that converted it to PDF. */
+  producer?: string
+  /** `/CreationDate`, as a PDF date string. */
+  creationDate?: string
+  /** `/ModDate`, as a PDF date string. */
+  modDate?: string
+  /** `/Trapped`. */
+  trapped?: Trapped
+  /** Every other entry whose value is a text string, by key (the name without its `/`). */
+  custom: Record<string, string>
+}
+
+/** Options for an incremental save (`saveIncremental`, `saveIncrementalAsync`). */
+export interface IncrementalSaveOptions {
+  /**
+   * Return only the bytes appended to the original file (an update to append to the file in
+   * place) instead of the whole new file. Default `false`.
+   */
+  suffixOnly?: boolean
+  /** Ask for byte-identical output for identical input and edits (default `false`). */
+  deterministic?: boolean
+  /**
+   * The second element of the new `/ID` (§14.4). Default: a digest of the update. The first
+   * element is always kept.
+   */
+  id1?: Uint8Array
+}
+
+/**
+ * Changes to the document information dictionary (§14.3.3), for `setInfo` (the core
+ * `InfoUpdate`).
+ *
+ * Every field is one change: absent (or `undefined`) keeps the entry, `null` removes it, a value
+ * sets it. Text is written as a PDF text string (PDFDocEncoding when every character has a
+ * code there, otherwise UTF-16BE), so any Unicode text round-trips. Dates are PDF date strings
+ * (the JavaScript facade also takes `Date` objects). `/ModDate` is never set automatically.
+ */
+export interface InfoUpdate {
+  /** `/Title`. */
+  title?: string | null
+  /** `/Author`. */
+  author?: string | null
+  /** `/Subject`. */
+  subject?: string | null
+  /** `/Keywords`. */
+  keywords?: string | null
+  /** `/Creator`. */
+  creator?: string | null
+  /** `/Producer`. */
+  producer?: string | null
+  /**
+   * `/CreationDate`, as a PDF date string (§7.9.4; partial forms such as `"D:2026"` are
+   * accepted).
+   */
+  creationDate?: string | null
+  /** `/ModDate`, as a PDF date string. */
+  modDate?: string | null
+  /** `/Trapped`. */
+  trapped?: Trapped | null
+  /**
+   * Other entries, by key (the name without its `/`): `null` removes the entry, a string sets
+   * it. A key must not be one of the standard keys above (`Title`, `CreationDate`, …). A key
+   * that is set must not be empty, be longer than 127 bytes in UTF-8 (the PDF name length
+   * limit) or contain a NUL character; any other key can be removed.
+   */
+  custom?: Record<string, string | null>
+}
+
+/** Options for `PdfDocument.open` and `PdfDocument.openAsync`. */
+export interface OpenOptions {
+  /**
+   * Refuse damaged files instead of repairing them (default `false`: repair what can be
+   * repaired and record a diagnostic for each repair).
+   */
+  strict?: boolean
+}
+
+/** The page box `setPageBox` changes. */
+export type PageBox = 'media' | 'crop'
+
+/**
+ * What a page looks like: its size as displayed, its boxes and its rotation (the core
+ * `PageInfo`).
+ */
+export interface PageInfo {
+  /** The page's 0-based index. */
+  index: number
+  /**
+   * The width as displayed, in points: the crop box's width, or its height when the page is
+   * rotated by 90 or 270 degrees.
+   */
+  width: number
+  /** The height as displayed, in points (see `width`). */
+  height: number
+  /**
+   * The media box (§7.7.3.3; inherited from the page tree when the page has none; US Letter
+   * when no valid one exists).
+   */
+  mediaBox: Rect
+  /** The crop box (§14.11.2), clipped to the media box; the media box when the page has none. */
+  cropBox: Rect
+  /** The rotation, clockwise in degrees: 0, 90, 180 or 270. */
+  rotation: number
+}
+
+/**
+ * Parses a PDF date string (ISO 32000-2 §7.9.4, leniently: partial dates such as `"D:2026"`,
+ * a missing `D:`, the offset forms real files use) and returns it in RFC 3339 form, such as
+ * `"2026-10-10T09:30:00+02:00"`, or `null` when the text is not a date.
+ *
+ * A date whose offset from UT is unknown has no offset in the result (a local date-time).
+ */
+export declare function pdfDateToIso(text: string): string | null
+
+/**
+ * A rectangle in default user space (ISO 32000-2 §7.9.5), in PDF points: the core `Rect`.
+ *
+ * Rectangles the binding returns are normalized (`llx <= urx`, `lly <= ury`); rectangles it
+ * takes may have their corners in any order.
+ */
+export interface Rect {
+  /** The x coordinate of the lower-left corner. */
+  llx: number
+  /** The y coordinate of the lower-left corner. */
+  lly: number
+  /** The x coordinate of the upper-right corner. */
+  urx: number
+  /** The y coordinate of the upper-right corner. */
+  ury: number
+}
+
+/**
+ * Options for a full save (`save`, `saveAsync`): the core `SaveOptions`. Every field is
+ * optional; the defaults give a compact, garbage-collected, renumbered file.
+ */
+export interface SaveOptions {
+  /** The kind of cross-reference section (default `'auto'`). */
+  xref?: XrefStyle
+  /**
+   * Pack objects into object streams (§7.5.7; needs a cross-reference stream). Default
+   * `false`.
+   */
+  objectStreams?: boolean
+  /** How stream data is written (default `'compressNew'`). */
+  compress?: StreamCompression
+  /** Write only the objects reachable from the trailer (default `true`). */
+  gc?: boolean
+  /** Number the objects densely from 1 (default `true`). */
+  renumber?: boolean
+  /**
+   * Ask for byte-identical output for identical input and edits (the writer is
+   * deterministic either way; default `false`).
+   */
+  deterministic?: boolean
+  /**
+   * The file identifier to write (`/ID`, §14.4): two byte strings. Default: the source's
+   * first element and a new second one, or one generated from the content.
+   */
+  id?: [Uint8Array, Uint8Array]
+  /** The lowest PDF version for the header: `"1.0"` to `"1.7"` or `"2.0"`. */
+  minVersion?: string
+  /** The Flate compression level, an integer from 0 (store) to 9 (best). Default 6. */
+  flateLevel?: number
+}
+
+/** How a full save writes stream data. */
+export type StreamCompression = 'keep' | 'compressNew' | 'recompress'
+
+/** The `/Trapped` entry of the document information dictionary (§14.3.3). */
+export type Trapped = 'true' | 'false' | 'unknown'
+
+/**
  * Returns the version of the native Folioxide library, for example `"0.1.0"`.
  *
  * It equals the version of the `folioxide` npm package.
  */
 export declare function version(): string
+
+/** The kind of cross-reference section a full save writes (§7.5.4, §7.5.8). */
+export type XrefStyle = 'auto' | 'table' | 'stream'
