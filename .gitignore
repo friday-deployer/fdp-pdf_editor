@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / napi-rs
+node_modules/
+*.node
+npm-debug.log*
+.pnpm-store/
+
+# Python oracle venv
+.venv/
+__pycache__/
+
+# Generated test output
+/tests/output/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
