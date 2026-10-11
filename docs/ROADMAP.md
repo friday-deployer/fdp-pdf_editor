@@ -10,7 +10,7 @@ and the acceptance criteria for each milestone follow it.
 | M1 | Syntax layer, read path | ✅ done |
 | M2 | Writers, document model v1, Node open/save | ✅ done |
 | M3 | Signatures I: PAdES B-B, external signing, verification | ✅ done |
-| M4 | Signatures II: B-T timestamps, certification, visible signatures | ⏳ next |
+| M4 | Signatures II: B-T timestamps, certification, visible signatures | ⏳ in progress |
 | M5 | Encryption ∥ page operations | pending |
 | M6 | Document structure ∥ optimization | pending |
 | M7 | Content creation (text, fonts, images, shapes, watermarks) | pending |

@@ -218,3 +218,31 @@ All 19 open decisions in `docs/milestones/M3.md` §8 (D-1 … D-19) are accepted
 9. **`/SigFlags`:** every `/SigFlags` change after a signature is `Other`, matching pyHanko's strict comparison. Folioxide sets it only while no field is signed, so sequential signing never trips it.
 10. **Remaining residuals, documented:** names used inside a nested form XObject of a signed appearance stream are not read, and neither are names a viewer looks up in `/DR` after missing them in a stream's own `/Resources`. **M4 QA must include an independent adversarial pass on the classifier**, because the M3 round-5 expert pass was cut short.
 
+
+## D13: M4 design decisions (expert proposal, accepted by the manager, 2026-10-11)
+All 24 open decisions in `docs/milestones/M4.md` §8 (D-1 … D-24) are accepted as recommended. The most important:
+1. **D-1, the single exception to D10.1** ("never more lenient than pyHanko"):
+   - On documents certified with P = 3, adding plain markup annotations, from an add-only whitelist with no actions, JavaScript or appearance tricks (M4 §5.2), is reported as `Annotations` where pyHanko reports `Other`.
+   - Rationale: P = 3 explicitly permits annotations (ISO 32000-2 §12.8.2.2). Reporting them as `Other` would make every reviewed P = 3 document look tampered with.
+   - The default acceptance threshold (`formFilling`) still rejects `Annotations`, so callers must opt in or rely on `docmdp_ok`.
+   - The rows in M4 §0.2 record it, and the M4 adversarial pass (D12.10) must cover it.
+2. **D-2, P = 1 is stricter than pyHanko:** `/Info` and XMP changes give `docmdp_ok = false`, where pyHanko gives true. ROADMAP M4 acceptance #3 is reworded accordingly.
+3. **D-3:** no new **visible** signature field on certified documents (`DocMdpForbids`). Existing empty fields and invisible approval signatures are still allowed.
+4. **Timestamps:**
+   - The TSA certificate is checked with OpenSSL's timestamp-signing purpose; a failure makes the token invalid (D-4).
+   - Several tokens are accepted, and the earliest sound and trusted one is selected (D-5).
+   - Timestamp problems are reported in `TimestampInfo` and do not affect the signature's `is_valid()` (D-6).
+   - The signer is validated at a trusted `genTime` when no validation time is given (D-7).
+   - `tsa_reserve` defaults to 8192, with one retry (D-8). `grantedWithMods` is accepted (D-9).
+   - A nonce is mandatory and compared as an INTEGER (D-10). Requests use SHA-2 (D-11).
+   - BER tokens are embedded verbatim, with a warning (D-12).
+5. **D-13:** `docmdp_ok` is always computed, and `is_acceptable` requires `docmdp_ok != Some(false)`. This changes the semantics of an M3 API before 1.0.
+6. **Form-fill whitelist:** deliberate stricter differences per D-14. XFA, and the evaluated signature's own FieldMDP, make generic form filling `Other` until M11 (D-23).
+7. **Visible signatures:**
+   - Fonts are Helvetica and Helvetica-Bold, with WinAnsi encoding and `?` replacement. AFM metrics come from the PDFBox resources, with the Adobe notice in `NOTICE` (D-16).
+   - JPEGs: SOF0/1/2, 8-bit, gray or RGB only; CMYK comes in M7 (D-17).
+   - The rectangle is in default user space, with rotation compensation (D-18).
+8. **Test infrastructure:**
+   - MockTsa lives in the testkit (D-21).
+   - New oracle runner keys: `renderProbes`, `timestamp: "invalid"` and `timestampTrusted` (D-22).
+   - B-T through a later document timestamp is deferred to M11 (D-20).
