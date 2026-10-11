@@ -653,12 +653,13 @@ pub fn load_pem(key_pem: &str, certs_pem: &str, key_password: Option<&str>) -> R
    - **no revocation and no network**
 8. **Modified after signing:**
    - `coverage = WholeFile` if `b + c == file_len`, otherwise `Revision(k)`.
-   - For each later revision, compute changed object IDs from the xref sections after the signed revision (`Store::revision_entries(k)`). For a hybrid section the changed set is the UNION of the table's entries and its `/XRefStm` stream's, whatever a particular reader would take from either (otherwise a change can hide in the half another reader prefers: a shadow attack), and it includes every free entry and every entry that reads as null. Then classify with a whitelist modelled on pyHanko's DiffPolicy:
-     - new signature fields and their widgets, `/AcroForm` `/Fields` and `/SigFlags`, page `/Annots` additions of signature widgets → `Signing`
-     - `/DSS` and its streams, `/DocTimeStamp` → `LtvOnly`
-     - field `/V`, `/AS` and `/AP` changes → `FormFilling`
-     - annotation CRUD → `Annotations`
-     - anything else → `Other`
+   - For each later revision, compute changed object IDs from the xref sections after the signed revision (`Store::revision_entries(k)`). For a hybrid section the changed set is the UNION of the table's entries and its `/XRefStm` stream's, whatever a particular reader would take from either (otherwise a change can hide in the half another reader prefers: a shadow attack), and it includes every free entry and every entry that reads as null. Then classify with a **whitelist** modelled on pyHanko's DiffPolicy, in pyHanko's vocabulary (`ModificationLevel`: `None < LtaUpdates < FormFilling < Annotations < Other`). The level is **never more lenient than pyHanko** (for any file it is pyHanko's level or a higher one). **Principle:** a later revision gets a level below `Other` only for the exact changes legitimate later signers make; every other change to an object reachable from the signed revision is `Other`. Stricter than pyHanko is allowed (M3 brief §0); each such result is a `sign-attacks` corpus case with a `DELIBERATE_DIFFERENCES` row, listed in the M3 brief's deliberate-differences table (§0.1) together with the residuals of the levels below `Other`. The whitelist (M3 brief §5 V10 has the details):
+     - a re-listed or unchanged object, a new cross-reference or object stream, an orphan (a new object nothing reaches), the trailer's `/Info` (changed in place or a new dictionary), the catalog's XMP `/Metadata`, `/Extensions`, `/MarkInfo` and `/Version` → `LtaUpdates`
+     - a new **invisible** signature field registered at the root of `/AcroForm /Fields` (`/FT /Sig`, no `/Kids`, a `/T` without `.`, no `/A`, `/AA`, `/OC` or `/Parent`; `/MK` allowed), appended to `/Fields` and to its page's `/Annots`; an unsigned signature field's `/Ff` → `LtaUpdates`
+     - a new signature dictionary that a new or an unsigned field's new `/V` names, with the appearance (`/AP`, `/AS`, `/F`) the signed field gets; a new **visible** signature field → `FormFilling`
+     - **the AcroForm, exactly** (manager decision, M3 QA round 5): (a) `/Fields` gaining new root-level signature fields (with their widget, signature dictionary and the page's `/Annots` append, above) → `LtaUpdates`; (b) `/SigFlags` only as signing requires, which no signing after a signature does (D-6; pyHanko compares it strictly), so any `/SigFlags` change → `Other`; (c) `/DR` gaining NEW resource names (in `/Font /XObject /ColorSpace /ExtGState /Pattern /Shading /ProcSet`) that the signed revision does not name → `FormFilling`. The signed revision names every name token (PDF tokenizer) of every `/DA` string of the AcroForm, of its field tree's fields and widgets and of every annotation on every page and its `/Parent` chain (orphan widgets outside `/Fields` included), and of every appearance stream of those that has no `/Resources` of its own; when these cannot all be read within the limits, any new `/DR` name → `Other`. Residual: names that a form XObject nested in an appearance stream uses, and names a viewer looks up in `/DR` after failing to find them in an appearance stream's own `/Resources`, are not read. Everything else in the AcroForm → `Other`
+     - `/DSS` (until M11), annotations and generic form fields (until M4) → `Other` (D-9)
+     - anything else → `Other`: for example any change to `/NeedAppearances` (removing it too, also in a later signer's signing revision, which makes the earlier signatures `Other` where pyHanko reports `FormFilling`), any change to the AcroForm `/DA` (adding one too), changing `/Q`, changing or removing a `/DR` name or adding another `/DR` entry (`/Encoding`), a new signature field with an action, optional content or a `/Parent`, or any change to a role object (`/Info`, `/Metadata`, `/Extensions`, `/MarkInfo`, the AcroForm, `/Fields`, a page's `/Annots`) that the new revision's trailer, catalog, AcroForm or page no longer points to, or that the signed revision also uses elsewhere
    - `docmdpOk = level ≤ allowed(P)`. The report includes the list of changed objects.
    - **Repairs are modifications we cannot attribute:** if `Store::structure_repaired()` is true, or `Store::recovered_objects()` (taken after resolving every object the verifier reads) is not empty, or the newest trailer's `/Root` is not listed in any section after the signed revision while it differs from the signed revision's `/Root`, then `modification = Other` plus a warning naming the repair. Scan-based recovery can show objects that sit after the last `%%EOF` or in no xref section; an xref-based diff would never see them.
    - Revisions are logical sections in `/Prev` order and `eof_end` need not be monotonic (linearized files); step 2 matches `b + c` against the `eof_end` of *any* revision.
@@ -717,27 +718,37 @@ export class PdfDocument {
   getPage(i: number): PageInfo; insertBlankPage(at: number, size?: Size): void; deletePages(idx: number[]): void;
   movePage(from: number, to: number): void; rotatePage(i: number, deg: 0|90|180|270): void;
   importPages(src: PdfDocument, indices: number[], at?: number): void;
-  // signatures (M3/M4)
-  prepareSignature(opts: PrepareSignatureOptions): PreparedSignature;
-  verifySignatures(opts?: VerifyOptions): Promise<SignatureReport[]>;
+  // signatures (M3, implemented; `index.d.ts` documents every member)
+  prepareSignature(o: PrepareSignatureOptions): PreparedSignature;            // E_BUSY rule as for every sync method
+  prepareSignatureAsync(o: PrepareSignatureOptions): Promise<PreparedSignature>;
+  verifySignatures(o?: VerifyOptions): Promise<SignatureReport[]>;            // async only; validationTime default now
   // info/metadata, outlines, forms, annots … added per milestone
 }
-export class PreparedSignature {
-  readonly toBeSigned: Buffer; readonly toBeSignedDigest: Buffer; readonly digestAlgorithm: 'sha256'|'sha384'|'sha512';
-  timestampRequest(signature: Uint8Array): Buffer;
-  finish(signature: Uint8Array, timestampResponse?: Uint8Array): Buffer;
-  embedCms(cms: Uint8Array): Buffer;
-  serialize(): Buffer; static deserialize(b: Uint8Array): PreparedSignature;
+// PrepareSignatureOptions { certificateChain: Uint8Array[] (DER or PEM text); algorithm: SigAlg; digest?: DigestAlg;
+//   signingTime?: Date | string (default now); field?: { name?, page?, mode?: FieldMode }; subFilter?: SubFilter;
+//   name?, reason?, location?, contactInfo?: string; contentsReserve?: number }
+// VerifyOptions { trustAnchors?: Uint8Array[]; extraCertificates?: Uint8Array[]; validationTime?: Date | string | null }
+export class PreparedSignature {                // #[napi] class; Arc<Mutex<Slot>> holds Option<core::PreparedSignature>
+  readonly toBeSigned: Buffer; readonly toBeSignedDigest: Buffer; readonly toBeSignedDigestInfo: Buffer;
+  readonly digestAlgorithm: DigestAlg; readonly algorithm: SigAlg; readonly subFilter: SubFilter;
+  readonly contentsCapacity: number; readonly byteRange: number[]; readonly warnings: string[]; readonly isFinished: boolean;
+  finish(signature: Uint8Array): Buffer; finishAsync(signature: Uint8Array): Promise<Buffer>;
+  embedCms(cms: Uint8Array): Buffer; embedCmsAsync(cms: Uint8Array): Promise<Buffer>;
+  serialize(): Buffer; static deserialize(b: Uint8Array): PreparedSignature;   // the core's versioned `FXPS` form
+  // M4: timestampRequest(signature): Buffer; finish(signature, timestampResponse?)
 }
-export class LocalSigner { static fromPkcs12(p12: Uint8Array, password: string): LocalSigner;
-  static fromPem(keyPem: string, certsPem: string, keyPassword?: string): LocalSigner;
-  get certificateChain(): Buffer[]; sign(tbs: Uint8Array): Buffer; signAsync(tbs: Uint8Array): Promise<Buffer>; }
+export class LocalSigner { static fromPkcs12(p12: Uint8Array, password: string | Uint8Array): LocalSigner;
+  static fromPem(keyPem: string | Uint8Array, certsPem: string | Uint8Array, keyPassword?: string | Uint8Array): LocalSigner;
+  readonly certificateChain: Buffer[]; readonly algorithm: SigAlg; readonly defaultDigest: DigestAlg;
+  sign(tbs: Uint8Array, digest?: DigestAlg): Buffer; signAsync(tbs: Uint8Array, digest?: DigestAlg): Promise<Buffer>;
+  close(): void; [Symbol.dispose](): void; readonly isClosed: boolean; }   // close wipes the key; then E_CLOSED
+export interface ExternalSigner { certificateChain: Uint8Array[]; algorithm: SigAlg; digest?: DigestAlg;
+  sign(toBeSigned: Buffer, toBeSignedDigest: Buffer, digestAlgorithm: DigestAlg):
+    Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer; }      // ECDSA: DER or IEEE P1363
 // Hand-written facade (index.js), composes async callbacks in JS — no ThreadsafeFunction needed:
-export function signPdf(doc: PdfDocument, opts: {
-  signer: LocalSigner | { certificateChain: Uint8Array[]; algorithm: SigAlg; sign(tbs: Buffer, digest: Buffer): Promise<Uint8Array> };
-  timestamp?: (request: Buffer) => Promise<Uint8Array>;   // caller POSTs to TSA (application/timestamp-query)
-  field?: FieldSpec; reason?: string; location?: string; signingTime?: Date; certify?: 1|2|3; appearance?: AppearanceSpec;
-}): Promise<Buffer>;
+export function signPdf(doc: PdfDocument, opts: Omit<PrepareSignatureOptions, 'certificateChain'|'algorithm'> &
+  { signer: LocalSigner | ExternalSigner }): Promise<Buffer>;
+// M4 adds: timestamp?: (request: Buffer) => Promise<Uint8Array> (caller POSTs to the TSA); certify?: 1|2|3; appearance?
 ```
 
 ### Design rules
@@ -764,8 +775,17 @@ export function signPdf(doc: PdfDocument, opts: {
   - `InfoUpdate` fields are `Option<Either<T, Null>>`: absent or `undefined` keeps, `null` removes, a value sets. The facade converts `Date` values to PDF date strings (UTC) first; `toPdfDate` and `fromPdfDate` (native `pdfDateToIso`) convert in both directions.
   - Enums use `#[napi(string_enum)]`, emitted as type-only string-literal unions (`"constEnum": false` in `package.json`; a TS `const enum` would not accept the literal `'media'`). Input strings are parsed by the binding, so a wrong value is `E_INVALID_ARGUMENT` listing the accepted ones (`#[napi(ts_type)]` / `ts_arg_type` keep the precise type).
   - Option objects are input only: `SaveOptions` takes `minVersion` as a version string (`"1.7"`, like the `version` getter) and `id` as two byte arrays, where the core's serde form has a pair of numbers and arrays of numbers.
-- **Type tests:** `tsc --noEmit -p test` on `test/types.test-d.ts`, with `@types/node` (for `Buffer`). They also check the generated `binding.d.ts` agrees with the hand-written `index.d.ts` (`Equal<binding.PageInfo, PageInfo>` and so on).
-- **Runtime tests:** Node 22's built-in runner, `node --test "test/**/*.test.mjs"`, with `.mjs` files so no TypeScript toolchain is needed at runtime: `open-save.test.mjs` and `errors.test.mjs` run on the committed `fixtures/syntax/*.pdf` (helpers in `test/helpers.mjs`).
+- **Signing (M3):**
+  - `signPdf` (hand-written in `index.js`) is `await doc.prepareSignatureAsync(…)` (the core's `prepare` on the libuv pool), then `await signer.sign(toBeSigned, toBeSignedDigest, digestAlgorithm)` on the JavaScript side (a `LocalSigner` uses `signAsync`), then `prepared.finishAsync(signature)`. The signer is awaited in JavaScript, so no ThreadsafeFunction is needed. When `prepareSignatureAsync` throws `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` because of an explicit `contentsReserve`, it prepares once more with `details.needed`. An external signer's own error becomes `E_CRYPTO` with the error as `cause` (its message is not repeated: it could quote what the signer was given); a returned `ArrayBuffer` (WebCrypto) is accepted.
+  - `PreparedSignature` is a `#[napi(custom_finalize)]` class holding a `Slot { prepared: Option<core::PreparedSignature>, in_flight, finished, reported }` behind `Arc<Mutex<…>>` (locked on the JavaScript thread only) and copies of the small fields. Finishing goes through the core's `try_finish` / `try_embed_cms`, which return the prepared signature with the error (`FinishError`): a refused value or CMS goes back into the slot, so the caller can try again; the first finish that **succeeds** takes the value, and later finishing calls and `serialize` throw `E_INVALID_ARGUMENT`; the getters keep working. `finishAsync` / `embedCmsAsync` move the value into the task at the call (`in_flight`: the other finishing methods and `serialize` throw `E_BUSY`), and the task's `resolve` puts a refused value back. The prepared file (a full copy of the output) is reported to V8 as external memory until a finish succeeds or the object is finalized.
+  - `LocalSigner` holds `Option<Arc<core::LocalSigner>>`; `close()` (and `[Symbol.dispose]`) drops it, which wipes the key (RustCrypto key types zeroize on drop), or, while a `signAsync` task holds a reference, when that task ends; afterwards methods throw `E_CLOSED`. Passwords and PEM keys are taken as `string | Uint8Array`: the binding's `String` copy is `Zeroizing`, bytes are read in place so the caller can wipe them; JavaScript strings cannot be wiped (documented next to the RSA advisory).
+  - `prepareSignatureAsync` and `verifySignatures` are document tasks like `saveAsync` (a `Pending` guard from the call: `E_BUSY` for sync methods, `E_CLOSED` once closed). `verifySignatures` is asynchronous only; the facade passes `validationTime: new Date()` unless the caller gives one (`null`: the core's default, the signer's claimed time, with a warning), so trust agrees with pyHanko's "now".
+  - Certificates (`certificateChain`, `trustAnchors`, `extraCertificates`) are DER, or PEM text (one or more `CERTIFICATE` blocks in one `Uint8Array`, recognised by `-----BEGIN`); `LocalSigner.fromPem` takes strings or bytes.
+  - Dates (`signingTime`, `validationTime`) are `Date` (formatted in UTC by `toPdfDate`) or strings parsed by `PdfDate::parse` (PDF dates, and the ISO 8601 form).
+  - `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` gets `details = { needed, reserved }`, parsed by the facade from the core's fixed `Display` text.
+  - The report DTOs (`SignatureReport`, `CertificateInfo`, `KeyDescription`, `ObjectRef` `{num, gen}`, `SignatureProblem` `{code, message}`) are `#[napi(object, use_nullable = true)]` mirrors: `null` where the core's serde writes `null`, enum values from the core's `as_str()` (`'entireFile'`, `'formFilling'`, `'B-B'`, `'digestMismatch'`, …; type-only `#[napi(string_enum)]` unions name them in `binding.d.ts`), and the certificate `der` as a `Buffer` (an array of numbers in serde). A Rust test compares their JSON with the core's, and one checks `index.d.ts` lists every `ProblemCode::ALL` and report enum value.
+- **Type tests:** `tsc --noEmit -p test` on `test/types.test-d.ts`, with `@types/node` (for `Buffer`). They also check the generated `binding.d.ts` agrees with the hand-written `index.d.ts` (`Equal<binding.PageInfo, PageInfo>`, `Equal<binding.CertificateInfo, CertificateInfo>` and so on).
+- **Runtime tests:** Node 22's built-in runner, `node --test "test/**/*.test.mjs"`, with `.mjs` files so no TypeScript toolchain is needed at runtime: `open-save.test.mjs` and `errors.test.mjs` run on the committed `fixtures/syntax/*.pdf` (helpers in `test/helpers.mjs`); `sign.test.mjs` signs with the `fixtures/pki` keys (PKCS#12 modern and legacy, PEM, external signers on `node:crypto` and WebCrypto) and checks every signed output with the signature oracles (`tools/oracles/validate_sig.py` for pyHanko and pdfsig, `extract_cms.py --verify` for OpenSSL) when `.venv` exists, skipping them otherwise.
 
 ## A.8 Tauri readiness (what the core does now)
 1. No napi, Node or Tauri types in any `crates/*` crate. CI checks `cargo tree -p folioxide -e normal | grep -E 'napi|tauri'` is empty.

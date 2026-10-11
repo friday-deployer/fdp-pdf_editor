@@ -1643,6 +1643,44 @@ fn truncated_stream_is_diagnostic_or_error() {
 }
 
 #[test]
+fn capped_decode_stops_at_the_callers_cap() {
+    let data = vec![b'a'; 100_000];
+    let flate = encode_flate(&data, 6);
+    let bytes = with_stream("/Filter /FlateDecode", &flate, &[]);
+    let store = Store::open_bytes(bytes, &OpenOptions::default()).unwrap();
+    let obj = store.resolve(id(5)).unwrap();
+    let stream = obj.as_stream().unwrap();
+    // Below the cap: the data. Above it: `None`, and only the cap was paid for.
+    let full = store.stream_data_capped(stream, 100_000).unwrap().unwrap();
+    assert_eq!(full.data, data);
+    let fresh = Store::open_bytes(
+        with_stream("/Filter /FlateDecode", &flate, &[]),
+        &OpenOptions::default(),
+    )
+    .unwrap();
+    let obj = fresh.resolve(id(5)).unwrap();
+    assert!(
+        fresh
+            .stream_data_capped(obj.as_stream().unwrap(), 1000)
+            .unwrap()
+            .is_none()
+    );
+    assert!(fresh.total_decoded() <= 1000, "{}", fresh.total_decoded());
+    // The document limit still applies when it is the smaller one.
+    let limits = Limits::default().with_max_decoded_stream(100);
+    let small = Store::open_bytes(
+        with_stream("/Filter /FlateDecode", &flate, &[]),
+        &OpenOptions::default().with_limits(limits),
+    )
+    .unwrap();
+    let obj = small.resolve(id(5)).unwrap();
+    let err = small
+        .stream_data_capped(obj.as_stream().unwrap(), 1_000_000)
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::LimitExceeded);
+}
+
+#[test]
 fn decode_limits_are_enforced() {
     let data = vec![b'a'; 1000];
     let flate = encode_flate(&data, 6);

@@ -12,6 +12,8 @@ pub mod qpdf;
 pub mod syntax;
 // M2 WP2.2: document-model fixtures, generated at test time.
 pub mod model;
+// M3 WP3.1A-pre: byte-level generators for the signed-PDF attack corpus (brief §5.1).
+pub mod sign_attacks;
 
 use std::path::{Path, PathBuf};
 

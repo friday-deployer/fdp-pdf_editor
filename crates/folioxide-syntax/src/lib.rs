@@ -69,3 +69,6 @@ pub use writer::{
     IncrementalOptions, IncrementalUpdate, SaveOptions, StreamCompression, XrefStyle,
     incremental_suffix, incremental_update, save, save_incremental,
 };
+// M3 WP3.1A: overlay-aware incremental update and object locations (signatures).
+pub use store::ObjectLocation;
+pub use writer::{IncrementalLayout, incremental_suffix_with_overlay};

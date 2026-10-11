@@ -36,9 +36,55 @@ Paths are relative to `fixtures/`. "Generator" is the command that recreates the
 | `pki/expired.pem`, `pki/expired.key.pem` | negative case: certificate valid only in 2025 | `bash tools/gen-pki.sh` | MIT |
 | `pki/wrong-ku.pem`, `pki/wrong-ku.key.pem` | negative case: no digitalSignature or nonRepudiation | `bash tools/gen-pki.sh` | MIT |
 | `pki/*.p12` | PKCS#12 bundles: `signer-rsa2048-{modern,3des,rc2-40}.p12`, `signer-p256-modern.p12` | `bash tools/gen-pki.sh` | MIT |
+| `pki/signer-rsa2048.key.pkcs1.pem`, `pki/signer-rsa3072.key.pkcs1.pem` | the RSA signer keys as PKCS#1 (`BEGIN RSA PRIVATE KEY`), derived from `signer-*.key.pem` | `bash tools/gen-pki.sh --derive` | MIT |
+| `pki/signer-p256.key.sec1.pem`, `pki/signer-p384.key.sec1.pem` | the EC signer keys as SEC1 (`BEGIN EC PRIVATE KEY`, named curve), derived from `signer-*.key.pem` | `bash tools/gen-pki.sh --derive` | MIT |
 
 `bash tools/gen-pki.sh --check` validates the committed PKI without regenerating it; see
 `pki/README.md` for the hierarchy, the algorithms and the password (`folioxide`).
+
+### `sign/`: CMS vectors and key files for `folioxide-sign`
+
+Foreign inputs of the CMS, key-loading, trust and verification tests (M3 WP3.1B, WP3.2B):
+detached CMS `SignedData` made by OpenSSL 3.0 and pyHanko 0.37.0 over `sign/data.bin` with the
+test PKI's signers, golden RSA signatures, key files for the negative key-loading cases, the
+trust-path certificates of `sign/chain/`, and PDFs signed by other signers in `sign/pdf/`.
+**Every key here is a published, test-only key**, like those in `pki/`.
+
+- Regenerate with `.venv/bin/python -I tools/fixtures/sign.py` (oracle venv and OpenSSL 3.x),
+  in the same change as a regenerated `pki/` (everything here uses its keys); `--only cms`,
+  `--only chain` or `--only pdf` rewrites one group. Signing times, serial numbers and ECDSA
+  nonces differ on every run, so the files are not reproducible byte for byte.
+- `.venv/bin/python -I tools/fixtures/sign.py --check` verifies the committed files: every CMS
+  with `openssl cms -verify` and (detached ones) pyHanko's `async_validate_detached_cms`, the
+  golden signatures with `openssl dgst -prverify` and for determinism, the key-file types; the
+  chain certificates' names, validity, issuer signatures and pyhanko-certvalidator verdicts; and
+  every signed PDF with the oracle suite's signature checks (pyHanko, pdfsig, OpenSSL, structure,
+  PAdES profile) plus its incremental-update prefix.
+
+| Files | What | Generator | License |
+|---|---|---|---|
+| `sign/data.bin` | the 66-byte content every CMS vector signs | `tools/fixtures/sign.py` | MIT |
+| `sign/openssl-rsa2048-sha256.p7s`, `sign/openssl-p384-sha384.p7s` | `openssl cms -sign -nosmimecap`: content-type, signing-time and message-digest attributes, no ESS attribute | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/openssl-p256-cades.p7s` | `openssl cms -sign -cades`: adds signing-certificate-v2 | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/openssl-rsa2048-pss.p7s` | RSASSA-PSS signature (`-keyopt rsa_padding_mode:pss`) | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/openssl-rsa2048-sha1.p7s` | SHA-1 digest and `sha1WithRSAEncryption` (legacy, weak) | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/openssl-rsa2048-noattr.p7s` | no signed attributes (`-noattr`): the signature covers `data.bin` itself | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/openssl-p256-ber-attached.p7s` | `-stream`: BER indefinite lengths and `data.bin` embedded as a constructed OCTET STRING (attached) | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/ber-indefinite-p256.p7s` | `openssl-p256-cades.p7s` with ContentInfo, SignedData, encapContentInfo, signerInfos and SignerInfo re-encoded with indefinite lengths (signed attributes and certificates unchanged) | `tools/fixtures/sign.py` | MIT |
+| `sign/openssl-long-serial.p7s`, `sign/long-serial.pem`, `sign/long-serial.key.pem` | a self-signed P-256 certificate with a 24-byte serial number, its test-only key, and a CMS it signed | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/pyhanko-rsa2048.p7s`, `sign/pyhanko-p256.p7s`, `sign/pyhanko-p384-sha384.p7s`, `sign/pyhanko-rsa3072-pss.p7s` | pyHanko `SimpleSigner.async_sign(use_pades=True)`; the last with `prefer_pss=True` | `tools/fixtures/sign.py` (pyHanko 0.37.0) | MIT |
+| `sign/golden-rsa2048-sha256.sig`, `sign/golden-rsa3072-sha512.sig` | raw RSASSA-PKCS1-v1_5 signatures of `data.bin` (`openssl dgst -sign`) | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/rsa1024.key.pem`, `sign/p521.key.pem`, `sign/ed25519.key.pem` | test-only keys Folioxide must refuse: RSA-1024, P-521, Ed25519 (PKCS#8) | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/signer-rsa2048.key.legacy-enc.pem`, `sign/signer-p256.key.pbes1.pem` | `pki/` signer keys encrypted with legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) and with PBES1 (`PBE-SHA1-3DES`); password `folioxide` | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/signer-p256-nomac.p12` | `pki/signer-p256` as a PKCS#12 without a MAC (`-nomac`); password `folioxide` | `tools/fixtures/sign.py` (OpenSSL 3.0) | MIT |
+| `sign/chain/*.pem` | trust-path certificates (no keys): `unknown-critical` (critical private extension), `sub-ca` + `sub-ca-signer` (below the intermediate's pathlen 0), `no-certsign-ca` + `no-certsign-signer` (CA key usage without keyCertSign), `issued-by-ee` (issued by `pki/signer-p256`), `sha1-signer` (ecdsa-with-SHA1), `pss-ca` + `pss-ca-signer` (RSASSA-PSS by the root), `ku-digital-signature`, `ku-non-repudiation` (one signing key usage each), `rsa1024-ca` + `rsa1024-ca-signer`, `rsa1024-signer` (RSA keys below 2048 bits), `self-signed`, `impostor-root` (the root's name, another key); validity 2025-01-01 .. 2075-12-31; `--check` asserts pyhanko-certvalidator's verdict on each | `tools/fixtures/sign.py --only chain` (OpenSSL 3.0 `openssl ca`) | MIT |
+| `sign/pdf/pyhanko-rsa2048.pdf`, `sign/pdf/pyhanko-p256.pdf` | `syntax/minimal.pdf` with one invisible PAdES B-B signature (`Signature1`) by pyHanko `sign_pdf`, RSA-2048 (PEM) and P-256 (`.p12`); the signature dictionary has `/Contents` before `/ByteRange` | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0) | MIT |
+| `sign/pdf/pyhanko-two-signatures.pdf` | `pyhanko-rsa2048.pdf` plus `Signature2` by P-384 with SHA-384: the first signature is `entireRevision`/`formFilling` | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0) | MIT |
+| `sign/pdf/pyhanko-pkcs7-rsa3072.pdf` | one `adbe.pkcs7.detached` signature (signing-time attribute, not B-B) by RSA-3072 | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0) | MIT |
+| `sign/pdf/pyhanko-certified-p1.pdf`, `sign/pdf/pyhanko-certified-p2.pdf` | certification signatures (`/Perms /DocMDP`) with P=1 (P-256) and P=2 (RSA-2048) | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0 `certify`) | MIT |
+| `sign/pdf/pyhanko-doc-timestamp.pdf` | `pyhanko-p256.pdf` plus an `ETSI.RFC3161` document timestamp `DocTimeStamp1` from an in-process TSA with `pki/tsa` | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0 `PdfTimeStamper`) | MIT |
+| `sign/pdf/pyhanko-empty-field.pdf` | `syntax/minimal.pdf` with one empty (unsigned, invisible) signature field `Approval` | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0) | MIT |
+| `sign/pdf/openssl-rsa2048.pdf`, `sign/pdf/openssl-p256-cades.pdf`, `sign/pdf/openssl-rsa2048-sha1.pdf` | a CMS made by `openssl cms -sign` over the byte ranges of a pyHanko placeholder, embedded unchanged: SHA-256 (`adbe.pkcs7.detached`), `-cades` (`ETSI.CAdES.detached`, with signing-time), and SHA-1 (weak: intact and valid, never trusted) | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0, OpenSSL 3.0) | MIT |
 
 ### `syntax/`: generated syntax-layer fixtures
 

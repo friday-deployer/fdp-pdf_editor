@@ -1,21 +1,50 @@
 // Type tests, checked with `tsc --noEmit -p test` (pnpm test:types). Nothing here is executed.
 
-import { FolioxideError, PdfDocument, fromPdfDate, toPdfDate, version } from 'folioxide'
+import {
+  FolioxideError,
+  LocalSigner,
+  PdfDocument,
+  PreparedSignature,
+  fromPdfDate,
+  isSignatureAcceptable,
+  signPdf,
+  toPdfDate,
+  version,
+} from 'folioxide'
 import type {
+  CertificateInfo,
+  Coverage,
   Diagnostic,
   DiagnosticKind,
+  DigestAlg,
   DocInfo,
   ErrorCode,
+  ExternalSigner,
+  FieldMode,
   IncrementalSaveOptions,
   InfoUpdate,
+  KeyDescription,
+  ModificationLevel,
+  ObjectRef,
   OpenOptions,
+  PadesLevel,
   PageBox,
   PageInfo,
   PdfDateInput,
+  PrepareSignatureOptions,
+  ProblemCode,
   Rect,
   SaveOptions,
+  SigAlg,
+  SignPdfOptions,
+  SignatureFieldSpec,
+  SignatureKind,
+  SignatureProblem,
+  SignatureReport,
   StreamCompression,
+  SubFilter,
   Trapped,
+  VerifyOptions,
   XrefStyle,
 } from 'folioxide'
 import * as binding from '../binding.js'
@@ -174,6 +203,197 @@ const parsed: Date | null = fromPdfDate('D:2026')
 // @ts-expect-error toPdfDate takes a Date
 toPdfDate('2026-10-10')
 
+// ---- signing: LocalSigner ----------------------------------------------------------------------
+
+const p12Signer: LocalSigner = LocalSigner.fromPkcs12(bytes, 'password')
+const pemSigner: LocalSigner = LocalSigner.fromPem('-----BEGIN PRIVATE KEY-----', buffer, 'password')
+const pemSignerNoPassword: LocalSigner = LocalSigner.fromPem('key', 'certs')
+const signerChain: Buffer[] = p12Signer.certificateChain
+const signerAlgorithm: SigAlg = p12Signer.algorithm
+const signerDigest: DigestAlg = p12Signer.defaultDigest
+const signedBytes: Buffer = p12Signer.sign(bytes)
+const signedBytesSha384: Buffer = p12Signer.sign(bytes, 'sha384')
+const signedAsync: Promise<Buffer> = pemSigner.signAsync(buffer, 'sha512')
+const sigAlgs: Equal<SigAlg, 'rsa-pkcs1v15' | 'ecdsa'> = true
+const digestAlgs: Equal<DigestAlg, 'sha256' | 'sha384' | 'sha512'> = true
+// @ts-expect-error SHA-1 is never used to sign
+p12Signer.sign(bytes, 'sha1')
+// Secrets as bytes, which the caller can wipe.
+const p12SignerBytes: LocalSigner = LocalSigner.fromPkcs12(bytes, buffer)
+const pemSignerBytes: LocalSigner = LocalSigner.fromPem(buffer, 'certs', bytes)
+// @ts-expect-error the password is a string or bytes
+LocalSigner.fromPkcs12(bytes, 42)
+// @ts-expect-error the key password is a string or bytes
+LocalSigner.fromPem('key', 'certs', 42)
+p12SignerBytes.close()
+pemSignerBytes[Symbol.dispose]()
+const signerClosed: boolean = p12SignerBytes.isClosed
+// @ts-expect-error isClosed is read-only
+p12SignerBytes.isClosed = true
+// @ts-expect-error signers come from fromPkcs12 or fromPem
+new LocalSigner()
+// @ts-expect-error the chain is read-only
+p12Signer.certificateChain = []
+
+// ---- signing: the two phases -------------------------------------------------------------------
+
+const prepareOptions: PrepareSignatureOptions = {
+  certificateChain: [bytes, buffer],
+  algorithm: 'ecdsa',
+  digest: 'sha384',
+  signingTime: new Date(),
+  field: { name: 'Approval', page: 0, mode: 'createOrUse' },
+  subFilter: 'ETSI.CAdES.detached',
+  name: 'Jane',
+  reason: 'Approved',
+  location: 'Berlin',
+  contactInfo: 'jane@example.com',
+  contentsReserve: 16384,
+}
+const minimalPrepareOptions: PrepareSignatureOptions = { certificateChain: [bytes], algorithm: 'rsa-pkcs1v15' }
+const stringTime: PrepareSignatureOptions = { ...minimalPrepareOptions, signingTime: 'D:20261010120000Z' }
+const prepared: PreparedSignature = opened.prepareSignature(prepareOptions)
+const preparedAsync: Promise<PreparedSignature> = opened.prepareSignatureAsync(minimalPrepareOptions)
+const toBeSigned: Buffer = prepared.toBeSigned
+const toBeSignedDigest: Buffer = prepared.toBeSignedDigest
+const toBeSignedDigestInfo: Buffer = prepared.toBeSignedDigestInfo
+const preparedDigest: DigestAlg = prepared.digestAlgorithm
+const preparedAlgorithm: SigAlg = prepared.algorithm
+const preparedSubFilter: SubFilter = prepared.subFilter
+const capacity: number = prepared.contentsCapacity
+const byteRange: number[] = prepared.byteRange
+const preparedWarnings: string[] = prepared.warnings
+const isFinished: boolean = prepared.isFinished
+const finished: Buffer = prepared.finish(bytes)
+const finishedAsync: Promise<Buffer> = prepared.finishAsync(buffer)
+const embedded: Buffer = prepared.embedCms(bytes)
+const embeddedAsync: Promise<Buffer> = prepared.embedCmsAsync(bytes)
+const serialized: Buffer = prepared.serialize()
+const deserialized: PreparedSignature = PreparedSignature.deserialize(serialized)
+const subFilters: Equal<SubFilter, 'ETSI.CAdES.detached' | 'adbe.pkcs7.detached'> = true
+const fieldModes: Equal<FieldMode, 'createOrUse' | 'existingOnly' | 'createOnly'> = true
+const fieldSpec: SignatureFieldSpec = {}
+// @ts-expect-error the bytes to sign are read-only
+prepared.toBeSigned = buffer
+// @ts-expect-error prepared signatures come from prepareSignature or deserialize
+new PreparedSignature()
+// @ts-expect-error the algorithm is required
+opened.prepareSignature({ certificateChain: [bytes] })
+// @ts-expect-error SubFilter names are case-sensitive PDF names
+opened.prepareSignature({ ...minimalPrepareOptions, subFilter: 'etsi.cades.detached' })
+// @ts-expect-error the field mode is one of three
+opened.prepareSignature({ ...minimalPrepareOptions, field: { mode: 'replace' } })
+
+// ---- signing: signPdf ------------------------------------------------------------------------
+
+const external: ExternalSigner = {
+  certificateChain: [bytes],
+  algorithm: 'ecdsa',
+  digest: 'sha256',
+  sign: async (tbs: Buffer, digest: Buffer, digestAlgorithm: DigestAlg) => {
+    void [digest, digestAlgorithm]
+    return new Uint8Array(tbs.length)
+  },
+}
+// Synchronous signers, signers that ignore some arguments and WebCrypto's ArrayBuffer results fit.
+const syncExternal: ExternalSigner = { certificateChain: [bytes], algorithm: 'rsa-pkcs1v15', sign: () => buffer }
+const webCryptoLike: ExternalSigner = {
+  certificateChain: [bytes],
+  algorithm: 'ecdsa',
+  sign: (tbs) => Promise.resolve(new ArrayBuffer(tbs.length)),
+}
+const signPdfOptions: SignPdfOptions = { signer: p12Signer, reason: 'Approved', contentsReserve: 100 }
+const signedPdf: Promise<Buffer> = signPdf(opened, signPdfOptions)
+const signedExternally: Promise<Buffer> = signPdf(opened, { signer: external, signingTime: 'D:2026', field: { name: 'X' } })
+signPdf(opened, { signer: syncExternal })
+signPdf(opened, { signer: webCryptoLike, digest: 'sha512' })
+// @ts-expect-error the signer is required
+signPdf(opened, { reason: 'x' })
+// @ts-expect-error the chain comes from the signer, not the options
+signPdf(opened, { signer: p12Signer, certificateChain: [bytes] })
+// @ts-expect-error a signer returns bytes
+signPdf(opened, { signer: { certificateChain: [bytes], algorithm: 'ecdsa', sign: () => 'signature' } })
+// @ts-expect-error the document is a PdfDocument
+signPdf(bytes, { signer: p12Signer })
+
+// ---- verification ------------------------------------------------------------------------------
+
+const verifyOptions: VerifyOptions = {
+  trustAnchors: [bytes],
+  extraCertificates: [buffer],
+  validationTime: new Date(),
+}
+const claimedTime: VerifyOptions = { validationTime: null }
+const reportsPromise: Promise<SignatureReport[]> = opened.verifySignatures(verifyOptions)
+const reportsDefault: Promise<SignatureReport[]> = opened.verifySignatures()
+declare const report: SignatureReport
+const acceptable: boolean = isSignatureAcceptable(report)
+const acceptableLta: boolean = isSignatureAcceptable(report, 'ltaUpdates')
+// @ts-expect-error: not a modification level
+isSignatureAcceptable(report, 'everything')
+const reportShape: Equal<
+  SignatureReport,
+  {
+    fieldName: string | null
+    kind: SignatureKind
+    sigObject: ObjectRef
+    subFilter: string | null
+    byteRange: number[] | null
+    byteRangeOk: boolean
+    intact: boolean
+    signatureValid: boolean
+    coverage: Coverage
+    signedRevision: number | null
+    modification: ModificationLevel
+    changedObjects: ObjectRef[]
+    digestAlgorithm: string | null
+    signatureAlgorithm: string | null
+    signer: CertificateInfo | null
+    chain: CertificateInfo[]
+    trusted: boolean | null
+    claimedTime: string | null
+    name: string | null
+    reason: string | null
+    location: string | null
+    contactInfo: string | null
+    padesLevel: PadesLevel | null
+    docmdp: number | null
+    docmdpOk: boolean | null
+    problems: SignatureProblem[]
+    warnings: string[]
+  }
+> = true
+const certificateShape: Equal<
+  CertificateInfo,
+  {
+    subject: string
+    issuer: string
+    commonName: string | null
+    serialHex: string
+    notBefore: string
+    notAfter: string
+    sha256Hex: string
+    key: KeyDescription
+    keyUsage: string[]
+    extKeyUsage: string[]
+    isCa: boolean
+    der: Buffer
+  }
+> = true
+const coverages: Equal<Coverage, 'entireFile' | 'entireRevision' | 'contiguousBlockFromStart' | 'unclear'> = true
+const modifications: Equal<ModificationLevel, 'none' | 'ltaUpdates' | 'formFilling' | 'annotations' | 'other'> = true
+const kinds: Equal<SignatureKind, 'signature' | 'docTimeStamp'> = true
+const padesLevels: Equal<PadesLevel, 'B-B'> = true
+const problemCode: ProblemCode = 'digestMismatch'
+const reportProblemCode: ProblemCode | undefined = report.problems[0]?.code
+const subjectText: string | undefined = report.signer?.subject
+// @ts-expect-error not a problem code
+const notAProblem: ProblemCode = 'somethingWrong'
+// @ts-expect-error not a coverage level
+const notACoverage: Coverage = 'entire'
+// @ts-expect-error trust anchors are bytes
+opened.verifySignatures({ trustAnchors: ['root.pem'] })
+
 // ---- the generated binding agrees with the facade ----------------------------------------------
 
 // What the native addon returns is exactly what the facade declares (Diagnostic narrows `kind`
@@ -191,8 +411,103 @@ const bindingSaveOptions: binding.SaveOptions = saveOptions
 const bindingIncremental: binding.IncrementalSaveOptions = incrementalOptions
 const bindingOpenOptions: binding.OpenOptions = openOptions
 const bindingUpdate: binding.InfoUpdate = { ...update, creationDate: 'D:2026', modDate: null }
+// Signing: the same names and shapes; the facade narrows `problems[].code` to ProblemCode and
+// takes dates as `Date` too.
+const bindingSigAlg: Equal<binding.SigAlg, SigAlg> = true
+const bindingDigestAlg: Equal<binding.DigestAlg, DigestAlg> = true
+const bindingSubFilter: Equal<binding.SubFilter, SubFilter> = true
+const bindingFieldMode: Equal<binding.FieldMode, FieldMode> = true
+const bindingCoverage: Equal<binding.Coverage, Coverage> = true
+const bindingModification: Equal<binding.ModificationLevel, ModificationLevel> = true
+const bindingKind: Equal<binding.SignatureKind, SignatureKind> = true
+const bindingPades: Equal<binding.PadesLevel, PadesLevel> = true
+const bindingObjectRef: Equal<binding.ObjectRef, ObjectRef> = true
+const bindingKey: Equal<binding.KeyDescription, KeyDescription> = true
+const bindingCertificate: Equal<binding.CertificateInfo, CertificateInfo> = true
+const bindingFieldSpec: Equal<binding.SignatureFieldSpec, SignatureFieldSpec> = true
+const bindingReportFields: Equal<Omit<binding.SignatureReport, 'problems'>, Omit<SignatureReport, 'problems'>> = true
+const bindingReport: binding.SignatureReport = report
+const bindingProblem: binding.SignatureProblem = {} as SignatureProblem
+const bindingPrepare: binding.PrepareSignatureOptions = { ...prepareOptions, signingTime: 'D:20261010120000Z' }
+const bindingVerify: binding.VerifyOptions = { ...verifyOptions, validationTime: 'D:20261010120000Z' }
+const bindingSignerChain: Equal<binding.LocalSigner['certificateChain'], LocalSigner['certificateChain']> = true
+const bindingSignerClose: Equal<binding.LocalSigner['close'], LocalSigner['close']> = true
+const bindingSignerClosed: Equal<binding.LocalSigner['isClosed'], LocalSigner['isClosed']> = true
+const bindingPreparedDigest: Equal<binding.PreparedSignature['toBeSignedDigest'], PreparedSignature['toBeSignedDigest']> = true
 
 export {
+  bindingCertificate,
+  bindingCoverage,
+  bindingDigestAlg,
+  bindingFieldMode,
+  bindingFieldSpec,
+  bindingKey,
+  bindingKind,
+  bindingModification,
+  bindingObjectRef,
+  bindingPades,
+  bindingPrepare,
+  bindingPreparedDigest,
+  bindingProblem,
+  bindingReport,
+  bindingReportFields,
+  bindingSigAlg,
+  bindingSignerChain,
+  bindingSignerClose,
+  bindingSignerClosed,
+  bindingSubFilter,
+  bindingVerify,
+  acceptable,
+  acceptableLta,
+  byteRange,
+  capacity,
+  certificateShape,
+  claimedTime,
+  coverages,
+  deserialized,
+  digestAlgs,
+  embedded,
+  embeddedAsync,
+  external,
+  fieldModes,
+  fieldSpec,
+  finished,
+  finishedAsync,
+  isFinished,
+  kinds,
+  minimalPrepareOptions,
+  modifications,
+  notACoverage,
+  notAProblem,
+  padesLevels,
+  pemSignerNoPassword,
+  signerClosed,
+  preparedAlgorithm,
+  preparedAsync,
+  preparedDigest,
+  preparedSubFilter,
+  preparedWarnings,
+  problemCode,
+  reportProblemCode,
+  reportShape,
+  reportsDefault,
+  reportsPromise,
+  serialized,
+  sigAlgs,
+  signedAsync,
+  signedBytes,
+  signedBytesSha384,
+  signedExternally,
+  signedPdf,
+  signerAlgorithm,
+  signerChain,
+  signerDigest,
+  stringTime,
+  subFilters,
+  subjectText,
+  toBeSigned,
+  toBeSignedDigest,
+  toBeSignedDigestInfo,
   bindingCompression,
   bindingDiagnostic,
   bindingIncremental,

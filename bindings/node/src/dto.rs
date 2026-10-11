@@ -526,7 +526,7 @@ impl SaveOptions {
         if let Some(level) = self.flate_level {
             options = options.with_flate_level(integer_in(level, 0, 9, "flateLevel")? as u8);
         }
-        options.validate().map_err(|err| from_core(&err))?;
+        options.validate().map_err(|err| from_core(&err.into()))?;
         Ok(options)
     }
 }

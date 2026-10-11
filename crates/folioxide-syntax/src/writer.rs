@@ -54,7 +54,9 @@ use crate::store::{COMPUTED_TRAILER_KEYS, Store};
 use crate::xref::XrefKind;
 
 pub use full::save;
-pub use incremental::{incremental_suffix, incremental_update, save_incremental};
+pub use incremental::{
+    incremental_suffix, incremental_suffix_with_overlay, incremental_update, save_incremental,
+};
 
 /// The Flate level [`SaveOptions::flate_level`] uses by default (zlib's default).
 pub const DEFAULT_FLATE_LEVEL: u8 = 6;
@@ -365,6 +367,58 @@ pub struct IncrementalUpdate {
     pub xref_kind: Option<XrefKind>,
 }
 
+/// The absolute byte layout of an incremental update produced with an overlay
+/// ([`incremental_suffix_with_overlay`]): what a signature needs to patch its `/ByteRange` and
+/// locate its `/Contents` (brief §1, ARCHITECTURE §A.6.2).
+///
+/// It is a thin wrapper around [`IncrementalUpdate`] (the manager's reconciliation of the brief's
+/// `IncrementalLayout` with M2's `IncrementalUpdate`, rather than a second, parallel type): the
+/// brief's three fields map onto the update's, so that the overlay path shares every line with
+/// [`incremental_update`]:
+///
+/// - `suffix` is [`IncrementalUpdate::bytes`]: the bytes appended to the source (a leading
+///   end-of-line included when the source does not end with one);
+/// - `base` is [`IncrementalUpdate::start`]: the absolute offset of `suffix[0]` in the output,
+///   which equals the source length;
+/// - `spans` is [`IncrementalUpdate::objects`]: the absolute span of every object written, from
+///   its `N G obj` header to just past the end-of-line after `endobj`.
+///
+/// The accessors [`IncrementalLayout::suffix`], [`IncrementalLayout::base`] and
+/// [`IncrementalLayout::spans`] give those under the brief's names; [`IncrementalLayout::update`]
+/// and [`IncrementalLayout::into_update`] reach the wrapped [`IncrementalUpdate`] (with its
+/// `xref_pos` and `xref_kind`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncrementalLayout(pub IncrementalUpdate);
+
+impl IncrementalLayout {
+    /// The bytes appended to the source ([`IncrementalUpdate::bytes`]).
+    pub fn suffix(&self) -> &[u8] {
+        &self.0.bytes
+    }
+
+    /// The absolute offset of `suffix[0]` in the output, equal to the source length
+    /// ([`IncrementalUpdate::start`]).
+    pub fn base(&self) -> u64 {
+        self.0.start
+    }
+
+    /// The absolute span of every object written, from its `N G obj` header to just past the
+    /// end-of-line after `endobj` ([`IncrementalUpdate::objects`]).
+    pub fn spans(&self) -> &[(ObjectId, Range<u64>)] {
+        &self.0.objects
+    }
+
+    /// The wrapped [`IncrementalUpdate`], for its `xref_pos` and `xref_kind`.
+    pub fn update(&self) -> &IncrementalUpdate {
+        &self.0
+    }
+
+    /// Unwraps into the [`IncrementalUpdate`].
+    pub fn into_update(self) -> IncrementalUpdate {
+        self.0
+    }
+}
+
 impl Store {
     /// Writes the whole document again; see [`save`].
     ///
@@ -388,6 +442,19 @@ impl Store {
     /// See [`save_incremental`].
     pub fn incremental_suffix(&self, opts: &IncrementalOptions) -> Result<Vec<u8>> {
         incremental_suffix(self, opts)
+    }
+
+    /// An incremental update with the `overlay` objects written on top of the edits, and its
+    /// absolute byte layout; see [`incremental_suffix_with_overlay`].
+    ///
+    /// # Errors
+    /// See [`incremental_suffix_with_overlay`].
+    pub fn incremental_suffix_with_overlay(
+        &self,
+        opts: &IncrementalOptions,
+        overlay: &std::collections::BTreeMap<ObjectId, Object>,
+    ) -> Result<IncrementalLayout> {
+        incremental_suffix_with_overlay(self, opts, overlay)
     }
 
     /// Checks that an incremental update may be appended to this store's source: `Ok` unless

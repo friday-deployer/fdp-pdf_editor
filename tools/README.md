@@ -9,6 +9,7 @@ Dev-only helpers. Nothing here is linked into Folioxide: the oracles are externa
 | `requirements-dev.txt` | exact pins: pyHanko, pypdf, pikepdf, pyhanko-certvalidator, asn1crypto, PyYAML |
 | `gen-pki.sh` | generates the test PKI in `fixtures/pki/`; `--check` validates the committed files |
 | `fixtures/qpdf.py` | writes the qpdf-linearized fixtures in `fixtures/qpdf/` (oracle venv); `--check` regenerates and compares them |
+| `fixtures/sign.py` | writes the CMS vectors, key files, trust-path certificates and signed PDFs in `fixtures/sign/` (oracle venv, OpenSSL; `--only cms|chain|pdf` for one group); `--check` verifies them with OpenSSL, pyHanko, pyhanko-certvalidator and the signature oracles |
 | `tsa/openssl-tsa.cnf` | `openssl ts -reply` configuration for the fixture TSA |
 | `oracles/` | cross-validation scripts and their self-tests |
 
@@ -20,6 +21,7 @@ bash tools/setup-venv.sh                                         # once
 .venv/bin/python -I -m unittest discover -s tools/oracles/tests  # oracle self-tests
 bash tools/gen-pki.sh --check                                    # validate fixtures/pki
 .venv/bin/python -I tools/fixtures/qpdf.py --check               # validate fixtures/qpdf
+.venv/bin/python -I tools/fixtures/sign.py --check               # validate fixtures/sign (CMS, chain, signed PDFs)
 cargo xtask oracle [--suite <name>]                              # Rust-emitted cases
 ```
 
@@ -69,6 +71,8 @@ checks:
     "docmdp": null, "docmdpOk": true,           // certification level P (1-3) or null
     "pades": "B-B",                             // true | false | "B-B" | "B-T"
     "timestamp": false                          // signature timestamp token present and valid
+  }, {
+    "field": "Signature2", "rejected": true     // negative case (D-3): every oracle must reject it
   }]
 }
 ```
@@ -79,6 +83,16 @@ poppler cannot validate document timestamps) and OpenSSL. The cross-checks must 
 when `intact` and `valid` are both expected. OpenSSL validates the chain only for
 `"trusted": true`; otherwise it checks the digest and the signature value (`cms -verify
 -noverify`, or `ts -verify -partial_chain` anchored at the token's own certificates).
+
+`"rejected": true` (M3 brief D-3, for the USF attack cases) takes no key but `field` and expects
+every oracle to reject the signature: pyHanko raises or reports `intact`/`valid` false
+(`rejected.pyhanko`), `pdfsig` does not print "Signature is Valid." (`rejected.pdfsig`), and the
+OpenSSL route fails, either at the extraction (no usable `/ByteRange`, a gap that is not the
+dictionary's own `/Contents` `<hex>` string) or at `openssl cms -verify` (`rejected.openssl`).
+The structure rows are not reported for it. pyHanko reads the signatures one at a time, so a
+broken signature does not hide the others. With a rejected entry every entry must name its
+`field` (unless there is only one), and the counts only require that no more signatures are
+listed than there are entries.
 
 `objectCount` counts the in-use objects of the merged cross-reference data that resolve to a
 non-null object; `check_pdf.check_object_count` documents exactly how pikepdf's count is

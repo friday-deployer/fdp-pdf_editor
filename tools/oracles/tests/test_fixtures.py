@@ -66,6 +66,18 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("2 files in fixtures/qpdf match", result.stdout)
 
+    def test_sign_fixtures_pass_their_checks(self):
+        """fixtures/sign: CMS vectors, chain certificates and signed PDFs keep the properties
+        that tools/fixtures/sign.py --check asserts (they are not byte-reproducible)."""
+        script = REPO_ROOT / "tools" / "fixtures" / "sign.py"
+        result = subprocess.run([sys.executable, "-I", str(script), "--check"],
+                                capture_output=True, text=True, check=False)
+        if result.returncode == 2:
+            # Not the oracle venv (pyHanko or OpenSSL missing).
+            self.skipTest(result.stderr.strip())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("checks passed", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

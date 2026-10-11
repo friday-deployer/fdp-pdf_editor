@@ -13,8 +13,9 @@ categories = ["encoding", "parser-implementations", "cryptography"]
 default = ["encryption", "signatures", "pkcs12-legacy", "fonts", "images", "interactive"]
 # Open and save encrypted documents.
 encryption = ["dep:folioxide-security", "folioxide-model/encryption"]
-# Digital signatures (pulls in the RustCrypto stack).
-signatures = ["dep:folioxide-sign"]
+# Digital signatures (pulls in the RustCrypto stack), with the operating-system RNG
+# (`getrandom`) as the default RNG for RSA blinding (M3 brief D-1; `folioxide-sign/sys-rng`).
+signatures = ["dep:folioxide-sign", "folioxide-sign/sys-rng"]
 # RC2-40 and 3DES PKCS#12 bags. Has no effect without `signatures`.
 pkcs12-legacy = ["folioxide-sign?/pkcs12-legacy"]
 # TrueType/OpenType embedding and subsetting; without it only the standard-14 fonts.
@@ -34,7 +35,7 @@ render = ["dep:folioxide-render"]
 # `Serialize`/`Deserialize` on all DTOs: the syntax layer's (`ErrorCode`, `Limits`, `Diagnostic`,
 # `OpenOptions`, `SaveOptions`, …) and the model's (`DocInfo`, `InfoUpdate`, `PageInfo`, `Rect`,
 # `Rotation`, `PdfDate`, `Trapped`).
-serde = ["folioxide-syntax/serde", "folioxide-model/serde"]
+serde = ["folioxide-syntax/serde", "folioxide-model/serde", "folioxide-sign?/serde"]
 # Path helpers, `SystemClock` and optional mmap. Placeholder until M2.
 std-fs = []
 

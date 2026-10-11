@@ -1,12 +1,14 @@
 //! The incremental writer: an update appended to the untouched source (ISO 32000-2 §7.5.6,
 //! ARCHITECTURE §A.3 "Incremental save" and §A.10 trap #12).
 
+use std::collections::BTreeMap;
+
 use super::full::check_root;
 use super::md5::Md5;
 use super::{
-    DEFAULT_FLATE_LEVEL, Entry, IncrementalOptions, IncrementalUpdate, ObjectWriter,
-    StreamCompression, carried_trailer, check_value, first_id, id_array, link_free_list,
-    write_table, xref_stream,
+    DEFAULT_FLATE_LEVEL, Entry, IncrementalLayout, IncrementalOptions, IncrementalUpdate,
+    ObjectWriter, StreamCompression, carried_trailer, check_value, first_id, id_array,
+    link_free_list, write_table, xref_stream,
 };
 use crate::error::{Error, Result};
 use crate::limits::LimitKind;
@@ -14,6 +16,15 @@ use crate::object::{Dict, Object, ObjectId, keys};
 use crate::serialize::{serialize_indirect, serialize_object};
 use crate::store::{Edit, Store, next_generation};
 use crate::xref::{OffsetBase, XrefKind};
+
+/// One object the incremental writer writes: a value (set or added, or an overlay object) or a
+/// free entry. It borrows from the store's edits and from the overlay, so neither is cloned.
+enum Action<'a> {
+    /// Write this value as the object's definition.
+    Set(&'a Object),
+    /// Write a free entry for this object number (see [`Edit::Free`]).
+    Free,
+}
 
 /// The source followed by an incremental update that holds the edits (§7.5.6): what
 /// [`incremental_update`] describes, appended to [`Store::source`]. When nothing was edited,
@@ -91,12 +102,54 @@ pub fn incremental_suffix(store: &Store, opts: &IncrementalOptions) -> Result<Ve
 ///   the cross-reference stream.
 /// - The errors of [`Store::raw_stream_data`].
 pub fn incremental_update(store: &Store, opts: &IncrementalOptions) -> Result<IncrementalUpdate> {
+    build_update(store, opts, &BTreeMap::new())
+}
+
+/// Only the bytes an incremental update with an `overlay` appends to the source, with the
+/// absolute byte layout of the result ([`IncrementalLayout`]): what a signature needs to compute
+/// its `/ByteRange` over an update it has not committed to the store (ARCHITECTURE §A.6.1, §A.6.2).
+///
+/// The `overlay` objects are written as if they were edits ([`Store::set`]/[`Store::add`]), but
+/// the store is **not** changed: an overlay object wins over a store edit of the same identifier,
+/// and over the source's object. Each overlay identifier must either be in use (a replacement,
+/// [`Store::contains`]) or have a number at least [`Store::next_object_number`] (a new object,
+/// never a reused free number, ARCHITECTURE §A.6.1); any other identifier is
+/// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument). Overlay objects are written
+/// uncompressed and never in an object stream, like every object of an incremental update (§7.5.6),
+/// so a signature dictionary and its widget keep byte-exact `/Contents` and `/ByteRange`.
+///
+/// Everything else matches [`incremental_update`]: the same cross-reference kind, the same
+/// trailer, the same offset base, and the source left byte for byte untouched. The store's own
+/// pending edits are written too, in the same revision as the overlay, before being overridden by
+/// any overlay object of the same identifier.
+///
+/// # Errors
+/// The errors of [`incremental_update`], plus
+/// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) for an overlay identifier
+/// that is neither in use nor a fresh number (`>= next_object_number()`).
+pub fn incremental_suffix_with_overlay(
+    store: &Store,
+    opts: &IncrementalOptions,
+    overlay: &BTreeMap<ObjectId, Object>,
+) -> Result<IncrementalLayout> {
+    build_update(store, opts, overlay).map(IncrementalLayout)
+}
+
+/// Builds the incremental update of [`incremental_update`] and [`incremental_suffix_with_overlay`]:
+/// the edits of the store, with `overlay` objects written on top (winning over a store edit of the
+/// same identifier) without changing the store.
+fn build_update(
+    store: &Store,
+    opts: &IncrementalOptions,
+    overlay: &BTreeMap<ObjectId, Object>,
+) -> Result<IncrementalUpdate> {
     let stream_kind = appendable_kind(store)?;
     let last = store.revisions().last().ok_or_else(no_revision)?;
     let carried = carried_trailer(store.trailer())?;
     let source = store.source();
     let start = source.len() as u64;
-    if !store.is_modified() {
+    check_overlay(store, overlay)?;
+    if !store.is_modified() && overlay.is_empty() {
         return Ok(IncrementalUpdate {
             start,
             ..IncrementalUpdate::default()
@@ -124,9 +177,9 @@ pub fn incremental_update(store: &Store, opts: &IncrementalOptions) -> Result<In
     };
     let mut entries: Vec<(u32, Entry)> = Vec::new();
     let mut objects = Vec::new();
-    for (&id, edit) in store.edits() {
-        match edit {
-            Edit::Set(obj) => {
+    for (id, action) in merged_actions(store, overlay) {
+        match action {
+            Action::Set(obj) => {
                 check_value(id, obj)?;
                 let pos = start.saturating_add(out.len() as u64);
                 entries.push((
@@ -140,14 +193,14 @@ pub fn incremental_update(store: &Store, opts: &IncrementalOptions) -> Result<In
                 objects.push((id, pos..start.saturating_add(out.len() as u64)));
             }
             // A number the source never listed (added, then freed) needs no entry.
-            Edit::Free if id.num <= store.max_object_number() => entries.push((
+            Action::Free if id.num <= store.max_object_number() => entries.push((
                 id.num,
                 Entry::Free {
                     next: 0,
                     r#gen: next_generation(id.r#gen),
                 },
             )),
-            Edit::Free => {}
+            Action::Free => {}
         }
     }
 
@@ -240,6 +293,56 @@ pub fn incremental_update(store: &Store, opts: &IncrementalOptions) -> Result<In
             XrefKind::Table
         }),
     })
+}
+
+/// The objects to write, by identifier in object-number order: the store's edits, with the
+/// `overlay` objects on top. An overlay object wins over a store edit of the same identifier
+/// (and over the source), so a signature can override a pending edit without touching the store.
+/// Each [`Action`] borrows from the store's edits or the overlay, so nothing is cloned.
+fn merged_actions<'a>(
+    store: &'a Store,
+    overlay: &'a BTreeMap<ObjectId, Object>,
+) -> BTreeMap<ObjectId, Action<'a>> {
+    let mut actions: BTreeMap<ObjectId, Action<'a>> = BTreeMap::new();
+    for (&id, edit) in store.edits() {
+        actions.insert(
+            id,
+            match edit {
+                Edit::Set(obj) => Action::Set(obj),
+                Edit::Free => Action::Free,
+            },
+        );
+    }
+    for (&id, obj) in overlay {
+        actions.insert(id, Action::Set(obj));
+    }
+    actions
+}
+
+/// Checks the overlay identifiers of [`incremental_suffix_with_overlay`]: each must be in use (a
+/// replacement) or at least [`Store::next_object_number`] (a fresh number, never a reused free
+/// one, ARCHITECTURE §A.6.1). Object 0 is never a valid identifier.
+fn check_overlay(store: &Store, overlay: &BTreeMap<ObjectId, Object>) -> Result<()> {
+    if overlay.is_empty() {
+        return Ok(());
+    }
+    let next = store.next_object_number();
+    for &id in overlay.keys() {
+        if id.num == 0 {
+            return Err(Error::invalid_argument(
+                "an overlay object cannot be object 0 (§7.5.4)",
+            ));
+        }
+        if store.contains(id) || id.num >= next {
+            continue;
+        }
+        return Err(Error::invalid_argument(format!(
+            "overlay object {id} is neither in use nor a fresh number (>= {next}); a signature \
+             overlay may only replace an object in use or add one above every number in use, \
+             never reuse a freed number"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether an incremental update may be appended to `store`'s source, and if so whether its

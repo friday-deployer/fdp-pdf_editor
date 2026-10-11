@@ -267,6 +267,41 @@ impl AsRef<Object> for Resolved<'_> {
     }
 }
 
+/// Where an object's current definition lives in the file, as [`Store::object_location`] reports
+/// it: inside the file at an absolute byte range, or as a member of an object stream (§7.5.7).
+///
+/// A signature verifier needs this to tell whether a signature dictionary is uncompressed (so
+/// its `/Contents` can be excluded from the signed byte range) and where its bytes are, so that
+/// the gap in the `/ByteRange` can be checked against the actual `/Contents` token (ARCHITECTURE
+/// §A.6.7, trap #14).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+pub enum ObjectLocation {
+    /// An uncompressed object. `start` is the absolute position of its `N G obj` header; `end` is
+    /// the absolute position just past the parse that produced the resolved object (after
+    /// `endobj`, or, when `endobj` is missing, after the last part read). `source[start..end]`
+    /// therefore holds the whole object definition, including its `N G obj` header.
+    InFile {
+        /// Absolute position of the `N G obj` header.
+        start: u64,
+        /// Absolute position just past the object (after `endobj`).
+        end: u64,
+    },
+    /// A compressed object: member `index` of the object stream `stream` (§7.5.8.3, type 2),
+    /// which has no byte position of its own in the file.
+    InObjStm {
+        /// The object number of the object stream that holds it.
+        stream: u32,
+        /// The index of this object among the stream's members.
+        index: u32,
+    },
+}
+
 /// Where the merged cross-reference data says an in-use object is. A free object has no slot:
 /// like an object no section lists, it reads as `null`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1718,6 +1753,58 @@ impl Store {
         })
     }
 
+    /// Where object `id`'s current definition lives in the file (ARCHITECTURE §A.6.7): an
+    /// uncompressed object as [`ObjectLocation::InFile`] with the absolute range of its
+    /// definition (`start` at `N G obj`, `end` just past `endobj`), or a compressed object as
+    /// [`ObjectLocation::InObjStm`]. `None` for object 0, a free or missing object, a generation
+    /// that does not match the entry, or an uncompressed object whose header cannot be found at
+    /// all.
+    ///
+    /// This reports the **source** location of the definition, so an object replaced by
+    /// [`Store::set`] or [`Store::get_mut`] reports where its source bytes are (an edit lives
+    /// only in memory until the document is saved); an object added by [`Store::add`], and one
+    /// freed by [`Store::free`], have no source definition and give `None`.
+    ///
+    /// A signature verifier uses it to refuse an object-stream-compressed signature dictionary
+    /// (its `/Contents` can never be excluded from the signed bytes) and to re-lex the dictionary
+    /// from the file to check the `/ByteRange` gap against the real `/Contents` token (trap #14).
+    ///
+    /// Finding the end of an uncompressed object parses it (quietly, within its region, as
+    /// [`Store::resolve`] would); the result is not cached here.
+    pub fn object_location(&self, id: ObjectId) -> Option<ObjectLocation> {
+        if id.num == 0 {
+            return None;
+        }
+        let slot = self.slot_of(id).filter(|s| s.r#gen == id.r#gen)?;
+        match slot.loc {
+            Location::InObjStm { stream, index } => {
+                Some(ObjectLocation::InObjStm { stream, index })
+            }
+            Location::InFile { pos } => {
+                // The actual header position (after the offset repairs of `locate`), then the
+                // parse end. Quiet: this is an inspection, not a resolve, so it records no
+                // diagnostics and marks nothing recovered.
+                let at = self.locate(id, pos, true).ok()?;
+                let bytes = self.bytes();
+                // `N G obj` begins after at most a little white-space (`object_header_at`).
+                let header = at.saturating_add(
+                    bytes
+                        .get(at..)
+                        .unwrap_or_default()
+                        .iter()
+                        .take_while(|&&b| crate::lexer::is_whitespace(b))
+                        .count(),
+                );
+                let region = self.region_end(at, pos);
+                let parsed = self.parse_source_object(at, region, true).ok()?;
+                Some(ObjectLocation::InFile {
+                    start: header as u64,
+                    end: parsed.end as u64,
+                })
+            }
+        }
+    }
+
     /// Which position the offsets in the file count from: the header (as the standard says, and
     /// always when the header is at byte 0), or byte 0 (a writer that counted the junk before the
     /// header). Taken from how the newest section was found, or from where the catalog is.
@@ -2889,6 +2976,17 @@ impl Store {
     /// - The errors of [`Store::raw_stream_data`] and [`Store::deref`].
     pub fn stream_data(&self, stream: &Stream) -> Result<StreamBytes> {
         self.decode_internal(stream, Mode::Blocking, false)
+    }
+
+    /// [`Store::stream_data`] with an output cap of the caller's own: `Ok(None)` when the data
+    /// would decode to more than `cap` bytes, which stops the decoder at `cap` (a check that
+    /// only needs small streams, such as an XMP packet, never pays for a decompression bomb).
+    /// What the stopped decode produced counts against [`Limits::max_total_decoded`] as usual.
+    ///
+    /// # Errors
+    /// As [`Store::stream_data`]; the document limits still apply when they are below `cap`.
+    pub fn stream_data_capped(&self, stream: &Stream, cap: usize) -> Result<Option<StreamBytes>> {
+        self.decode_capped(stream, Mode::Blocking, false, cap, Charge::Once)
     }
 
     pub(crate) fn decode_internal(

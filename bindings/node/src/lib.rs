@@ -10,12 +10,18 @@
 //! - The plain objects that cross the boundary (`dto`): [`PageInfo`], [`DocInfo`],
 //!   [`InfoUpdate`], [`Diagnostic`] and the options, with the JSON shape of the core's `serde`
 //!   DTOs.
+//! - Signing and verification (`sign`): [`LocalSigner`] (PKCS#12 and PEM keys),
+//!   `PdfDocument.prepareSignature` and [`PreparedSignature`] for the two-phase flow (the
+//!   JavaScript facade's `signPdf` awaits an external signer between the phases), and
+//!   `PdfDocument.verifySignatures`, whose [`SignatureReport`]s have the JSON shape of the core's
+//!   serde DTOs.
 //! - Errors (`error`): every error carries `err.code = "E_" + ErrorCode`, or `E_BUSY` or
 //!   `E_CLOSED`.
 
 mod document;
 mod dto;
 mod error;
+mod sign;
 
 pub use document::{OpenTask, PdfDocument, SaveError, SaveTask};
 pub use dto::{
@@ -23,6 +29,12 @@ pub use dto::{
     SaveOptions, StreamCompression, Trapped, XrefStyle,
 };
 pub use error::{BindingError, E_BUSY, E_CLOSED, JsResult, MAX_MESSAGE_LEN};
+pub use sign::{
+    CertificateInfo, Coverage, DigestAlg, DocumentTaskError, FieldMode, FinishTask, KeyDescription,
+    LocalSigner, ModificationLevel, ObjectRef, PadesLevel, PrepareSignatureOptions, PrepareTask,
+    PreparedSignature, SigAlg, SignTask, SignatureFieldSpec, SignatureKind, SignatureProblem,
+    SignatureReport, SubFilter, VerifyOptions, VerifyTask,
+};
 
 use napi_derive::napi;
 
@@ -84,6 +96,65 @@ mod tests {
         for &kind in folioxide::DiagnosticKind::ALL {
             let js = format!("'{}'", kind.as_str());
             assert!(union.contains(&js), "index.d.ts DiagnosticKind lacks {js}");
+        }
+    }
+
+    /// `index.d.ts` lists every problem code of the signature reports in its `ProblemCode`
+    /// union, and the values of every report enum in theirs (the binding passes the core's
+    /// strings through, so the unions must not fall behind the core).
+    #[test]
+    fn index_d_ts_lists_every_report_value() {
+        let union = declaration(INDEX_D_TS, "export type ProblemCode =");
+        for &code in folioxide::ProblemCode::ALL {
+            let js = format!("'{}'", code.as_str());
+            assert!(union.contains(&js), "index.d.ts ProblemCode lacks {js}");
+        }
+        let unions: [(&str, Vec<&str>); 4] = [
+            (
+                "export type Coverage =",
+                [
+                    folioxide::Coverage::EntireFile,
+                    folioxide::Coverage::EntireRevision,
+                    folioxide::Coverage::ContiguousBlockFromStart,
+                    folioxide::Coverage::Unclear,
+                ]
+                .map(folioxide::Coverage::as_str)
+                .to_vec(),
+            ),
+            (
+                "export type ModificationLevel =",
+                [
+                    folioxide::ModificationLevel::None,
+                    folioxide::ModificationLevel::LtaUpdates,
+                    folioxide::ModificationLevel::FormFilling,
+                    folioxide::ModificationLevel::Annotations,
+                    folioxide::ModificationLevel::Other,
+                ]
+                .map(folioxide::ModificationLevel::as_str)
+                .to_vec(),
+            ),
+            (
+                "export type SignatureKind =",
+                [
+                    folioxide::SignatureKind::Signature,
+                    folioxide::SignatureKind::DocTimeStamp,
+                ]
+                .map(folioxide::SignatureKind::as_str)
+                .to_vec(),
+            ),
+            (
+                "export type PadesLevel =",
+                vec![folioxide::PadesLevel::BB.as_str()],
+            ),
+        ];
+        for (start, values) in unions {
+            let union = declaration(INDEX_D_TS, start);
+            for value in values {
+                assert!(
+                    union.contains(&format!("'{value}'")),
+                    "{start} lacks '{value}'"
+                );
+            }
         }
     }
 

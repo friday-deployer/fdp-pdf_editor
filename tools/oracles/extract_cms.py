@@ -99,6 +99,9 @@ class SignatureBlob:
     contents_match_dict: bool
     #: What is wrong with the ByteRange itself (empty when it starts at offset 0).
     problems: list[str] = field(default_factory=list)
+    #: The keys of the signature dictionary, e.g. ``{"/Type", "/M", "/Contents", ...}`` (for the
+    #: PAdES checks of ``/M`` and ``/Cert``).
+    dict_keys: frozenset[str] = frozenset()
 
     @property
     def is_doc_timestamp(self) -> bool:
@@ -254,8 +257,33 @@ def _int_byte_range(raw: Any) -> tuple[int, int, int, int]:
     return o1, l1, o2, l2
 
 
+@dataclass(frozen=True)
+class ExtractionFailure:
+    """A signature field whose CMS and signed bytes could not be sliced out of the file."""
+
+    field_name: str | None
+    reason: str
+
+
 def extract(path: Path) -> list[SignatureBlob]:
-    """Find every signature and slice its CMS and signed bytes from the raw file."""
+    """Find every signature and slice its CMS and signed bytes from the raw file.
+
+    Raises :class:`ExtractionError` when the file cannot be read or any signature cannot be
+    extracted; :func:`extract_all` reports the latter per field instead.
+    """
+    blobs, failures = extract_all(path)
+    if failures:
+        raise ExtractionError(failures[0].reason)
+    return blobs
+
+
+def extract_all(path: Path) -> tuple[list[SignatureBlob], list[ExtractionFailure]]:
+    """Like :func:`extract`, but a signature that cannot be extracted (a ByteRange that is not 4
+    integers or does not fit the file, a gap that is not a ``<hex>`` string) is returned as an
+    :class:`ExtractionFailure` while the other signatures are still extracted.
+
+    Raises :class:`ExtractionError` only when the signature fields cannot be read at all.
+    """
     pypdf = import_module("pypdf")
     data = path.read_bytes()
     with captured_logs("pypdf"):
@@ -268,48 +296,59 @@ def extract(path: Path) -> list[SignatureBlob]:
             raise ExtractionError(f"cannot read the signature fields: {type(exc).__name__}: {exc}") from exc
 
         blobs: list[SignatureBlob] = []
+        failures: list[ExtractionFailure] = []
         for name, sig in fields:
-            o1, l1, o2, l2 = _int_byte_range(sig.get("/ByteRange"))
-            problems: list[str] = []
-            if o1 != 0:
-                problems.append(f"ByteRange starts at {o1}, not 0")
-            gap_start, gap_end = o1 + l1, o2
-            if min(o1, l1, o2, l2) < 0 or not gap_start < gap_end or o2 + l2 > len(data):
-                raise ExtractionError(
-                    f"field {name!r}: ByteRange {[o1, l1, o2, l2]} is inconsistent with the file size {len(data)}"
-                )
-            gap = data[gap_start:gap_end]
-            if len(gap) < 2 or gap[:1] != b"<" or gap[-1:] != b">":
-                raise ExtractionError(f"field {name!r}: the ByteRange gap is not a <hex> string")
-            hex_body = gap[1:-1]
-            if not set(hex_body) <= _HEX_OR_WS:
-                raise ExtractionError(f"field {name!r}: the ByteRange gap contains non-hex bytes")
-            digits = bytes(b for b in hex_body if b in _HEX)
-            if len(digits) % 2:
-                digits += b"0"  # §7.3.4.3: an odd final digit is followed by an implied 0
-            raw = bytes.fromhex(digits.decode("ascii"))
-            length = ber_element_length(raw)
-            cms_der, padding = raw[:length], raw[length:]
-            contents_bytes = _string_bytes(sig.get("/Contents"))
-            blobs.append(
-                SignatureBlob(
-                    index=0,
-                    field_name=name,
-                    sig_type=str(sig.get("/Type")) if sig.get("/Type") is not None else None,
-                    sub_filter=str(sig.get("/SubFilter")) if sig.get("/SubFilter") is not None else None,
-                    byte_range=(o1, l1, o2, l2),
-                    cms_der=cms_der,
-                    signed_bytes=data[o1 : o1 + l1] + data[o2 : o2 + l2],
-                    trailing_padding_ok=not padding.strip(b"\x00"),
-                    contents_match_dict=contents_bytes == raw,
-                    problems=problems,
-                )
-            )
+            try:
+                blobs.append(_extract_one(data, name, sig))
+            except OracleEnvError:
+                raise
+            except ExtractionError as exc:
+                failures.append(ExtractionFailure(name, str(exc)))
+            except Exception as exc:  # noqa: BLE001 - malformed objects are a FAIL, not a crash
+                failures.append(ExtractionFailure(name, f"field {name!r}: {type(exc).__name__}: {exc}"))
     # Order of application: the signature covering the shortest prefix came first.
     blobs.sort(key=lambda b: b.byte_range[2] + b.byte_range[3])
     for i, blob in enumerate(blobs):
         blob.index = i
-    return blobs
+    return blobs, failures
+
+
+def _extract_one(data: bytes, name: str | None, sig: Any) -> SignatureBlob:
+    o1, l1, o2, l2 = _int_byte_range(sig.get("/ByteRange"))
+    problems: list[str] = []
+    if o1 != 0:
+        problems.append(f"ByteRange starts at {o1}, not 0")
+    gap_start, gap_end = o1 + l1, o2
+    if min(o1, l1, o2, l2) < 0 or not gap_start < gap_end or o2 + l2 > len(data):
+        raise ExtractionError(
+            f"field {name!r}: ByteRange {[o1, l1, o2, l2]} is inconsistent with the file size {len(data)}"
+        )
+    gap = data[gap_start:gap_end]
+    if len(gap) < 2 or gap[:1] != b"<" or gap[-1:] != b">":
+        raise ExtractionError(f"field {name!r}: the ByteRange gap is not a <hex> string")
+    hex_body = gap[1:-1]
+    if not set(hex_body) <= _HEX_OR_WS:
+        raise ExtractionError(f"field {name!r}: the ByteRange gap contains non-hex bytes")
+    digits = bytes(b for b in hex_body if b in _HEX)
+    if len(digits) % 2:
+        digits += b"0"  # §7.3.4.3: an odd final digit is followed by an implied 0
+    raw = bytes.fromhex(digits.decode("ascii"))
+    length = ber_element_length(raw)
+    cms_der, padding = raw[:length], raw[length:]
+    contents_bytes = _string_bytes(sig.get("/Contents"))
+    return SignatureBlob(
+        index=0,
+        field_name=name,
+        sig_type=str(sig.get("/Type")) if sig.get("/Type") is not None else None,
+        sub_filter=str(sig.get("/SubFilter")) if sig.get("/SubFilter") is not None else None,
+        byte_range=(o1, l1, o2, l2),
+        cms_der=cms_der,
+        signed_bytes=data[o1 : o1 + l1] + data[o2 : o2 + l2],
+        trailing_padding_ok=not padding.strip(b"\x00"),
+        contents_match_dict=contents_bytes == raw,
+        problems=problems,
+        dict_keys=frozenset(str(key) for key in sig.keys()),
+    )
 
 
 # --------------------------------------------------------------------------------------------

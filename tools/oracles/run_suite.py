@@ -27,7 +27,9 @@ Expect keys (§A.9). Implemented:
   ``check_pdf.py``
 * ``signatures`` ([{field, intact, valid, trusted, coverage, modification, docmdp, docmdpOk,
   pades, timestamp}]): see ``validate_sig.py``. ``intact`` and ``valid`` default to true, and
-  every signature also gets the structural, pdfsig and OpenSSL checks
+  every signature also gets the structural, pdfsig and OpenSSL checks. A negative case is
+  ``{"field": ..., "rejected": true}`` (M3 brief D-3): it passes only when pyHanko, pdfsig and
+  the OpenSSL route (extraction or ``cms -verify``) all reject that signature
 * ``textContains`` / ``textAbsent`` (lists of strings): see ``text_check.py``
 * ``prefixOf`` (path): the PDF starts with every byte of that file (incremental-save integrity)
 * ``revisions`` (int): number of ``startxref`` keywords in the file, and pyHanko's revision count

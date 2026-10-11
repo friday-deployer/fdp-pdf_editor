@@ -4,6 +4,7 @@
 # Usage:
 #   bash tools/gen-pki.sh [--dir DIR]           regenerate every file, then run the checks
 #   bash tools/gen-pki.sh --check [--dir DIR]   validate the committed files (no regeneration)
+#   bash tools/gen-pki.sh --derive [--dir DIR]  rewrite only the derived key files, then check
 #
 # DIR defaults to fixtures/pki. Keys are random, so regeneration never reproduces the committed
 # bytes; that is why --check validates properties instead of comparing output. Requires OpenSSL 3.x
@@ -28,7 +29,11 @@
 #   signer-rsa2048-3des.p12                  PBE-SHA1-3DES for key and certs, SHA-1 MAC
 #   signer-rsa2048-rc2-40.p12                -legacy: certs RC2-40 (PBE-SHA1-RC2-40), key 3DES, SHA-1 MAC
 #   signer-p256-modern.p12                   OpenSSL 3 defaults
+#   signer-{rsa2048,rsa3072}.key.pkcs1.pem   derived: the same RSA keys as PKCS#1 (BEGIN RSA PRIVATE KEY)
+#   signer-{p256,p384}.key.sec1.pem          derived: the same EC keys as SEC1 (BEGIN EC PRIVATE KEY)
 # Every .p12 holds the signer key and certificate plus the intermediate and root certificates.
+# The derived files are a deterministic function of the committed keys (M3 brief §2, WP3.1B), so
+# --derive can add them without regenerating, and --check verifies they are up to date.
 # Non-expired certificates are valid from 2025-01-01 to 2075-12-31.
 set -euo pipefail
 
@@ -40,18 +45,21 @@ EXPIRED_NOT_AFTER="20251231235959Z"
 LONG_VALIDITY_EPOCH=3313526400
 DN_PREFIX="/O=Folioxide Test PKI/OU=TEST ONLY - DO NOT TRUST"
 SIGNERS=(signer-rsa2048 signer-rsa3072 signer-p256 signer-p384)
+RSA_SIGNERS=(signer-rsa2048 signer-rsa3072)
+EC_SIGNERS=(signer-p256 signer-p384)
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pki_dir="$repo_root/fixtures/pki"
 mode="generate"
 
 usage() {
-    sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) mode="check" ;;
+        --derive) mode="derive" ;;
         --dir)
             [ $# -ge 2 ] || { usage >&2; exit 2; }
             pki_dir="$2"
@@ -211,12 +219,30 @@ generate() {
     "${export_p12[@]}" -inkey "$out/signer-p256.key.pem" -in "$out/signer-p256.pem" \
         -name "Folioxide Test Signer P-256" -out "$out/signer-p256-modern.p12"
 
+    derive "$out"
+
     mkdir -p "$pki_dir"
     local f
     for f in "$out"/*; do
         cp "$f" "$pki_dir/"
     done
     echo "gen-pki: wrote $(find "$out" -type f | wc -l | tr -d ' ') files to $pki_dir"
+}
+
+# derive_rsa <key.pem> <out>: the RSA key as PKCS#1 (BEGIN RSA PRIVATE KEY)
+derive_rsa() { openssl rsa -in "$1" -traditional -out "$2" 2>/dev/null; }
+# derive_ec <key.pem> <out>: the EC key as SEC1 with named-curve parameters (BEGIN EC PRIVATE KEY)
+derive_ec() { openssl ec -in "$1" -out "$2" 2>/dev/null; }
+
+# derive <dir>: write the derived key files next to the unencrypted PKCS#8 keys in <dir>
+derive() {
+    local d="$1" s
+    for s in "${RSA_SIGNERS[@]}"; do
+        derive_rsa "$d/$s.key.pem" "$d/$s.key.pkcs1.pem"
+    done
+    for s in "${EC_SIGNERS[@]}"; do
+        derive_ec "$d/$s.key.pem" "$d/$s.key.sec1.pem"
+    done
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -346,6 +372,12 @@ check() {
     for s in "${SIGNERS[@]}"; do
         required+=("$s.pem" "$s.key.pem" "$s.key.enc.pem")
     done
+    for s in "${RSA_SIGNERS[@]}"; do
+        required+=("$s.key.pkcs1.pem")
+    done
+    for s in "${EC_SIGNERS[@]}"; do
+        required+=("$s.key.sec1.pem")
+    done
     local missing=0
     for f in "${required[@]}"; do
         if [ -f "$d/$f" ]; then ok; else fail "missing $d/$f"; missing=1; fi
@@ -375,6 +407,26 @@ check() {
         fi
         check_signer_ku "$d/$s.pem"
         check_long_validity "$d/$s.pem"
+    done
+    # Derived key files: the right PEM type, the signer's key, and up to date with the PKCS#8 key.
+    local derived
+    for s in "${RSA_SIGNERS[@]}"; do
+        derived="$d/$s.key.pkcs1.pem"
+        check_pkcs8 "$derived" "RSA PRIVATE KEY"
+        check_key_matches "$d/$s.pem" "$derived"
+        derive_rsa "$d/$s.key.pem" "$work/derived.pem"
+        if cmp -s "$derived" "$work/derived.pem"; then ok; else
+            fail "$(basename "$derived") is not derived from $s.key.pem (run: bash tools/gen-pki.sh --derive)"
+        fi
+    done
+    for s in "${EC_SIGNERS[@]}"; do
+        derived="$d/$s.key.sec1.pem"
+        check_pkcs8 "$derived" "EC PRIVATE KEY"
+        check_key_matches "$d/$s.pem" "$derived"
+        derive_ec "$d/$s.key.pem" "$work/derived.pem"
+        if cmp -s "$derived" "$work/derived.pem"; then ok; else
+            fail "$(basename "$derived") is not derived from $s.key.pem (run: bash tools/gen-pki.sh --derive)"
+        fi
     done
     check_key_type "$d/signer-rsa2048.key.pem" rsa:2048
     check_key_type "$d/signer-rsa3072.key.pem" rsa:3072
@@ -449,5 +501,8 @@ Shrouded Keybag: pbeWithSHA1And3-KeyTripleDES-CBC"
 
 if [ "$mode" = "generate" ]; then
     generate
+elif [ "$mode" = "derive" ]; then
+    derive "$pki_dir"
+    echo "gen-pki: wrote the derived key files to $pki_dir"
 fi
 check

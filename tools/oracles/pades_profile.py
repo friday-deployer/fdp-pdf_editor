@@ -11,7 +11,14 @@ For each signature this parses the CMS with asn1crypto and reports:
   requires for a DEFAULT value
 * ``noSigningTime``: the signing-time attribute is absent (the claimed time lives in ``/M``)
 * ``detached``: ``encapContentInfo`` has no eContent
+* ``mPresent``: the signature dictionary has ``/M`` (EN 319 142-1 §6.3 Table 1: cardinality 1)
+* ``noCertEntry``: the signature dictionary has no ``/Cert`` (Table 1: cardinality 0)
+* ``signerCertificateIncluded``: ``SignedData.certificates`` is not empty and contains the
+  certificate the SignerInfo's ``sid`` names (EN 319 122-1 Table 1, additional requirement (a))
 * ``timestamp``: an id-aa-signatureTimeStampToken unsigned attribute is present (B-T)
+
+The signing-certificate-v2 check also requires the first ESSCertIDv2's ``issuerSerial``, when
+present, to name the signer certificate's issuer and serial number (RFC 5035 §4).
 
 ``level`` is ``B-T`` when every B-B requirement holds and a timestamp token is present, ``B-B``
 when every B-B requirement holds, and ``null`` otherwise. Document timestamps
@@ -71,6 +78,9 @@ class PadesReport:
     signing_certificate_v2: bool = False
     no_signing_time: bool = False
     detached: bool = False
+    m_present: bool = False
+    no_cert_entry: bool = False
+    signer_certificate_included: bool = False
     timestamp: bool = False
     level: str | None = None
     problems: list[str] = field(default_factory=list)
@@ -90,6 +100,9 @@ class PadesReport:
             "signingCertificateV2": d["signing_certificate_v2"],
             "noSigningTime": d["no_signing_time"],
             "detached": d["detached"],
+            "mPresent": d["m_present"],
+            "noCertEntry": d["no_cert_entry"],
+            "signerCertificateIncluded": d["signer_certificate_included"],
             "timestamp": d["timestamp"],
             "level": d["level"],
             "problems": d["problems"],
@@ -149,6 +162,12 @@ def profile(blob: SignatureBlob) -> PadesReport:
         return report
     if blob.sub_filter != "/ETSI.CAdES.detached":
         report.problems.append(f"SubFilter is {blob.sub_filter}, not /ETSI.CAdES.detached")
+    report.m_present = "/M" in blob.dict_keys
+    if not report.m_present:
+        report.problems.append("the signature dictionary has no /M (PAdES requires the claimed time)")
+    report.no_cert_entry = "/Cert" not in blob.dict_keys
+    if not report.no_cert_entry:
+        report.problems.append("the signature dictionary has /Cert (PAdES forbids it)")
 
     try:
         content_info = cms.ContentInfo.load(blob.cms_der)
@@ -164,6 +183,12 @@ def profile(blob: SignatureBlob) -> PadesReport:
             report.problems.append("encapContentInfo carries eContent (not detached)")
         if eci["content_type"].dotted != OID_DATA:
             report.problems.append(f"eContentType is {eci['content_type'].dotted}, not id-data")
+
+        report.signer_certificate_included = _signer_certificate(signed_data, info["sid"]) is not None
+        if not signed_data["certificates"]:
+            report.problems.append("SignedData.certificates is empty")
+        elif not report.signer_certificate_included:
+            report.problems.append("signer certificate not found in SignedData.certificates")
 
         attrs = {a["type"].dotted: a for a in (info["signed_attrs"] or [])}
         ct = attrs.get(OID_CONTENT_TYPE)
@@ -202,6 +227,9 @@ def profile(blob: SignatureBlob) -> PadesReport:
         and report.signing_certificate_v2
         and report.no_signing_time
         and report.detached
+        and report.m_present
+        and report.no_cert_entry
+        and report.signer_certificate_included
         and not report.problems
     )
     if baseline:
@@ -226,8 +254,7 @@ def _check_signing_certificate_v2(der: bytes, signed_data: Any, info: Any, probl
         problems.append("ESSCertIDv2 encodes the DEFAULT sha256 hashAlgorithm explicitly (not DER)")
     cert = _signer_certificate(signed_data, info["sid"])
     if cert is None:
-        problems.append("signer certificate not found in SignedData.certificates")
-        return False
+        return False  # reported by profile()
     try:
         digest = hashlib.new(hash_alg, cert.dump()).digest()
     except ValueError:
@@ -236,6 +263,13 @@ def _check_signing_certificate_v2(der: bytes, signed_data: Any, info: Any, probl
     if digest != first["cert_hash"].native:
         problems.append("ESSCertIDv2 certHash does not match the signer certificate")
         return False
+    issuer_serial = first["issuer_serial"]
+    if issuer_serial.native is not None:
+        names = list(issuer_serial["issuer"])
+        if (len(names) != 1 or names[0].name != "directory_name" or names[0].chosen != cert.issuer
+                or issuer_serial["serial_number"].native != cert.serial_number):
+            problems.append("ESSCertIDv2 issuerSerial does not name the signer certificate's issuer and serial")
+            return False
     return True
 
 

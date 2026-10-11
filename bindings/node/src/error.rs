@@ -23,8 +23,8 @@ pub type JsResult<T> = napi::Result<T, String>;
 pub type BindingError = napi::Error<String>;
 
 /// The `code` of the error a synchronous method throws while an asynchronous method
-/// (`saveAsync`, `saveIncrementalAsync`) has the document (ARCHITECTURE §A.7: sync methods never
-/// block the event loop).
+/// (`saveAsync`, `saveIncrementalAsync`, `prepareSignatureAsync`, `verifySignatures`) has the
+/// document (ARCHITECTURE §A.7: sync methods never block the event loop).
 pub const E_BUSY: &str = "E_BUSY";
 
 /// The `code` of the error every method throws (and every asynchronous method rejects with)
@@ -64,8 +64,9 @@ pub fn page_out_of_range(message: impl Into<String>) -> BindingError {
 pub fn busy() -> BindingError {
     napi::Error::new(
         E_BUSY.to_owned(),
-        "the document is busy: an asynchronous operation (saveAsync or saveIncrementalAsync) \
-         is using it; await it before calling a synchronous method"
+        "the document is busy: an asynchronous operation (saveAsync, saveIncrementalAsync, \
+         prepareSignatureAsync or verifySignatures) is using it; await it before calling a \
+         synchronous method"
             .to_owned(),
     )
 }
@@ -75,6 +76,24 @@ pub fn closed() -> BindingError {
     napi::Error::new(
         E_CLOSED.to_owned(),
         "the document was closed: its memory was freed by close(); open the file again to use it"
+            .to_owned(),
+    )
+}
+
+/// The [`E_CLOSED`] error of a `LocalSigner` after `close()`.
+pub fn signer_closed() -> BindingError {
+    napi::Error::new(
+        E_CLOSED.to_owned(),
+        "the signer was closed: close() wiped its key; load the key again to sign".to_owned(),
+    )
+}
+
+/// The [`E_BUSY`] error of a `PreparedSignature` while `finishAsync` or `embedCmsAsync` runs.
+pub fn finishing() -> BindingError {
+    napi::Error::new(
+        E_BUSY.to_owned(),
+        "the prepared signature is busy: a finishAsync or embedCmsAsync is using it; await it \
+         first (if it fails, the prepared signature can be finished again)"
             .to_owned(),
     )
 }
@@ -128,12 +147,16 @@ mod tests {
 
     #[test]
     fn core_errors_keep_their_code_and_message() {
-        let err = folioxide::Error::invalid_argument("a page rotation must be a multiple of 90");
+        let err = folioxide::Error::from(folioxide::SyntaxError::invalid_argument(
+            "a page rotation must be a multiple of 90",
+        ));
         let js = from_core(&err);
         assert_eq!(js.status, "E_INVALID_ARGUMENT");
         assert_eq!(js.reason, err.to_string());
         assert_eq!(busy().status, E_BUSY);
         assert_eq!(closed().status, E_CLOSED);
+        assert_eq!(signer_closed().status, E_CLOSED);
+        assert_eq!(finishing().status, E_BUSY);
     }
 
     #[test]

@@ -176,3 +176,45 @@ All 19 open decisions in `docs/milestones/M3.md` §8 (D-1 … D-19) are accepted
     - Signature dictionaries are recognised by `/Type /Sig`, `/ByteRange`, or `/Contents` plus `/Filter` or `/SubFilter`, and are never packed into object streams.
 17. **Known limitation:** a name holding a NUL byte (non-conformant input such as `/A#00B`) is copied as `#00`, which qpdf rejects. Garbage in, garbage out; a later sanitising option may rewrite such names.
 18. **Build profile:** `[profile.dev] debug = "line-tables-only"` keeps per-worktree build directories small.
+
+## D12: Decisions from M3, signatures I (manager, 2026-10-11)
+1. **The modification classifier is whitelist-based** (V10 in the M3 brief, ARCHITECTURE §A.6.7).
+   - A later revision gets a level below `Other` **only** for the exact changes legitimate later signers make. Every other change to an object reachable from the signed revision is `Other`.
+   - The result is never more lenient than pyHanko. Each stricter result has a `sign-attacks` case and a `DELIBERATE_DIFFERENCES` row.
+   - This principle replaced rule-by-rule emulation of pyHanko after three QA rounds kept finding new shadow Hide/Replace variants.
+2. **AcroForm whitelist, final after five hardening rounds.** Only three AcroForm changes stay below `Other`:
+   - (a) `/Fields` gaining new root-level signature fields, with their widget, signature dictionary and the page `/Annots` append;
+   - (b) the `/SigFlags` change that signing requires;
+   - (c) `/DR` gaining **new** resource names that no signed `/DA` selects. The check covers the field tree, **every widget on every page** and the AcroForm `/DA`, and is tokenized with the PDF lexer. An incomplete walk counts as `Other`.
+
+   Everything else is `Other`:
+   - any change to `/NeedAppearances`, including removal, since removing it reveals stale stored appearances;
+   - adding, changing or removing `/DA` (exceptions for "safe" additions leaked twice);
+   - `/Q`, `/DR /Encoding`, and removing or replacing `/DR` names.
+
+   **Consequences:**
+   - Documents whose later signer deleted `/NeedAppearances`, as pyHanko's signer does, or added an AcroForm `/DA` show the earlier signatures as `Other` (stricter than pyHanko, recorded).
+   - **Residual risk:** a new `/DR` name used only by a signed appearance stream that has no `/Resources` of its own.
+3. **Role objects:** an old `/Info`, `/Metadata`, `/Extensions` or `/MarkInfo` object, and the AcroForm, `/Fields` and `/Annots` arrays, keep their relaxed rule only while the new revision still points to them.
+4. **New signature fields:**
+   - A new field carrying `/A`, `/AA`, `/OC` or `/Parent` is `Other`. `/MK` is allowed.
+   - Catalog `/Version`, `/Extensions`, `/MarkInfo` and an XMP `/Metadata` stream count as `LtaUpdates`, as in pyHanko.
+5. **Trust:** `trusted` requires `intact && signature_valid`, and is `None` without trust anchors.
+   - Trust problems (`WeakAlgorithm` for SHA-1, MD5 or RSA < 2048 in the path) appear in `problems`, so `is_valid()` is false for them.
+   - Path building is bounded and covers RFC 5280 basics. There is no revocation and no network.
+6. **CMS:**
+   - The certificates `[0]` SET is DER-sorted (brief §4.3), and the signer is found through IssuerAndSerialNumber.
+   - `verify_detached` requires eContentType id-data, which is stricter than pyHanko.
+   - PKCS#12 files in indefinite-length BER (some Windows and Java exports) are not supported yet.
+7. **Node API:**
+   - `verifySignatures` is async only.
+   - The verify option is named `extraCertificates`.
+   - `ExternalSigner.sign(tbs, digest, digestAlgorithm)` may return an `ArrayBuffer` (WebCrypto).
+   - `signPdf` retries placeholder overflow once, using `details.needed`, only when the caller set `contentsReserve`.
+   - The first `finish`/`embedCms` call consumes a `PreparedSignature`; keep `serialize()` bytes to retry.
+   - `LocalSigner` supports `close()`/`using`.
+   - Report objects use the core serde JSON shape, except that certificate `der` is a Buffer.
+8. **Hardening limits:** the number of signature reports and the revisions analysed are bounded, as are the field-tree name lengths. The verify cost is linear in file size times a bounded signature count.
+9. **`/SigFlags`:** every `/SigFlags` change after a signature is `Other`, matching pyHanko's strict comparison. Folioxide sets it only while no field is signed, so sequential signing never trips it.
+10. **Remaining residuals, documented:** names used inside a nested form XObject of a signed appearance stream are not read, and neither are names a viewer looks up in `/DR` after missing them in a stream's own `/Resources`. **M4 QA must include an independent adversarial pass on the classifier**, because the M3 round-5 expert pass was cut short.
+

@@ -12,6 +12,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4.13"
 folioxide-syntax = { path = "../crates/folioxide-syntax" }
+# fuzz_cms_parse and fuzz_verify (M3 WP3.3A).
+folioxide-model = { path = "../crates/folioxide-model" }
+folioxide-sign = { path = "../crates/folioxide-sign" }
 # `exercise` (open, resolve, decode, page count) for fuzz_parse_document. Test support only.
 folioxide-testkit = { path = "../crates/folioxide-testkit" }
 
@@ -43,6 +46,20 @@ bench = false
 [[bin]]
 name = "fuzz_parse_document_default_limits"
 path = "fuzz_targets/fuzz_parse_document_default_limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cms_parse"
+path = "fuzz_targets/fuzz_cms_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_verify"
+path = "fuzz_targets/fuzz_verify.rs"
 test = false
 doc = false
 bench = false

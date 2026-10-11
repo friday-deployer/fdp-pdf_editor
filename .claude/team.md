@@ -67,4 +67,7 @@ A milestone may only be committed with zero open Blockers/Majors.
 - **M1:** prefer designs that are linear **by construction** (non-overlapping coverage) over budgets and cutoffs. Budgets produced a chain of new edge cases, and three patches in a row each introduced a regression.
 - **M1:** when two consecutive fix rounds introduce regressions, stop patching. The manager decides on a simpler design, with the expert, before the next round.
 - **M1:** the expert's differential probes (our store against pikepdf/qpdf on crafted files) were the most effective QA tool for the syntax layer. Reuse them, and keep them in `/tmp` or the scratchpad, never in the repo.
+- **M3:** security classifiers (for example "what changed after signing") must be **whitelist-based** from day one. Emulating a reference validator rule by rule produced a new bypass in every QA round, and so did "safe" exceptions such as `/DA` added when fields have appearances. Each stricter-than-reference result gets a corpus case and a deliberate-difference row, so the oracle keeps confirming it.
+- **M3:** expert design briefs that fix the reference behaviour up front (pyHanko) paid off. The QA rounds found policy gaps, not misunderstandings.
+- **M3:** adversarial reviewers sometimes stop partway (a safety filter on attack-crafting). The manager then runs the gates and an end-to-end check personally, and schedules the missing pass for the next milestone's QA.
 

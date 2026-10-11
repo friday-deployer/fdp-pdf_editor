@@ -5,9 +5,10 @@
 //! - **Synchronous methods** run on the JavaScript thread. They never wait for the lock: while an
 //!   asynchronous method has the document (from the call until its work is done), they throw
 //!   [`E_BUSY`](crate::error::E_BUSY) at once, so the event loop is never blocked.
-//! - **Asynchronous methods** (`openAsync`, `saveAsync`, `saveIncrementalAsync`) return a
-//!   promise of a napi-rs [`AsyncTask`]: the work runs on the libuv thread pool, which takes the
-//!   lock inside [`Task::compute`]. Two of them on one document run one after the other.
+//! - **Asynchronous methods** (`openAsync`, `saveAsync`, `saveIncrementalAsync`, and the
+//!   signing methods `prepareSignatureAsync` and `verifySignatures` of the `sign` module) return
+//!   a promise of a napi-rs [`AsyncTask`]: the work runs on the libuv thread pool, which takes
+//!   the lock inside [`Task::compute`]. Two of them on one document run one after the other.
 //!
 //! "Has the document" is counted from the call, not from when the pool thread takes the lock,
 //! so that a synchronous call right after `saveAsync()` throws `E_BUSY` deterministically
@@ -42,7 +43,7 @@ use crate::dto::{
 use crate::error::{self, BindingError, busy, closed, from_core, invalid_argument};
 
 /// What a `PdfDocument` and its asynchronous tasks share.
-struct Shared {
+pub(crate) struct Shared {
     /// The document; `None` once it was closed (or its JavaScript object finalized) and no
     /// asynchronous operation needs it any more. Locked by synchronous methods with `try_lock`
     /// and by asynchronous tasks on the thread pool.
@@ -70,7 +71,7 @@ impl Shared {
     /// it). A poisoned lock is taken over: the core never panics on its data, and a panic in
     /// one operation leaves the document as consistent as any `&mut` method that returned an
     /// error.
-    fn lock(&self) -> MutexGuard<'_, Option<Document>> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Option<Document>> {
         self.doc.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -90,7 +91,7 @@ impl Shared {
 
     /// Brings the report up to date after an asynchronous operation, if the document is free
     /// (a task running on it reports when it resolves). JavaScript thread only.
-    fn report_if_free(&self, env: &Env) {
+    pub(crate) fn report_if_free(&self, env: &Env) {
         let estimate = match self.doc.try_lock() {
             Ok(guard) => guard.as_ref().map(memory_estimate),
             Err(TryLockError::Poisoned(poisoned)) => {
@@ -147,7 +148,7 @@ fn memory_estimate(doc: &Document) -> u64 {
 /// its creation (on the JavaScript thread) until it is dropped, which [`SaveTask::compute`] does
 /// right after its work, or the task's own drop when the work never ran. The last one to end
 /// after the document was closed drops it.
-struct Pending(Arc<Shared>);
+pub(crate) struct Pending(Arc<Shared>);
 
 impl Pending {
     fn new(shared: &Arc<Shared>) -> Pending {
@@ -186,7 +187,7 @@ impl ObjectFinalize for PdfDocument {
 }
 
 impl PdfDocument {
-    fn new(doc: Document) -> PdfDocument {
+    pub(crate) fn new(doc: Document) -> PdfDocument {
         PdfDocument {
             shared: Shared::new(doc),
         }
@@ -202,7 +203,7 @@ impl PdfDocument {
 
     /// The document for a synchronous method: `E_CLOSED` once it was closed, `E_BUSY` while an
     /// asynchronous operation has it, never a wait.
-    fn try_lock(&self) -> Result<MutexGuard<'_, Option<Document>>, BindingError> {
+    pub(crate) fn try_lock(&self) -> Result<MutexGuard<'_, Option<Document>>, BindingError> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(closed());
         }
@@ -218,7 +219,7 @@ impl PdfDocument {
 
     /// Runs a read-only core operation on the document, then reports its memory (reading
     /// caches what it read).
-    fn read<T>(
+    pub(crate) fn read<T>(
         &self,
         env: &Env,
         op: impl FnOnce(&Document) -> folioxide::Result<T>,
@@ -243,14 +244,22 @@ impl PdfDocument {
         result
     }
 
-    /// A task that saves the document on the thread pool: `E_CLOSED` once it was closed.
-    fn save_task(&self, job: SaveJob) -> Result<AsyncTask<SaveTask>, BindingError> {
+    /// What an asynchronous task on the document needs: the shared state, and the [`Pending`]
+    /// guard that marks the document busy from now until the task's work is done (the task
+    /// drops it at the end of `compute`). `E_CLOSED` once the document was closed.
+    pub(crate) fn start_task(&self) -> Result<(Arc<Shared>, Pending), BindingError> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(closed());
         }
+        Ok((Arc::clone(&self.shared), Pending::new(&self.shared)))
+    }
+
+    /// A task that saves the document on the thread pool: `E_CLOSED` once it was closed.
+    fn save_task(&self, job: SaveJob) -> Result<AsyncTask<SaveTask>, BindingError> {
+        let (shared, pending) = self.start_task()?;
         Ok(AsyncTask::new(SaveTask {
-            pending: Some(Pending::new(&self.shared)),
-            shared: Arc::clone(&self.shared),
+            pending: Some(pending),
+            shared,
             job,
         }))
     }
@@ -277,7 +286,7 @@ impl PdfDocument {
         let options = options.unwrap_or_default().into_core();
         Document::open(data.to_vec(), &options)
             .map(|doc| PdfDocument::reported(&env, doc))
-            .map_err(|err| from_core(&err))
+            .map_err(|err| from_core(&err.into()))
     }
 
     /// Like `open`, on the libuv thread pool: the bytes are copied before it returns, so the
@@ -327,7 +336,7 @@ impl PdfDocument {
     /// The number of pages (the pages the page tree really has, not its `/Count`).
     #[napi(getter)]
     pub fn page_count(&self, env: Env) -> Result<u32, BindingError> {
-        let count = self.read(&env, |doc| doc.page_count())?;
+        let count = self.read(&env, |doc| Ok(doc.page_count()?))?;
         u32::try_from(count).map_err(|_| {
             error::with_code(
                 folioxide::ErrorCode::LimitExceeded,
@@ -376,7 +385,7 @@ impl PdfDocument {
     /// document does not have are left out.
     #[napi]
     pub fn get_info(&self, env: Env) -> Result<DocInfo, BindingError> {
-        self.read(&env, |doc| doc.info().map(DocInfo::from))
+        self.read(&env, |doc| Ok(doc.info().map(DocInfo::from)?))
     }
 
     /// Changes the document information dictionary: in `update`, a field that is absent keeps
@@ -388,7 +397,7 @@ impl PdfDocument {
     #[napi]
     pub fn set_info(&self, env: Env, update: InfoUpdate) -> Result<(), BindingError> {
         let update = update.into_core()?;
-        self.edit(&env, |doc| doc.set_info(&update))
+        self.edit(&env, |doc| Ok(doc.set_info(&update)?))
     }
 
     /// Sets the rotation of the page at `index` to `degrees` clockwise: a multiple of 90,
@@ -403,7 +412,7 @@ impl PdfDocument {
     ) -> Result<(), BindingError> {
         let index = dto::page_index(index)?;
         let rotation = dto::rotation(degrees)?;
-        self.edit(&env, |doc| doc.set_rotation(index, rotation))
+        self.edit(&env, |doc| Ok(doc.set_rotation(index, rotation)?))
     }
 
     /// Sets the media box or the crop box of the page at `index`, written on the page itself.
@@ -426,11 +435,13 @@ impl PdfDocument {
             Either::B(Null) => None,
         };
         match (PageBox::parse(&kind)?, rect) {
-            (PageBox::Media, Some(rect)) => self.edit(&env, |doc| doc.set_media_box(index, rect)),
+            (PageBox::Media, Some(rect)) => {
+                self.edit(&env, |doc| Ok(doc.set_media_box(index, rect)?))
+            }
             (PageBox::Media, None) => Err(invalid_argument(
                 "a page must have a media box: setPageBox(i, 'media', null) is not allowed",
             )),
-            (PageBox::Crop, rect) => self.edit(&env, |doc| doc.set_crop_box(index, rect)),
+            (PageBox::Crop, rect) => self.edit(&env, |doc| Ok(doc.set_crop_box(index, rect)?)),
         }
     }
 
@@ -440,7 +451,8 @@ impl PdfDocument {
     #[napi]
     pub fn save(&self, env: Env, options: Option<SaveOptions>) -> Result<Buffer, BindingError> {
         let options = options.unwrap_or_default().into_core()?;
-        self.read(&env, |doc| doc.save(&options)).map(Buffer::from)
+        self.read(&env, |doc| Ok(doc.save(&options)?))
+            .map(Buffer::from)
     }
 
     /// Like `save`, on the libuv thread pool.
@@ -492,9 +504,9 @@ fn save_incremental(
     suffix_only: bool,
 ) -> folioxide::Result<Vec<u8>> {
     if suffix_only {
-        doc.incremental_suffix(options)
+        Ok(doc.incremental_suffix(options)?)
     } else {
-        doc.save_incremental(options)
+        Ok(doc.save_incremental(options)?)
     }
 }
 
@@ -510,10 +522,7 @@ impl Task for OpenTask {
     type JsValue = PdfDocument;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        Ok(Document::open(
-            std::mem::take(&mut self.data),
-            &self.options,
-        ))
+        Ok(Document::open(std::mem::take(&mut self.data), &self.options).map_err(Into::into))
     }
 
     fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
@@ -560,7 +569,9 @@ impl Task for SaveTask {
             let guard = self.shared.lock();
             match (guard.as_ref(), &self.job) {
                 (None, _) => Err(SaveError::Closed),
-                (Some(doc), SaveJob::Full(options)) => doc.save(options).map_err(SaveError::Core),
+                (Some(doc), SaveJob::Full(options)) => {
+                    doc.save(options).map_err(|err| SaveError::Core(err.into()))
+                }
                 (
                     Some(doc),
                     SaveJob::Incremental {

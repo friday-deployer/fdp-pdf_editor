@@ -10,6 +10,88 @@
 export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-wasip1'
 
 /**
+ * A private key held in memory with its certificate chain, loaded from PKCS#12 or PEM.
+ *
+ * RSA signatures use the blinded path; on servers where an attacker can time many signatures,
+ * prefer ECDSA keys or an external signer (KMS, HSM), because the `rsa` crate has an
+ * unpatched timing advisory (RUSTSEC-2023-0071).
+ *
+ * **Key hygiene.** The key is held in memory that is wiped when it is dropped: at `close()`, or
+ * when the object is garbage-collected if that comes first (a `signAsync` already running
+ * keeps it until it is done). The binding wipes its own copies of the password and of the PEM
+ * key once the key is loaded, but cannot wipe what JavaScript holds: strings are immutable and
+ * garbage-collected. To keep a secret out of the JavaScript heap as a string, pass it as a
+ * `Uint8Array` (UTF-8) and `fill(0)` it after loading. `p12-keystore` keeps an unwiped copy of
+ * a PKCS#12 key while the file is loaded; it is dropped before `fromPkcs12` returns.
+ */
+export declare class LocalSigner {
+  /**
+   * Loads the key and its certificate chain from a PKCS#12 (`.p12`, `.pfx`) file. The MAC is
+   * checked before anything is decrypted; modern (AES) and legacy (3DES, RC2-40) files load.
+   * The password is a string or its UTF-8 bytes.
+   *
+   * Throws `E_WRONG_PASSWORD` for a wrong password, `E_UNSUPPORTED` for an unsupported
+   * encryption scheme, `E_KEY_LOAD` for anything else (no key, a corrupt file, a key that
+   * does not match its certificate, an RSA key below 2048 bits, excessive key-derivation
+   * parameters), `E_INVALID_ARGUMENT` for a password that is not UTF-8. Messages never
+   * contain the password.
+   */
+  static fromPkcs12(data: Uint8Array, password: string | Uint8Array): LocalSigner
+  /**
+   * Loads the key from PEM (`PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`, `RSA PRIVATE KEY` or
+   * `EC PRIVATE KEY`) and the certificates from one or more `CERTIFICATE` blocks; the
+   * certificate that matches the key is put first. The key and its password are strings or
+   * their UTF-8 bytes.
+   *
+   * Throws `E_PASSWORD_REQUIRED` for an encrypted key without a password,
+   * `E_WRONG_PASSWORD` when it does not decrypt, `E_CERTIFICATE` when the certificates do not
+   * parse, `E_UNSUPPORTED` for legacy OpenSSL encryption or an unsupported key type,
+   * `E_KEY_LOAD` for anything else (no certificate matches the key, an RSA key below 2048
+   * bits, excessive key-derivation parameters), `E_INVALID_ARGUMENT` for bytes that are not
+   * UTF-8.
+   */
+  static fromPem(keyPem: string | Uint8Array, certsPem: string, keyPassword?: string | Uint8Array | undefined | null): LocalSigner
+  /**
+   * Wipes the key from memory now, instead of when the object is garbage-collected. Every
+   * method then throws `E_CLOSED`; a `signAsync` already running finishes first and wipes
+   * the key when it is done. Calling it again does nothing.
+   */
+  close(): void
+  /** Whether `close()` was called. */
+  get isClosed(): boolean
+  /**
+   * The DER certificates: the signer's first, then the intermediates (and the root, when
+   * the file has it).
+   *
+   * Throws `E_CLOSED` after `close()`.
+   */
+  get certificateChain(): Array<Buffer>
+  /**
+   * The signature algorithm of the key.
+   *
+   * Throws `E_CLOSED` after `close()`.
+   */
+  get algorithm(): SigAlg
+  /**
+   * The digest used when none is given: SHA-256 for RSA and P-256 keys, SHA-384 for P-384
+   * keys.
+   *
+   * Throws `E_CLOSED` after `close()`.
+   */
+  get defaultDigest(): DigestAlg
+  /**
+   * Signs `data` (hashing it with `digest`, default `defaultDigest`): RSA PKCS#1 v1.5 (the
+   * modulus length) or ECDSA (a DER `ECDSA-Sig-Value`, deterministic per RFC 6979).
+   *
+   * Throws `E_INVALID_ARGUMENT` for an unknown digest, `E_CRYPTO` when signing fails,
+   * `E_CLOSED` after `close()`.
+   */
+  sign(data: Uint8Array, digest?: DigestAlg): Buffer
+  /** Like `sign`, on the libuv thread pool. */
+  signAsync(data: Uint8Array, digest?: DigestAlg): Promise<Buffer>
+}
+
+/**
  * A PDF document opened from bytes or created empty.
  *
  * Page indices are 0-based. Every error is thrown (or rejected) with `err.code` set to an
@@ -125,7 +207,164 @@ export declare class PdfDocument {
   saveIncremental(options?: IncrementalSaveOptions | undefined | null): Buffer
   /** Like `saveIncremental`, on the libuv thread pool. */
   saveIncrementalAsync(options?: IncrementalSaveOptions | undefined | null): Promise<Buffer>
+  /**
+   * The first phase of signing: builds the incremental update that adds an invisible
+   * signature (the document's pending changes, the field and the signature dictionary with
+   * its placeholders), digests the signed byte ranges and builds the signed attributes. The
+   * document is not changed.
+   *
+   * Sign the returned object's `toBeSigned` (or `toBeSignedDigest`) with the key of the
+   * first certificate, then call its `finish` with the signature value.
+   *
+   * Throws `E_INVALID_ARGUMENT` for invalid options (an empty chain, an algorithm that does
+   * not match the certificate, …), `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` for a
+   * `contentsReserve` below what the CMS needs, `E_UNSUPPORTED` for a document whose
+   * structure was repaired or that has bytes before its header (save it in full first),
+   * `E_DOC_MDP_FORBIDS` for a certified document that allows no changes,
+   * `E_PAGE_OUT_OF_RANGE`, `E_NOT_FOUND`, `E_CERTIFICATE`.
+   */
+  prepareSignature(options: PrepareSignatureOptions): PreparedSignature
+  /** Like `prepareSignature`, on the libuv thread pool. */
+  prepareSignatureAsync(options: PrepareSignatureOptions): Promise<PreparedSignature>
+  /**
+   * Verifies every signature of the document, on the libuv thread pool: one report per
+   * signature dictionary, in signing order, dictionaries no field refers to last.
+   *
+   * Rejects with `E_INVALID_ARGUMENT` when the document has unsaved changes (verify the
+   * saved file) or an option is invalid.
+   */
+  verifySignatures(options?: VerifyOptions | undefined | null): Promise<Array<SignatureReport>>
 }
+
+/**
+ * A prepared signature: the file with the placeholders, and the bytes to sign.
+ *
+ * Sign `toBeSigned` (or `toBeSignedDigest`) with the signer's key, then call `finish` with the
+ * signature value (or `embedCms` with a whole CMS): either returns the signed file. The first
+ * of `finish`, `finishAsync`, `embedCms` and `embedCmsAsync` **that succeeds** takes the
+ * prepared file; a later call throws `E_INVALID_ARGUMENT`. A refused value or CMS leaves it as
+ * it was, so the caller can try again with a corrected one. While `finishAsync` or
+ * `embedCmsAsync` runs, the other three and `serialize` throw `E_BUSY`.
+ */
+export declare class PreparedSignature {
+  /**
+   * Reads the form `serialize` writes (the core's versioned binary form) and checks every
+   * invariant again: the file, the byte range and the signed attributes must be unchanged.
+   *
+   * Throws `E_INVALID_ARGUMENT` for bytes that are not a serialized prepared signature of
+   * this version, or that were changed; `E_CERTIFICATE` or `E_UNSUPPORTED` for a signer
+   * certificate that does not parse or has an unsupported key.
+   */
+  static deserialize(data: Uint8Array): PreparedSignature
+  /**
+   * The bytes to sign: the DER signed attributes (RFC 5652 §5.4, universal `SET` tag), for
+   * "sign message" APIs that hash themselves (`node:crypto` `sign`, WebCrypto, KMS `RAW`).
+   */
+  get toBeSigned(): Buffer
+  /** The digest of `toBeSigned` with `digestAlgorithm`, for "sign digest" HSM and KMS APIs. */
+  get toBeSignedDigest(): Buffer
+  /**
+   * The DER `DigestInfo` of `toBeSignedDigest` (RFC 8017 §9.2), for raw RSA signing
+   * (PKCS#11 `CKM_RSA_PKCS`).
+   */
+  get toBeSignedDigestInfo(): Buffer
+  /** The digest algorithm the signature uses. */
+  get digestAlgorithm(): DigestAlg
+  /** The signature algorithm of the signer's key. */
+  get algorithm(): SigAlg
+  /** The `/SubFilter` of the signature dictionary. */
+  get subFilter(): SubFilter
+  /** The bytes of DER the `/Contents` placeholder holds. */
+  get contentsCapacity(): number
+  /**
+   * `[0, a, b, c]`: the signed byte ranges `[0, a)` and `[b, b + c)` of the finished file;
+   * `[a, b)` is the `/Contents` hexadecimal string.
+   */
+  get byteRange(): Array<number>
+  /**
+   * Observations from preparing, for example an AcroForm `/NeedAppearances true` left as it
+   * is.
+   */
+  get warnings(): Array<string>
+  /**
+   * Whether `finish`, `finishAsync`, `embedCms` or `embedCmsAsync` succeeded (and took the
+   * prepared file).
+   */
+  get isFinished(): boolean
+  /**
+   * Finishes the file with `signature`, the signature value over `toBeSigned`: returns the
+   * signed PDF. RSA: the modulus length; ECDSA: DER or IEEE P1363 (`r || s`). The value is
+   * verified with the signer certificate before it is embedded. A refused value leaves the
+   * prepared signature as it was: call `finish` again with the right one.
+   *
+   * Throws `E_SIGNATURE_INVALID` when the value does not verify (another key, another
+   * digest, other bytes), `E_INVALID_ARGUMENT` when a finish succeeded already, `E_BUSY`
+   * while `finishAsync` or `embedCmsAsync` runs.
+   */
+  finish(signature: Uint8Array): Buffer
+  /**
+   * Like `finish`, on the libuv thread pool. Until it settles, the other finishing methods
+   * and `serialize` throw `E_BUSY`.
+   */
+  finishAsync(signature: Uint8Array): Promise<Buffer>
+  /**
+   * Finishes the file with `cms`, a whole CMS `ContentInfo` (DER) that a signing service
+   * made over the prepared byte ranges: returns the signed PDF. The CMS must sign exactly
+   * these bytes, with one signer whose signature verifies; for `'ETSI.CAdES.detached'` it
+   * must also meet PAdES baseline B-B. A refused CMS leaves the prepared signature as it was.
+   *
+   * Throws `E_SIGNATURE_INVALID` when it signs other bytes or does not verify,
+   * `E_INVALID_ARGUMENT` when it is not such a CMS or a finish succeeded already,
+   * `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` (with `details.needed`) when it is larger than
+   * `contentsCapacity`, `E_BUSY` while `finishAsync` or `embedCmsAsync` runs.
+   */
+  embedCms(cms: Uint8Array): Buffer
+  /**
+   * Like `embedCms`, on the libuv thread pool. Until it settles, the other finishing
+   * methods and `serialize` throw `E_BUSY`.
+   */
+  embedCmsAsync(cms: Uint8Array): Promise<Buffer>
+  /**
+   * The prepared signature in the core's versioned binary form (magic `FXPS`, version 1),
+   * to finish it later or in another process with `PreparedSignature.deserialize`. It holds
+   * the whole prepared file.
+   *
+   * Throws `E_INVALID_ARGUMENT` when a finish succeeded already, `E_BUSY` while
+   * `finishAsync` or `embedCmsAsync` runs.
+   */
+  serialize(): Buffer
+}
+
+/** Information about an X.509 certificate (RFC 5280). */
+export interface CertificateInfo {
+  /** The subject as RFC 4514 text, most specific first (`"CN=…,OU=…,O=…"`). */
+  subject: string
+  /** The issuer, in the same form. */
+  issuer: string
+  /** The subject's common name (`CN`). */
+  commonName: string | null
+  /** The serial number, uppercase hexadecimal. */
+  serialHex: string
+  /** The start of the validity period, RFC 3339 UTC. */
+  notBefore: string
+  /** The end of the validity period, RFC 3339 UTC. */
+  notAfter: string
+  /** The SHA-256 fingerprint of the DER, lowercase hexadecimal. */
+  sha256Hex: string
+  /** The public key. */
+  key: KeyDescription
+  /** The key usages by their RFC 5280 names (`"digitalSignature"`, `"nonRepudiation"`, …). */
+  keyUsage: Array<string>
+  /** The extended key usages, as dotted OIDs. */
+  extKeyUsage: Array<string>
+  /** Whether the certificate is a CA certificate (basicConstraints `cA`). */
+  isCa: boolean
+  /** The certificate's DER. */
+  der: Buffer
+}
+
+/** How much of the file a signature's byte ranges cover (pyHanko's `SignatureCoverageLevel`). */
+export type Coverage = 'entireFile' | 'entireRevision' | 'contiguousBlockFromStart' | 'unclear'
 
 /**
  * A record of one repair or leniency decision made while reading the document (the core
@@ -145,6 +384,9 @@ export interface Diagnostic {
   /** A human-readable description. */
   message: string
 }
+
+/** A digest algorithm for signing. */
+export type DigestAlg = 'sha256' | 'sha384' | 'sha512'
 
 /**
  * The document information dictionary (§14.3.3), decoded (the core `DocInfo`).
@@ -175,6 +417,9 @@ export interface DocInfo {
   /** Every other entry whose value is a text string, by key (the name without its `/`). */
   custom: Record<string, string>
 }
+
+/** Whether a signature uses an existing signature field, creates one, or either. */
+export type FieldMode = 'createOrUse' | 'existingOnly' | 'createOnly'
 
 /** Options for an incremental save (`saveIncremental`, `saveIncrementalAsync`). */
 export interface IncrementalSaveOptions {
@@ -232,6 +477,30 @@ export interface InfoUpdate {
   custom?: Record<string, string | null>
 }
 
+/** A certificate's public key. */
+export interface KeyDescription {
+  /** `"rsa"` or `"ec"`; for other keys, the dotted OID of the key algorithm. */
+  algorithm: string
+  /** The key size in bits (the RSA modulus or the curve's field size); 0 when unknown. */
+  bits: number
+  /** For EC keys, the curve: `"P-256"`, `"P-384"`, or a dotted OID. */
+  curve: string | null
+}
+
+/**
+ * What the revisions appended after a signature changed (pyHanko's `ModificationLevel`),
+ * from harmless to anything.
+ */
+export type ModificationLevel = 'none' | 'ltaUpdates' | 'formFilling' | 'annotations' | 'other'
+
+/** An indirect object's identifier (§7.3.10): `{ num, gen }`. */
+export interface ObjectRef {
+  /** The object number. */
+  num: number
+  /** The generation number (`gen`). */
+  gen: number
+}
+
 /** Options for `PdfDocument.open` and `PdfDocument.openAsync`. */
 export interface OpenOptions {
   /**
@@ -240,6 +509,9 @@ export interface OpenOptions {
    */
   strict?: boolean
 }
+
+/** The PAdES baseline level a signature meets (ETSI EN 319 142-1 §6). */
+export type PadesLevel = 'B-B'
 
 /** The page box `setPageBox` changes. */
 export type PageBox = 'media' | 'crop'
@@ -277,6 +549,42 @@ export interface PageInfo {
  * A date whose offset from UT is unknown has no offset in the result (a local date-time).
  */
 export declare function pdfDateToIso(text: string): string | null
+
+/** Options for `prepareSignature` and `prepareSignatureAsync` (the core `PrepareRequest`). */
+export interface PrepareSignatureOptions {
+  /**
+   * The certificates: the signer's first, then the intermediates (the root is optional).
+   * Each entry is a DER certificate, or PEM text with one or more certificates.
+   */
+  certificateChain: Array<Uint8Array>
+  /** The signature algorithm of the signer's key. */
+  algorithm: SigAlg
+  /** The digest algorithm. Default: SHA-256 for RSA and P-256 keys, SHA-384 for P-384 keys. */
+  digest?: DigestAlg
+  /**
+   * The claimed signing time `/M`, a PDF date string (the facade also takes a `Date`, and
+   * defaults to now).
+   */
+  signingTime: string
+  /** Which signature field to sign or create. Default: a new field on the first page. */
+  field?: SignatureFieldSpec
+  /** The `/SubFilter`. Default `'ETSI.CAdES.detached'`. */
+  subFilter?: SubFilter
+  /** `/Name`: the signer's name. */
+  name?: string
+  /** `/Reason`: why the document is signed. */
+  reason?: string
+  /** `/Location`: where it is signed. */
+  location?: string
+  /** `/ContactInfo`: how to reach the signer. */
+  contactInfo?: string
+  /**
+   * The bytes of DER the `/Contents` placeholder holds. Default: the exact size of the CMS
+   * plus a margin, at least 8192. A value below what the CMS needs throws
+   * `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` with `details.needed`.
+   */
+  contentsReserve?: number
+}
 
 /**
  * A rectangle in default user space (ISO 32000-2 §7.9.5), in PDF points: the core `Rect`.
@@ -329,11 +637,145 @@ export interface SaveOptions {
   flateLevel?: number
 }
 
+/**
+ * A signature algorithm: RSASSA-PKCS1-v1_5 (RFC 8017 §8.2) or ECDSA on P-256 or P-384 (the
+ * curve comes from the certificate).
+ */
+export type SigAlg = 'rsa-pkcs1v15' | 'ecdsa'
+
+/** Which signature field to sign or create (the core `FieldSpec`). */
+export interface SignatureFieldSpec {
+  /**
+   * The field name: an existing field's fully qualified name, or a new field's partial name
+   * (no `.`). Default: a new field `Signature1`, `Signature2`, … (the first free name).
+   */
+  name?: string
+  /** The 0-based index of the page that holds a new field's widget. Default 0. */
+  page?: number
+  /** Whether an existing field may be used and a new one created. Default `'createOrUse'`. */
+  mode?: FieldMode
+}
+
+/** What a signature dictionary is. */
+export type SignatureKind = 'signature' | 'docTimeStamp'
+
+/** Why a signature is not valid: a stable `camelCase` code and a message. */
+export interface SignatureProblem {
+  /** The category, for example `"digestMismatch"` or `"gapNotContents"`. */
+  code: string
+  /** What exactly was wrong, in English. */
+  message: string
+}
+
+/**
+ * The verification result of one signature dictionary (the core `SignatureReport`).
+ *
+ * `intact`, `signatureValid`, `trusted`, `coverage` and `modification` use pyHanko 0.37's
+ * vocabulary and are never more lenient than it (they agree with it except in the M3 brief's
+ * deliberate differences, where Folioxide is stricter); the signature is valid exactly when
+ * `byteRangeOk`, `intact` and `signatureValid` are true, `fieldName` is set, `problems` is empty
+ * and `coverage` is `'entireFile'` or `'entireRevision'`.
+ */
+export interface SignatureReport {
+  /**
+   * The fully qualified name of the signature field; `null` for a signature dictionary no
+   * field refers to (problem `orphan`).
+   */
+  fieldName: string | null
+  /** A signature or a document timestamp. */
+  kind: SignatureKind
+  /** The signature dictionary's object. */
+  sigObject: ObjectRef
+  /** The `/SubFilter`, for example `"ETSI.CAdES.detached"`. */
+  subFilter: string | null
+  /** The `/ByteRange` as written; `null` when it is missing or not an array of integers. */
+  byteRange: Array<number> | null
+  /**
+   * The byte range is sound: four integers from 0, inside the file, whose gap is exactly this
+   * dictionary's `/Contents`, in an uncompressed dictionary inside the signed bytes.
+   */
+  byteRangeOk: boolean
+  /** The digest of the signed bytes equals the CMS message digest. */
+  intact: boolean
+  /** The CMS signature verifies with the signer certificate. */
+  signatureValid: boolean
+  /** How much of the file the byte ranges cover. */
+  coverage: Coverage
+  /** The index (oldest first) of the revision the signature covers. */
+  signedRevision: number | null
+  /** What later revisions changed. */
+  modification: ModificationLevel
+  /**
+   * The objects later revisions list, sorted: at most 1,024 of them (the first by object
+   * number), with a warning giving the full count when there are more.
+   */
+  changedObjects: Array<ObjectRef>
+  /** The digest algorithm, for example `"sha256"`. */
+  digestAlgorithm: string | null
+  /** The signature algorithm, for example `"sha256WithRSAEncryption"`. */
+  signatureAlgorithm: string | null
+  /** The signer certificate. */
+  signer: CertificateInfo | null
+  /** Every certificate of the CMS, in file order. */
+  chain: Array<CertificateInfo>
+  /** Whether a certification path to a trust anchor validates; `null` without anchors. */
+  trusted: boolean | null
+  /** The claimed signing time `/M`, RFC 3339. */
+  claimedTime: string | null
+  /** `/Name`. */
+  name: string | null
+  /** `/Reason`. */
+  reason: string | null
+  /** `/Location`. */
+  location: string | null
+  /** `/ContactInfo`. */
+  contactInfo: string | null
+  /** The PAdES baseline level the signature meets. */
+  padesLevel: PadesLevel | null
+  /** For a certification signature, its DocMDP permissions `P` (1–3). */
+  docmdp: number | null
+  /**
+   * Whether later revisions respect the DocMDP permissions; `null` until certification
+   * signatures are supported.
+   */
+  docmdpOk: boolean | null
+  /** Why the signature is not valid; empty when nothing is wrong. */
+  problems: Array<SignatureProblem>
+  /** Observations that do not make the signature invalid. */
+  warnings: Array<string>
+}
+
 /** How a full save writes stream data. */
 export type StreamCompression = 'keep' | 'compressNew' | 'recompress'
 
+/**
+ * The `/SubFilter` of a signature dictionary (ISO 32000-2 §12.8.3.1, Table 260). Folioxide
+ * writes the same CMS (PAdES baseline B-B signed attributes) for both.
+ */
+export type SubFilter = 'ETSI.CAdES.detached' | 'adbe.pkcs7.detached'
+
 /** The `/Trapped` entry of the document information dictionary (§14.3.3). */
 export type Trapped = 'true' | 'false' | 'unknown'
+
+/** Options for `verifySignatures` (the core `VerifyOptions`). */
+export interface VerifyOptions {
+  /**
+   * Trusted root certificates (DER, or PEM text). Without any, `trusted` is `null` in every
+   * report.
+   */
+  trustAnchors?: Array<Uint8Array>
+  /**
+   * More certificates (DER, or PEM text) for finding signers and building certification
+   * paths, besides those the signatures carry.
+   */
+  extraCertificates?: Array<Uint8Array>
+  /**
+   * The time at which certificates must be valid, a PDF date string (the facade also takes
+   * a `Date`, and defaults to now). Absent: the signer's claimed signing time, with a
+   * warning in each report.
+   */
+  validationTime?: string
+}
 
 /**
  * Returns the version of the native Folioxide library, for example `"0.1.0"`.

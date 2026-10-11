@@ -778,10 +778,20 @@ function __napiStampBindingTarget(exportsObject, target) {
 // linked import resolves to `undefined`.
 module.exports.__napiBindingTarget = __napiStampBindingTarget(nativeBinding, __napiLoadedBindingTarget)
 module.exports = nativeBinding
+module.exports.LocalSigner = nativeBinding.LocalSigner
 module.exports.PdfDocument = nativeBinding.PdfDocument
+module.exports.PreparedSignature = nativeBinding.PreparedSignature
+module.exports.Coverage = nativeBinding.Coverage
+module.exports.DigestAlg = nativeBinding.DigestAlg
+module.exports.FieldMode = nativeBinding.FieldMode
+module.exports.ModificationLevel = nativeBinding.ModificationLevel
+module.exports.PadesLevel = nativeBinding.PadesLevel
 module.exports.PageBox = nativeBinding.PageBox
 module.exports.pdfDateToIso = nativeBinding.pdfDateToIso
+module.exports.SigAlg = nativeBinding.SigAlg
+module.exports.SignatureKind = nativeBinding.SignatureKind
 module.exports.StreamCompression = nativeBinding.StreamCompression
+module.exports.SubFilter = nativeBinding.SubFilter
 module.exports.Trapped = nativeBinding.Trapped
 module.exports.version = nativeBinding.version
 module.exports.XrefStyle = nativeBinding.XrefStyle

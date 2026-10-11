@@ -61,6 +61,34 @@ miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-a
 # default `fork`/`timeout` features, which pull in rusty-fork and tempfile.
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
+# Signatures (M3 WP3.0, brief §2 stage 0; ARCHITECTURE §A.5). The rest of the RustCrypto 2026
+# stack: every crate below is on `digest` 0.11, `der` 0.8, `spki` 0.8 and `rand_core` 0.10, so it
+# shares one graph with the M0 pins above (`cargo tree -i cms` stays single). All are MIT OR
+# Apache-2.0 and need Rust <= 1.87. None of their types appears in a public signature (gap 5).
+# `oid` gives `AssociatedOid`, which `rsa::pkcs1v15::{SigningKey, VerifyingKey}<D>` require.
+sha2 = { version = "0.11.0", default-features = false, features = ["oid"] }
+# SHA-1 verifies legacy signatures only; Folioxide never signs with it.
+sha1 = { version = "0.11.0", default-features = false, features = ["oid"] }
+# `ecdsa` = RFC 6979 signing and prehash verification; `pkcs8` = PKCS#8 and SEC1 key decoding.
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8"] }
+# `algorithm` = sign and verify; `der` = ECDSA-Sig-Value encoding (DER <-> IEEE P1363).
+ecdsa = { version = "0.17.0", default-features = false, features = ["algorithm", "der", "pkcs8"] }
+# `rand_core` = `RandomizedSigner`, the blinded RSA signing path (brief R-9).
+signature = { version = "3.0.0", default-features = false, features = ["alloc", "rand_core"] }
+# `encryption` = PBES2 `EncryptedPrivateKeyInfo::decrypt` (BEGIN ENCRYPTED PRIVATE KEY).
+pkcs8 = { version = "0.11.0", default-features = false, features = ["encryption", "pem"] }
+# SEC1 `ECPrivateKey` (BEGIN EC PRIVATE KEY).
+sec1 = { version = "0.8.1", default-features = false, features = ["der", "pem"] }
+spki = { version = "0.8.1", default-features = false, features = ["alloc"] }
+const-oid = { version = "0.10.2", default-features = false }
+rand_core = { version = "0.10.1", default-features = false }
+# `sys_rng` = `SysRng`, the default RNG for RSA blinding (brief D-1 / DECISIONS D10). wasm will
+# also need `wasm_js`.
+getrandom = { version = "0.4.3", default-features = false, features = ["sys_rng"] }
+# `Zeroizing` buffers for decrypted key material. Resolves to 1.9.1, already in the graph.
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

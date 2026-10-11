@@ -32,6 +32,32 @@ Expectation entries are matched to signatures by ``field`` when given, otherwise
 (signatures are ordered by the end of their byte range, i.e. in signing order). The number of
 entries must equal the number of signatures.
 
+**A file pyHanko cannot read** (it raises while reading the cross-reference data) gives one
+``signatures.pyhanko`` FAIL row instead of the per-signature pyHanko rows, and the independent
+checks above (structure, ``pdfsig``, OpenSSL, ``pades``) still run for every entry, matched by
+``field``. A case whose file is deliberately unreadable for pyHanko (an attack that a lenient
+reader repairs) lists ``signatures.pyhanko`` in ``knownFailures`` and still has its ``intact`` /
+``valid`` expectation checked by pdfsig and OpenSSL.
+
+**Negative cases** (M3 brief D-3): ``{"field": "Signature1", "rejected": true}`` expects every
+oracle to reject that signature, and takes no other key. It passes when
+
+* pyHanko raises (reading the file, listing its signatures or validating this one), does not
+  list the field, or reports ``intact`` or ``valid`` false for it (``rejected.pyhanko``);
+* ``pdfsig -nocert`` does not print "Signature is Valid." for it (it fails, does not list the
+  field, or prints another verdict; ``rejected.pdfsig``); and
+* the OpenSSL route fails: the CMS and the signed bytes cannot be extracted from the signature
+  dictionary (no usable ``/ByteRange``, a gap that is not a ``<hex>`` string or not the
+  dictionary's own ``/Contents``, a ByteRange that does not start at 0), or
+  ``openssl cms -verify -noverify`` (``ts -verify`` for a document timestamp) fails
+  (``rejected.openssl``).
+
+The structure rows (``byteRange``, ``gap``, ``padding``) are not reported for a rejected entry:
+a failing one counts as an extraction failure. When an expectation list has a rejected entry,
+every entry must name its ``field`` (unless there is only one), and the counts only require
+that the oracles list no more signatures than there are entries (a broken signature may not be
+listed at all).
+
 CLI::
 
     validate_sig.py FILE [--trust-root PEM]... [--json]
@@ -55,8 +81,9 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from extract_cms import (  # noqa: E402
     ExtractionError,
+    ExtractionFailure,
     SignatureBlob,
-    extract,
+    extract_all,
     openssl_ts_verify_signature_timestamp,
     openssl_verify,
     timestamp_token,
@@ -72,6 +99,7 @@ from oracle_common import (  # noqa: E402
     failed,
     first_line,
     import_module,
+    passed,
     print_results,
     run_tool,
     text,
@@ -81,8 +109,11 @@ from pades_profile import check_pades, profile  # noqa: E402
 #: Keys allowed inside one ``signatures[]`` expectation entry.
 SIGNATURE_KEYS = frozenset(
     {"field", "intact", "valid", "trusted", "coverage", "modification", "docmdp", "docmdpOk",
-     "pades", "timestamp"}
+     "pades", "timestamp", "rejected"}
 )
+
+#: The keys a ``"rejected": true`` entry may have besides ``rejected`` (M3 brief D-3).
+REJECTED_KEYS = frozenset({"field", "rejected"})
 
 #: What an entry expects when it does not say: an intact, cryptographically valid signature.
 DEFAULTS = {"intact": True, "valid": True}
@@ -123,6 +154,8 @@ class SigStatus:
     md_algorithm: str | None
     signer: str | None
     byte_range: list[int]
+    #: pyHanko raised while validating this signature (``intact`` and ``valid`` are then false).
+    error: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
@@ -132,7 +165,7 @@ class SigStatus:
             "coverage": d["coverage"], "modification": d["modification"], "docmdp": d["docmdp"],
             "docmdpOk": d["docmdp_ok"], "timestamp": d["timestamp"],
             "timestampValid": d["timestamp_valid"], "mdAlgorithm": d["md_algorithm"],
-            "signer": d["signer"], "byteRange": d["byte_range"],
+            "signer": d["signer"], "byteRange": d["byte_range"], "error": d["error"],
         }
 
 
@@ -161,13 +194,20 @@ def validate(path: Path, trust_roots: list[Path]) -> list[SigStatus]:
     statuses: list[SigStatus] = []
     with captured_logs(*_LOGGERS):
         reader = reader_mod.PdfFileReader(io.BytesIO(path.read_bytes()), strict=False)
-        embedded = sorted(reader.embedded_signatures, key=lambda s: s.byte_range[2] + s.byte_range[3])
+        embedded, broken = _embedded_signatures(reader)
+        embedded.sort(key=lambda s: s.byte_range[2] + s.byte_range[3])
         for i, sig in enumerate(embedded):
             is_ts = sig.sig_object_type == "/DocTimeStamp"
-            if is_ts:
-                status = validation.validate_pdf_timestamp(sig, validation_context=context())
-            else:
-                status = validation.validate_pdf_signature(sig, signer_validation_context=context())
+            try:
+                if is_ts:
+                    status = validation.validate_pdf_timestamp(sig, validation_context=context())
+                else:
+                    status = validation.validate_pdf_signature(sig, signer_validation_context=context())
+            except (ExpectError, OracleEnvError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - pyHanko rejected this signature
+                statuses.append(_failed_status(i, sig, is_ts, f"{type(exc).__name__}: {exc}"))
+                continue
             tst = getattr(status, "timestamp_validity", None)
             level = sig.docmdp_level
             modification = status.modification_level
@@ -191,7 +231,77 @@ def validate(path: Path, trust_roots: list[Path]) -> list[SigStatus]:
                     byte_range=list(sig.byte_range),
                 )
             )
+        # Signatures pyHanko could not even read come last, in field order.
+        statuses.extend(_broken_status(field, error) for field, error in broken)
+    for index, status in enumerate(statuses):
+        status.index = index
     return statuses
+
+
+def _embedded_signatures(reader: Any) -> tuple[list[Any], list[tuple[str | None, str]]]:
+    """pyHanko's ``reader.embedded_signatures``, one signature at a time.
+
+    ``collect_embedded_signatures`` (pdf_embedded.py) builds every ``EmbeddedPdfSignature`` at
+    once, so one unreadable signature (a missing ``/Contents``, garbage CMS) makes the whole file
+    unreadable. This does the same per field: the readable signatures are returned, and every
+    field pyHanko raises on is returned as ``(field name, error)``. Signatures with a SubFilter
+    pyHanko does not know are skipped, as pyHanko skips them.
+    """
+    fields_mod = import_module("pyhanko.sign.fields")
+    embedded_mod = import_module("pyhanko.sign.validation.pdf_embedded")
+    known = {str(sub.value) for sub in fields_mod.SigSeedSubFilter}
+    embedded: list[Any] = []
+    broken: list[tuple[str | None, str]] = []
+    for fq_name, sig_obj, sig_field in fields_mod.enumerate_sig_fields(reader, filled_status=True):
+        try:
+            if str(sig_obj.get_object().get("/SubFilter", None)) not in known:
+                continue
+            sig = embedded_mod.EmbeddedPdfSignature(reader, sig_field, fq_name)
+            _ = sig.signed_revision  # what pyHanko sorts by: the parse that may still fail
+            embedded.append(sig)
+        except (ExpectError, OracleEnvError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - pyHanko rejected this signature
+            broken.append((fq_name, f"{type(exc).__name__}: {exc}"))
+    return embedded, broken
+
+
+def _broken_status(field: str | None, error: str) -> SigStatus:
+    """The status of a signature pyHanko could not read."""
+    return SigStatus(index=-1, field=field, kind="signature", sub_filter=None, intact=False, valid=False,
+                     trusted=False, coverage=None, modification=None, docmdp=None, docmdp_ok=None,
+                     timestamp=False, timestamp_valid=None, md_algorithm=None, signer=None, byte_range=[],
+                     error=error)
+
+
+def _failed_status(index: int, sig: Any, is_ts: bool, error: str) -> SigStatus:
+    """The status of a signature whose validation raised."""
+
+    def attempt(read: Any, default: Any) -> Any:
+        try:
+            return read()
+        except Exception:  # noqa: BLE001 - a broken signature dictionary
+            return default
+
+    return SigStatus(
+        index=index,
+        field=attempt(lambda: sig.field_name, None),
+        kind="timestamp" if is_ts else "signature",
+        sub_filter=attempt(lambda: str(sig.sig_object.get("/SubFilter")), None),
+        intact=False,
+        valid=False,
+        trusted=False,
+        coverage=None,
+        modification=None,
+        docmdp=None,
+        docmdp_ok=None,
+        timestamp=False,
+        timestamp_valid=None,
+        md_algorithm=None,
+        signer=None,
+        byte_range=attempt(lambda: list(sig.byte_range), []),
+        error=error,
+    )
 
 
 @dataclass(frozen=True)
@@ -247,6 +357,11 @@ def _validate_entry(entry: Any, i: int) -> dict[str, Any]:
     unknown = sorted(set(entry) - SIGNATURE_KEYS)
     if unknown:
         raise ExpectError(f"signatures[{i}]: unknown key(s) {unknown}; allowed: {sorted(SIGNATURE_KEYS)}")
+    if "rejected" in entry and not isinstance(entry["rejected"], bool):
+        raise ExpectError(f"signatures[{i}].rejected must be true or false")
+    if entry.get("rejected") and set(entry) - REJECTED_KEYS:
+        raise ExpectError(f"signatures[{i}]: a rejected entry takes only {sorted(REJECTED_KEYS)}, "
+                          f"not {sorted(set(entry) - REJECTED_KEYS)}")
     for key in ("intact", "valid", "trusted", "timestamp"):
         if key in entry and not isinstance(entry[key], bool):
             raise ExpectError(f"signatures[{i}].{key} must be true or false")
@@ -269,27 +384,57 @@ def check_signatures(path: Path, expected: Any, trust_roots: list[Path]) -> list
     entries = [_validate_entry(e, i) for i, e in enumerate(expected)]
     if any("trusted" in e for e in entries) and not trust_roots:
         raise ExpectError("'trusted' needs trust roots: pass --trust-root or set \"trustRoots\" in expect.json")
+    rejected = [bool(e.get("rejected")) for e in entries]
+    if any(rejected) and len(entries) > 1 and not all("field" in e for e in entries):
+        raise ExpectError("with a 'rejected' entry, every signatures[] entry must name its 'field'")
+    all_rejected = bool(entries) and all(rejected)
 
+    # A file pyHanko cannot read is a FAIL (the row ``signatures.pyhanko``), unless every entry
+    # expects a rejection. The independent oracles (structure, pdfsig, OpenSSL) still run on
+    # every entry that is not a rejection, so a case that lists ``signatures.pyhanko`` in
+    # ``knownFailures`` (pyHanko cannot read a deliberately broken file) still has its
+    # ``intact``/``valid`` expectation checked by pdfsig and OpenSSL.
+    pyhanko_error: str | None = None
+    unreadable: CheckResult | None = None
     try:
         statuses = validate(path, trust_roots)
     except (ExpectError, OracleEnvError):
         raise
-    except Exception as exc:  # noqa: BLE001 - a file pyHanko cannot read is a FAIL
-        return [failed("signatures.pyhanko", f"{type(exc).__name__}: {exc}")]
+    except Exception as exc:  # noqa: BLE001
+        statuses, pyhanko_error = [], f"pyHanko cannot read the file: {type(exc).__name__}: {exc}"
+        if not all_rejected:
+            unreadable = failed("signatures.pyhanko", f"{type(exc).__name__}: {exc}")
+    head = [unreadable] if unreadable is not None else []
+    extract_error: str | None = None
     try:
-        blobs = extract(path)
+        blobs, failures = extract_all(path)
     except ExtractionError as exc:
-        return [failed("signatures.extract", str(exc))]
+        if not all_rejected:
+            return head + [failed("signatures.extract", str(exc))]
+        blobs, failures, extract_error = [], [], str(exc)
 
-    results = [
-        compare("signatures.count.pyhanko", len(entries), len(statuses)),
-        compare("signatures.count.fields", len(entries), len(blobs)),
-    ]
-    if len(statuses) != len(entries):
-        return results
+    found = len(blobs) + len(failures)
+    if any(rejected):
+        # A broken signature may not be listed at all; none may be listed beyond the entries.
+        results = head + [
+            CheckResult("signatures.count.pyhanko", len(statuses) <= len(entries),
+                        f"{len(statuses)} listed, at most {len(entries)} expected"),
+            CheckResult("signatures.count.fields", found <= len(entries),
+                        f"{found} listed, at most {len(entries)} expected"),
+        ]
+    elif unreadable is not None:
+        results = head + [compare("signatures.count.fields", len(entries), found)]
+    else:
+        results = [
+            compare("signatures.count.pyhanko", len(entries), len(statuses)),
+            compare("signatures.count.fields", len(entries), found),
+        ]
+        if len(statuses) != len(entries):
+            return results
 
     by_field = {s.field: s for s in statuses}
     blob_by_field = {b.field_name: b for b in blobs}
+    failure_by_field = {f.field_name: f for f in failures}
     try:
         pdfsig_entries: list[PdfsigEntry] | None = pdfsig(path)
         pdfsig_error = ""
@@ -300,6 +445,32 @@ def check_signatures(path: Path, expected: Any, trust_roots: list[Path]) -> list
     with tempfile.TemporaryDirectory(prefix="folioxide-roots-") as tmp:
         ca_bundle = _bundle(trust_roots, Path(tmp))
         for i, entry in enumerate(entries):
+            prefix = f"signatures[{i}]"
+            if entry.get("rejected"):
+                if "field" in entry:
+                    name = entry["field"]
+                else:  # the only entry: whatever the oracles list first
+                    name = (statuses[0].field if statuses else blobs[0].field_name if blobs
+                            else failures[0].field_name if failures else None)
+                results.extend(_check_rejected(
+                    prefix, name, by_field.get(name), pyhanko_error, blob_by_field.get(name),
+                    failure_by_field.get(name), extract_error,
+                    pdfsig_by_field if pdfsig_entries is not None else None, pdfsig_error))
+                continue
+            if unreadable is not None:
+                # No pyHanko status: the independent oracles only, by field (or by position).
+                if "field" in entry:
+                    name = entry["field"]
+                else:
+                    name = blobs[i].field_name if i < len(blobs) else None
+                blob = blob_by_field.get(name)
+                failure = failure_by_field.get(name)
+                kind = "timestamp" if blob is not None and blob.is_doc_timestamp else "signature"
+                results.extend(_check_independent(
+                    prefix, entry, name, kind, blob, ca_bundle,
+                    pdfsig_by_field if pdfsig_entries is not None else None, pdfsig_error,
+                    failure.reason if failure is not None else None))
+                continue
             if "field" in entry:
                 status = by_field.get(entry["field"])
                 if status is None:
@@ -308,52 +479,107 @@ def check_signatures(path: Path, expected: Any, trust_roots: list[Path]) -> list
                     continue
             else:
                 status = statuses[i]
-            prefix = f"signatures[{i}]"
             blob = blob_by_field.get(status.field)
+            failure = failure_by_field.get(status.field)
             results.extend(_check_one(prefix, entry, status, blob, ca_bundle,
-                                      pdfsig_by_field if pdfsig_entries is not None else None, pdfsig_error))
+                                      pdfsig_by_field if pdfsig_entries is not None else None, pdfsig_error,
+                                      failure.reason if failure is not None else None))
     return results
 
 
-def _check_one(
+def _check_rejected(
+    prefix: str,
+    name: str | None,
+    status: SigStatus | None,
+    pyhanko_error: str | None,
+    blob: SignatureBlob | None,
+    failure: ExtractionFailure | None,
+    extract_error: str | None,
+    pdfsig_by_field: dict[str | None, PdfsigEntry] | None,
+    pdfsig_error: str,
+) -> list[CheckResult]:
+    """The rows of a ``"rejected": true`` entry: each oracle must reject the signature (D-3)."""
+    results: list[CheckResult] = []
+
+    # pyHanko: raises, does not list the field, or reports intact/valid false.
+    if pyhanko_error is not None:
+        results.append(passed(f"{prefix}.rejected.pyhanko", pyhanko_error))
+    elif status is None:
+        results.append(passed(f"{prefix}.rejected.pyhanko", f"pyHanko lists no signature field {name!r}"))
+    elif status.error is not None:
+        results.append(passed(f"{prefix}.rejected.pyhanko", f"pyHanko raises: {status.error}"))
+    else:
+        ok = not (status.intact and status.valid)
+        results.append(CheckResult(f"{prefix}.rejected.pyhanko", ok,
+                                   f"intact={status.intact} valid={status.valid}"
+                                   + ("" if ok else "; expected a rejection")))
+
+    # pdfsig: never "Signature is Valid." for this field.
+    if pdfsig_by_field is None:
+        results.append(passed(f"{prefix}.rejected.pdfsig", f"pdfsig fails: {pdfsig_error}"))
+    else:
+        entry = pdfsig_by_field.get(name)
+        if entry is None:
+            results.append(passed(f"{prefix}.rejected.pdfsig", f"pdfsig lists no field {name!r}"))
+        else:
+            results.append(CheckResult(f"{prefix}.rejected.pdfsig", not entry.is_valid,
+                                       f"pdfsig: {entry.validation or 'no validation line'}"
+                                       + ("; expected a rejection" if entry.is_valid else "")))
+
+    # OpenSSL: extraction fails (structurally unusable signature) or the verification fails.
+    label = f"{prefix}.rejected.openssl"
+    if extract_error is not None:
+        results.append(passed(label, f"extraction fails: {extract_error}"))
+    elif failure is not None:
+        results.append(passed(label, f"extraction fails: {failure.reason}"))
+    elif blob is None:
+        results.append(passed(label, f"extract_cms finds no signature dictionary for field {name!r}"))
+    else:
+        broken = [r for r in blob.structure_checks(prefix) if not r.ok and not r.name.endswith(".padding")]
+        if broken:
+            results.append(passed(label, "extraction fails: " + "; ".join(r.detail for r in broken)))
+        else:
+            run = openssl_verify(blob, None, name=label)
+            results.append(CheckResult(label, not run.ok,
+                                       run.detail if not run.ok else f"{run.detail}; expected a rejection"))
+    return results
+
+
+def _check_independent(
     prefix: str,
     entry: dict[str, Any],
-    status: SigStatus,
+    field: str | None,
+    kind: str,
     blob: SignatureBlob | None,
     ca_bundle: Path | None,
     pdfsig_by_field: dict[str | None, PdfsigEntry] | None,
     pdfsig_error: str,
+    extract_failure: str | None = None,
 ) -> list[CheckResult]:
+    """The rows that do not depend on pyHanko: structure, pdfsig, OpenSSL and the PAdES profile.
+
+    ``kind`` is ``"signature"`` or ``"timestamp"`` (poppler cannot validate RFC 3161 document
+    timestamps, so they get no pdfsig row).
+    """
     want = {key: entry.get(key, default) for key, default in DEFAULTS.items()}
-    results = [compare(f"{prefix}.intact.pyhanko", want["intact"], status.intact),
-               compare(f"{prefix}.valid.pyhanko", want["valid"], status.valid)]
-    for key, actual in (("trusted", status.trusted), ("docmdp", status.docmdp), ("docmdpOk", status.docmdp_ok)):
-        if key in entry:
-            results.append(compare(f"{prefix}.{key}.pyhanko", entry[key], actual))
-    for key, actual in (("coverage", status.coverage), ("modification", status.modification)):
-        if key in entry:
-            want_value = entry[key]
-            ok = (_norm(want_value) == _norm(actual) if want_value is not None and actual is not None
-                  else want_value == actual)
-            results.append(CheckResult(f"{prefix}.{key}.pyhanko", ok,
-                                       repr(actual) if ok else f"expected {want_value!r}, got {actual!r}"))
+    results: list[CheckResult] = []
 
     # Structure: no expectation can waive these (ByteRange from 0, gap == /Contents, zero padding).
     if blob is None:
-        results.append(failed(f"{prefix}.extract",
-                              f"extract_cms found no signature dictionary for field {status.field!r}"))
+        results.append(failed(f"{prefix}.extract", extract_failure or
+                              f"extract_cms found no signature dictionary for field {field!r}"))
     else:
         results.extend(blob.structure_checks(prefix))
 
     # Cryptographic outcome that the independent oracles must agree on.
     expect_ok = want["intact"] and want["valid"]
-    if status.kind == "signature":  # poppler cannot validate RFC 3161 document timestamps
+    if kind == "signature":
         if pdfsig_by_field is None:
             results.append(failed(f"{prefix}.pdfsig", pdfsig_error))
         else:
-            ps = pdfsig_by_field.get(status.field)
+            ps = pdfsig_by_field.get(field)
             if ps is None:
-                results.append(failed(f"{prefix}.pdfsig", f"pdfsig lists no field {status.field!r}"))
+                results.append(failed(f"{prefix}.pdfsig", f"pdfsig lists no field {field!r}"))
             else:
                 results.append(CheckResult(f"{prefix}.pdfsig", ps.is_valid == expect_ok,
                                            f"pdfsig: {ps.validation or 'no validation line'}"))
@@ -371,6 +597,38 @@ def _check_one(
             results.append(failed(f"{prefix}.pades", "signature not found by extract_cms"))
         else:
             results.append(check_pades(f"{prefix}.pades", profile(blob), entry["pades"]))
+    return results
+
+
+def _check_one(
+    prefix: str,
+    entry: dict[str, Any],
+    status: SigStatus,
+    blob: SignatureBlob | None,
+    ca_bundle: Path | None,
+    pdfsig_by_field: dict[str | None, PdfsigEntry] | None,
+    pdfsig_error: str,
+    extract_failure: str | None = None,
+) -> list[CheckResult]:
+    want = {key: entry.get(key, default) for key, default in DEFAULTS.items()}
+    if status.error is not None:
+        results = [failed(f"{prefix}.pyhanko", f"pyHanko raises: {status.error}")]
+    else:
+        results = [compare(f"{prefix}.intact.pyhanko", want["intact"], status.intact),
+                   compare(f"{prefix}.valid.pyhanko", want["valid"], status.valid)]
+    for key, actual in (("trusted", status.trusted), ("docmdp", status.docmdp), ("docmdpOk", status.docmdp_ok)):
+        if key in entry:
+            results.append(compare(f"{prefix}.{key}.pyhanko", entry[key], actual))
+    for key, actual in (("coverage", status.coverage), ("modification", status.modification)):
+        if key in entry:
+            want_value = entry[key]
+            ok = (_norm(want_value) == _norm(actual) if want_value is not None and actual is not None
+                  else want_value == actual)
+            results.append(CheckResult(f"{prefix}.{key}.pyhanko", ok,
+                                       repr(actual) if ok else f"expected {want_value!r}, got {actual!r}"))
+
+    results.extend(_check_independent(prefix, entry, status.field, status.kind, blob, ca_bundle,
+                                      pdfsig_by_field, pdfsig_error, extract_failure))
 
     if "timestamp" in entry:
         if entry["timestamp"]:
@@ -425,7 +683,8 @@ def main(argv: list[str] | None = None) -> int:
         ok = s.intact and s.valid and (s.trusted or not args.trust_root)
         results.append(CheckResult(f"{prefix}.pyhanko", ok,
                                    f"field={s.field!r} intact={s.intact} valid={s.valid} trusted={s.trusted} "
-                                   f"coverage={s.coverage} modification={s.modification}"))
+                                   f"coverage={s.coverage} modification={s.modification}"
+                                   + (f" error={s.error}" if s.error else "")))
         if s.kind == "signature":
             ps = ps_by_field.get(s.field)
             results.append(CheckResult(f"{prefix}.pdfsig", ps is not None and ps.is_valid,

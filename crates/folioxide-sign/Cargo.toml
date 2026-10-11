@@ -8,20 +8,56 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# The workspace entry turns default features off, so the facade enables `sys-rng` itself.
+default = ["sys-rng"]
 # RC2-40 and 3DES PKCS#12 bags (PBES1); without it only modern PBES2/AES files load.
 pkcs12-legacy = ["p12-keystore/pbes1"]
+# The operating-system RNG (`getrandom` `SysRng`) as `LocalSigner`'s default RNG for RSA blinding
+# (M3 brief D-1). Without it, RSA signing needs `LocalSigner::with_rng`.
+sys-rng = ["dep:getrandom"]
+# `Serialize`/`Deserialize` on the DTOs (`DigestAlgorithm`, `SignatureAlgorithm`, `KeyKind`,
+# `Problem`, `ProblemCode`, `CertificateInfo`, `KeyDescription`, ...), `camelCase`.
+serde = ["dep:serde", "folioxide-syntax/serde", "folioxide-model/serde"]
 
 [dependencies]
 folioxide-syntax.workspace = true
 folioxide-model.workspace = true
 # Only for visible signature appearances (ARCHITECTURE §A.2 dependency direction).
 folioxide-content.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
 # RustCrypto stack. These types never appear in the public API (ARCHITECTURE §A.5 gap 5).
 rsa.workspace = true
 cms.workspace = true
 p12-keystore.workspace = true
-x509-cert.workspace = true
+# `hazmat` = the lenient `Raw` certificate profile (serial numbers over 20 bytes, any time
+# encoding), so one odd certificate never makes a CMS or a report unreadable (M3 brief §4.3).
+x509-cert = { workspace = true, features = ["hazmat"] }
 der.workspace = true
+# M3 stage 0 (brief §2): digests, ECDSA, key formats, OIDs, the RNG and secret wiping.
+sha2.workspace = true
+sha1.workspace = true
+p256.workspace = true
+p384.workspace = true
+ecdsa.workspace = true
+signature.workspace = true
+pkcs8.workspace = true
+sec1.workspace = true
+spki.workspace = true
+const-oid.workspace = true
+rand_core.workspace = true
+getrandom = { workspace = true, optional = true }
+zeroize.workspace = true
+
+[dev-dependencies]
+# The crate itself with its `serde` feature, so that `cargo test` and `cargo clippy
+# --all-targets` always build and test the DTOs' serde support, and JSON to test it.
+folioxide-sign = { workspace = true, features = ["serde", "pkcs12-legacy"] }
+serde_json.workspace = true
+# `cms_parse_never_panics` (M3 brief §6.2 robustness).
+proptest.workspace = true
+# PDF fixtures for the PDF-side tests (M3 WP3.1A).
+folioxide-testkit.workspace = true
 
 [lints]
 workspace = true
