@@ -416,4 +416,25 @@ All 22 open decisions in `docs/milestones/M5.md` §9 (D-1 … D-22) are accepted
     - Two general lenses and two adversarial lenses: H (hostile encrypted input) and G (page-operation graph integrity).
     - Variant minimums and pass criteria (i)–(vii) are fixed up front.
     - Closure rule: at most 3 review rounds plus a closing round. Every round re-runs all saved variants, new-class exploration is capped at 25 %, and the closing round is verify-only.
+13. **Stage-0 probe rulings (2026-10-23).** The reference probes P-1 … P-11 are recorded in `docs/milestones/M5-probes.md`. Where they contradict brief §0 about a reference reader, the evidence wins. The probes settle:
+    - **Spec over qpdf, as new E-rows:**
+      - a `/CF` entry named `Identity` never overrides the built-in filter;
+      - a per-stream `/Crypt` filter is honoured without `/Type`;
+      - CFM `/None` means no decryption;
+      - `/EFF` is followed (E6, now evidenced).
+    - **qpdf's real output is tolerated:** empty `/OE`/`/UE` in V4, `/CF` entries without `/Type`, and V4 Identity without `/CF`.
+    - **Permissions follow pikepdf:** R2 bits 9–12 come from bits 6, 5, 4 and 3; bit 10 is forced to 1 for R4 and R6. The pinned `/P` values are listed below.
+
+      | Revision | All granted | None granted |
+      |---|---|---|
+      | R2 | -4 | -64 |
+      | R3 | -4 | -3904 |
+      | R4 | -4 | -3392 |
+      | R6 | -4 | -3392 |
+
+    - **Passwords:**
+      - R6 passwords are truncated to 127 bytes on read and write (qpdf does not truncate on write, an E-row).
+      - R ≤ 4 passwords are PDFDocEncoded on write (E11, which equals pikepdf).
+      - E12 is corrected: pypdf SASLpreps on write.
+    - **Oracle tooling:** `extract_cms.py` gains `--password`.
 
