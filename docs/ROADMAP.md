@@ -11,7 +11,7 @@ and the acceptance criteria for each milestone follow it.
 | M2 | Writers, document model v1, Node open/save | ✅ done |
 | M3 | Signatures I: PAdES B-B, external signing, verification | ✅ done |
 | M4 | Signatures II: B-T timestamps, certification, visible signatures | ✅ done |
-| M5 | Encryption ∥ page operations | pending |
+| M5 | Encryption ∥ page operations | ⏳ in progress |
 | M6 | Document structure ∥ optimization | pending |
 | M7 | Content creation (text, fonts, images, shapes, watermarks) | pending |
 | M8 | Annotations ∥ form filling | pending |
@@ -168,7 +168,7 @@ Rendering and extraction come later.
 **Goal:** read and write every standard security handler, and the core page operations.
 
 - **WP5.1 (Dev A) ∥** `folioxide-security`:
-  - Algorithms 1, 1.A, 2–7, 2.A, 2.B, 8–10; R5 read
+  - Algorithms 1, 1.A, 2–7, 2.A, 2.B, 8–13 (11–13 are needed to read R6; M5 brief §4.1); R5 read
   - permissions DTO; crypt filters; `EncryptMetadata`
   - `Decryptor` wired into the reader and both writers
   - encrypt on full save, change and remove passwords

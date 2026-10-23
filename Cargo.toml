@@ -89,6 +89,17 @@ getrandom = { version = "0.4.3", default-features = false, features = ["sys_rng"
 # `Zeroizing` buffers for decrypted key material. Resolves to 1.9.1, already in the graph.
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 
+# Standard security handler (M5 brief §1.9; ARCHITECTURE §A.5). All are pure Rust, permissive, on
+# the same `cipher` 0.5 / `digest` 0.11 graph as the signing stack, and never in a public signature.
+# AES block cipher with our own CBC loop (no `cbc` crate), RC4 for R2-R4 (reads; writes need
+# `allow_weak_crypto`), MD5 for Algorithms 1-7, HMAC for the synthetic IVs, SASLprep for R6.
+aes = { version = "0.9.3", default-features = false, features = ["zeroize"] }
+rc4 = { version = "0.2.0", default-features = false, features = ["zeroize"] }
+md-5 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
+subtle = { version = "2.6.1", default-features = false }
+stringprep = { version = "0.1.5", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

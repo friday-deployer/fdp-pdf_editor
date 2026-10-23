@@ -367,3 +367,53 @@ The M4 QA gate ran five review rounds, two final fix rounds, a closing round and
       - The violation shows in the certification's own report (`docmdp_ok` false). The docs tell callers to check every report.
       - Criterion (i) holds. Making such a timestamp entry `Other` would be stricter and safe; it is on the backlog, at the latest for LTA in M11.
 14. **Dependencies.** `ctutils` is bumped from 0.4.2 to 0.4.4 in `Cargo.lock` for RUSTSEC-2026-0385, a RustCrypto transitive dependency. This was needed for `cargo deny`, and adds no new dependency.
+
+## D15: M5 design decisions (expert proposal, accepted by the manager, 2026-10-23)
+All 22 open decisions in `docs/milestones/M5.md` §9 (D-1 … D-22) are accepted as recommended, together with the deliberate differences E1–E15 (encryption) and P1–P6 (page operations) of brief §0. The most important:
+1. **One exemption predicate (D-1).**
+   - A single function in `folioxide_syntax::crypt`, shared by the reader and both writers, decides which strings and streams are not encrypted.
+   - The signature `/Contents` uses the D11.16 signature-dictionary predicate, which is wider than qpdf's (E7).
+2. **No padding oracle (D-2).**
+   - Padding validity is never observable: no error code, diagnostic or timing difference beyond the unavoidable.
+   - Only key-independent ciphertext defects produce diagnostics.
+   - XMP changes in encrypted files are `Other` (E15, stricter than pyHanko).
+3. **Page operations on signed or certified files are refused (D-3).**
+   - The errors are `E_SIGNED_DOCUMENT`, a new `ErrorCode::SignedDocument`, and `E_DOC_MDP_FORBIDS`.
+   - Opting in with `allow_invalidating_signatures` overrides the refusal.
+   - The rule also applies to the M2 page setters. This is a behaviour change before 1.0.
+4. **No ambient randomness (D-4).**
+   - New R6 encryption takes a caller seed, and IVs are synthetic (HMAC-derived, brief §1.8).
+   - The save functions take no RNG; Node passes a seed from `crypto.randomBytes`.
+5. **Revisions.**
+   - R5 is read, and an existing R5 dictionary is kept on saves; Folioxide never creates one (D-5).
+   - ISO/TS 32004 MACs are detected. Incremental saves and signing are refused for them, and a full save drops the MAC (D-6).
+6. **Passwords (D-7, D-8).**
+   - At most two candidates are tried, and password bytes are used verbatim.
+   - The owner password defaults to the user password.
+   - Restricted permissions with an empty owner password, or one equal to the user password, are refused because they cannot be enforced.
+7. **Permissions (D-9).** Permissions are reported by default (D5.2). `OpenOptions::enforce_permissions` enforces the brief §5.5 table.
+8. **The page tree (D-10).**
+   - It is flattened on the first structural operation (qpdf parity).
+   - A full save rebuilds a balanced tree with fanout 32, through the writer's overlay.
+   - Incremental saves keep the tree flat.
+9. **Defaults for page operations (D-11, D-12, D-13, D-19, D-20, D-21).**
+   - A blank page takes the neighbouring media box, else US Letter.
+   - Links to pages that were deleted or not imported are dropped (pypdf parity).
+   - Signed signature fields are dropped on import.
+   - AcroForm merges rename fields `name#k` and `/DR` fonts `Name_k`, with `/DA` rewritten, and remove the target's `/XFA`.
+   - Named destinations become explicit on import.
+   - `ImportSession` identity is a `Weak<DocIdentity>` plus an edit epoch, with no global counter.
+10. **Crates and encodings (D-14 … D-18).**
+    - RC4 comes from `rc4` 0.2.0, with a fallback to our own implementation.
+    - The PDFDocEncoding table moves to `folioxide-syntax::text::pdfdoc`.
+    - Ciphertext strings are written as hex.
+    - New R6 files are PDF 1.7 with `/Extensions /ADBE` level 8, or 2.0 on request.
+    - Writing RC4 needs `allow_weak_crypto` (qpdf parity).
+11. **Errors (D-22).**
+    - `ErrorCode::SignedDocument` is new; there is no `E_PAGE_RANGE` or `E_ENCRYPTED`.
+    - `DiagnosticKind::{Encryption, Ciphertext}` are new.
+12. **QA (brief §7).**
+    - Two general lenses and two adversarial lenses: H (hostile encrypted input) and G (page-operation graph integrity).
+    - Variant minimums and pass criteria (i)–(vii) are fixed up front.
+    - Closure rule: at most 3 review rounds plus a closing round. Every round re-runs all saved variants, new-class exploration is capped at 25 %, and the closing round is verify-only.
+
