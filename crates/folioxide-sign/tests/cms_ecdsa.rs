@@ -1,5 +1,8 @@
 //! ECDSA signature values (M3 brief §4.3 "ECDSA value", R-10, §6.2 "signers and ECDSA"): DER and
-//! IEEE P1363 inputs, minimal re-encoding, high-S values and bad lengths.
+//! IEEE P1363 inputs, minimal re-encoding, high-S values and bad lengths. A value a signer hands
+//! to `finish` may be P1363 or non-minimal DER (it is normalised); an **embedded** value, in a
+//! document signature or a timestamp token, must be minimal DER, as OpenSSL and pyHanko verify
+//! it (M4 QA finding F1).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -9,10 +12,14 @@
 
 mod cms_support;
 
-use cms_support::{der_children, der_split, pem_signer, tlv, vector_data, verify_over};
+use cms_support::{
+    alg_id, der_children, der_split, edit_signer_info, octets, pem_signer, tlv, vector_data,
+    verify_over,
+};
 use folioxide_sign::algorithms::DigestAlgorithm;
 use folioxide_sign::cms::{self, SignedAttrsInput};
 use folioxide_sign::signer::{LocalSigner, Signer};
+use folioxide_sign::tsp::{MessageImprint, OID_CT_TST_INFO, TimeStampReq};
 use folioxide_syntax::ErrorCode;
 
 /// Signed attributes over the vector data and `signer`'s DER signature of them.
@@ -274,4 +281,99 @@ fn verify_raw_rejects_algorithm_key_mismatch() {
     )
     .unwrap_err();
     assert_eq!(err.code(), ErrorCode::SignatureInvalid);
+}
+
+/// The CMS of `signer` over the vector data with its signature value replaced by `value` (the
+/// SignerInfo's `signature` OCTET STRING, every enclosing length rebuilt).
+fn cms_with_value(signer: &LocalSigner, digest: DigestAlgorithm, value: &[u8]) -> Vec<u8> {
+    let (attrs, der_sig) = signed(signer, digest);
+    let (cms_der, _) = embedded(signer, digest, &attrs, &der_sig);
+    edit_signer_info(&cms_der, |children| {
+        assert_eq!(children[5].0, 0x04, "the signature value");
+        children[5].1 = octets(value);
+    })
+}
+
+#[test]
+fn ecdsa_p1363_value_in_cms_rejected() {
+    // M4 QA finding F1b: the document signature's embedded value must be DER (OpenSSL `cms
+    // -verify` and pyHanko reject r || s); finish still normalises a P1363 value it is given.
+    for (signer, digest, field) in cases() {
+        let (attrs, der_sig) = signed(&signer, digest);
+        let p1363 = to_p1363(&der_sig, field);
+        let v = verify_over(&cms_with_value(&signer, digest, &p1363), &vector_data());
+        assert!(v.intact && !v.signature_valid, "{v:?}");
+        assert!(
+            v.problems
+                .iter()
+                .any(|p| p.message.contains("not the DER encoding")),
+            "{:?}",
+            v.problems
+        );
+        // The control: the same CMS with the DER value verifies.
+        let v = verify_over(&cms_with_value(&signer, digest, &der_sig), &vector_data());
+        assert!(v.intact && v.signature_valid, "{v:?}");
+        let cert = &signer.certificate_chain()[0];
+        assert_eq!(
+            cms::verify_and_normalize(cert, signer.algorithm(), digest, &attrs, &p1363).unwrap(),
+            der_sig
+        );
+    }
+}
+
+#[test]
+fn ecdsa_non_minimal_der_value_in_cms_rejected() {
+    for (signer, digest, field) in cases() {
+        let (_, der_sig) = signed(&signer, digest);
+        for pad in [1, 3] {
+            let lax = lax_der(&to_p1363(&der_sig, field), pad);
+            let v = verify_over(&cms_with_value(&signer, digest, &lax), &vector_data());
+            assert!(v.intact && !v.signature_valid, "pad {pad}: {v:?}");
+        }
+    }
+}
+
+/// A timestamp token over `b"value"` signed by the test P-256 key with ECDSA (the CMS layer
+/// does not check the TSA purpose), its signature value replaced by `value(der)`.
+fn ecdsa_token(value: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let signer = pem_signer("p256");
+    let cert = signer.certificate_chain()[0].clone();
+    let sign = move |attrs: &[u8]| signer.sign(DigestAlgorithm::Sha256, attrs).unwrap();
+    let tsa = folioxide_testkit::tsa::MockTsa::new(cert, Vec::new(), Box::new(sign));
+    let digest = DigestAlgorithm::Sha256;
+    let request = TimeStampReq::new(
+        MessageImprint::new(digest, digest.digest(&[b"value"])),
+        Some(0x0102_0304_0506_0708),
+        None,
+    );
+    let token = tsa.token_for(&request.to_der()).unwrap();
+    // The mock writes sha256WithRSAEncryption: ecdsa-with-SHA256, and the chosen value.
+    edit_signer_info(&token, |children| {
+        children[4].1 = alg_id("1.2.840.10045.4.3.2");
+        let (_, der) = der_split(&children[5].1);
+        let der = der.to_vec();
+        children[5].1 = octets(&value(&der));
+    })
+}
+
+#[test]
+fn tst_ecdsa_der_control_verifies() {
+    let token = ecdsa_token(<[u8]>::to_vec);
+    let v = cms::verify_encapsulated(&cms::parse(&token).unwrap(), OID_CT_TST_INFO, &[]);
+    assert!(v.intact && v.signature_valid, "{v:?}");
+}
+
+#[test]
+fn tst_ecdsa_p1363_rejected() {
+    // M4 QA finding F1a: `openssl ts -verify` and pyHanko reject a TSA's r || s value.
+    let token = ecdsa_token(|der| to_p1363(der, 32));
+    let v = cms::verify_encapsulated(&cms::parse(&token).unwrap(), OID_CT_TST_INFO, &[]);
+    assert!(v.intact && !v.signature_valid, "{v:?}");
+}
+
+#[test]
+fn tst_ecdsa_nonminimal_der_rejected() {
+    let token = ecdsa_token(|der| lax_der(&to_p1363(der, 32), 1));
+    let v = cms::verify_encapsulated(&cms::parse(&token).unwrap(), OID_CT_TST_INFO, &[]);
+    assert!(v.intact && !v.signature_valid, "{v:?}");
 }

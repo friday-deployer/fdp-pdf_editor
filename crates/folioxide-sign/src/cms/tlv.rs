@@ -346,6 +346,26 @@ pub(crate) fn octet_string_value(
 /// constructed strings, and every SET's elements in DER order (X.690 §10, §11.6). It is a check
 /// of the encoding rules a verifier like OpenSSL would trip over, not a full DER validator.
 pub(crate) fn is_der_tree(input: &[u8], element: &Element, depth: usize, max_depth: usize) -> bool {
+    is_der_tree_except(input, element, depth, max_depth, &[])
+}
+
+/// [`is_der_tree`], treating every element that spans exactly one of `opaque` (byte ranges in
+/// `input`) as DER without looking at it: an embedded value whose encoding is someone else's,
+/// such as a TSA's timestamp token (M4 brief §4.3, DECISIONS D13 D-12). Its encoding still
+/// counts for the order of the `SET` that holds it.
+pub(crate) fn is_der_tree_except(
+    input: &[u8],
+    element: &Element,
+    depth: usize,
+    max_depth: usize,
+    opaque: &[std::ops::Range<usize>],
+) -> bool {
+    if opaque
+        .iter()
+        .any(|range| range.start == element.start && range.end == element.end)
+    {
+        return true;
+    }
     if !element.is_der_header() {
         return false;
     }
@@ -358,7 +378,7 @@ pub(crate) fn is_der_tree(input: &[u8], element: &Element, depth: usize, max_dep
         let Ok(child) = child else {
             return false;
         };
-        if !is_der_tree(input, &child, depth + 1, max_depth) {
+        if !is_der_tree_except(input, &child, depth + 1, max_depth, opaque) {
             return false;
         }
         let raw = child.raw(input);
@@ -372,6 +392,187 @@ pub(crate) fn is_der_tree(input: &[u8], element: &Element, depth: usize, max_dep
         }
     }
     true
+}
+
+/// Whether every universal BOOLEAN in `element` (read at `depth`), itself included, is `00` or
+/// `FF`, and every primitive universal BIT STRING has its unused bits set to zero (and no unused
+/// bits when it is empty): the DER content rules of X.690 §11.1 and §11.2.1 (§8.6.2.3), which
+/// [`is_der_tree`] does not look at. A verifier that decodes and re-encodes a value (OpenSSL's
+/// `ASN1_TYPE` for an attribute value: `c2i_ASN1_BIT_STRING` clears the unused bits, a BOOLEAN
+/// comes back as `FF`) changes any other encoding (M4 QA round 3 finding 2). One pass, depth
+/// bounded by `max_depth`.
+pub(crate) fn der_primitive_contents(
+    input: &[u8],
+    element: &Element,
+    depth: usize,
+    max_depth: usize,
+) -> bool {
+    let universal = element.tag & 0xC0 == 0 && element.tag & 0x1F != 0x1F;
+    if !element.is_constructed() {
+        if !universal {
+            return true;
+        }
+        let content = element.content(input);
+        return match element.tag & 0x1F {
+            0x01 => matches!(content, [0x00] | [0xFF]),
+            0x03 => match content.split_first() {
+                Some((&0, _)) => true,
+                Some((&unused, [.., last])) if unused <= 7 => {
+                    last & !u8::MAX.checked_shl(u32::from(unused)).unwrap_or(0) == 0
+                }
+                _ => false,
+            },
+            _ => true,
+        };
+    }
+    children(input, element, depth, max_depth)
+        .all(|child| child.is_ok_and(|c| der_primitive_contents(input, &c, depth + 1, max_depth)))
+}
+
+/// Whether the content octets of a universal string of tag number `number` are text that
+/// OpenSSL's `ASN1_STRING_to_UTF8` converts (`ASN1_mbstring_ncopy`, `is_unicode_valid`), as it
+/// does for every value of every X.509 `Name` it decodes (`x509_name_canon`):
+///
+/// - a UTF8String is UTF-8 (RFC 3629: no surrogate, nothing above U+10FFFF, no overlong form);
+/// - a BMPString is UCS-2, big-endian: an even length and **no code unit in D800–DFFF**, alone
+///   or paired (OpenSSL reads one code unit per character, so a UTF-16 surrogate pair is two
+///   illegal characters there; M4 QA round 4 finding 1);
+/// - a UniversalString is UCS-4, big-endian: a multiple-of-four length and every value a
+///   Unicode scalar value (at most 10FFFF, not a surrogate).
+///
+/// Non-characters (U+FFFE, U+FFFF) and NUL are characters there, so they pass. Every other
+/// string type converts byte by byte and always passes.
+pub(crate) fn string_converts(number: u8, content: &[u8]) -> bool {
+    let scalar = |value: u32| value <= 0x10_FFFF && !(0xD800..=0xDFFF).contains(&value);
+    match number {
+        0x0C => std::str::from_utf8(content).is_ok(),
+        0x1E => {
+            content.len().is_multiple_of(2)
+                && content.chunks_exact(2).all(|unit| match unit {
+                    [hi, lo] => scalar(u32::from(u16::from_be_bytes([*hi, *lo]))),
+                    _ => false,
+                })
+        }
+        0x1C => {
+            content.len().is_multiple_of(4)
+                && content.chunks_exact(4).all(|quad| match quad {
+                    [a, b, c, d] => scalar(u32::from_be_bytes([*a, *b, *c, *d])),
+                    _ => false,
+                })
+        }
+        _ => true,
+    }
+}
+
+/// Checks that every element in `element` (read at `depth`), itself included, is an encoding
+/// an ASN.1 decoder such as OpenSSL's accepts as far as the universal types go (X.690 §8, BER
+/// or DER), and returns what is wrong otherwise:
+///
+/// - a BOOLEAN has one content octet (§8.2.1); an INTEGER or ENUMERATED is non-empty and has
+///   no redundant leading octet (§8.3.2, §8.4); a NULL has no content (§8.8.2);
+/// - an OBJECT IDENTIFIER has content, ends a subidentifier at its last octet and starts no
+///   subidentifier with `0x80` (§8.19.2);
+/// - a primitive BIT STRING has its unused-bits octet, at most 7 (§8.6.2);
+/// - a UTF8String, BMPString or UniversalString is text OpenSSL converts to UTF-8
+///   ([`string_converts`]: no surrogate in a BMPString, a Unicode scalar value in every
+///   UniversalString character; OpenSSL converts them in every name it decodes, M4 QA round 4
+///   finding 1, and the rule holds for every such string of the token, which is stricter than
+///   OpenSSL outside names); a UTCTime has at least 13 and a GeneralizedTime at least 15
+///   octets;
+/// - none of the always-primitive types (BOOLEAN, INTEGER, NULL, OBJECT IDENTIFIER, REAL,
+///   ENUMERATED, RELATIVE-OID) is constructed, SEQUENCE and SET are, and the segments of a
+///   constructed string have the string's own type (§8.21);
+/// - no end-of-contents octets stand inside a definite length (§8.1.5).
+///
+/// These are the checks of OpenSSL's `c2i_ASN1_INTEGER`, `c2i_ASN1_OBJECT`,
+/// `c2i_ASN1_BIT_STRING`, `asn1_ex_c2i` and its name decoding (M4 QA round 1 finding F6). The contents of OCTET
+/// STRINGs, of BIT STRINGs and of implicitly tagged primitives are not looked into: their type
+/// is not known here. One pass, depth bounded by `max_depth`.
+pub(crate) fn check_primitives(
+    input: &[u8],
+    element: &Element,
+    depth: usize,
+    max_depth: usize,
+) -> Result<(), &'static str> {
+    const UNIVERSAL_CLASS: u8 = 0x00;
+    let universal = element.tag & 0xC0 == UNIVERSAL_CLASS && element.tag & 0x1F != 0x1F;
+    let number = element.tag & 0x1F;
+    if universal && !element.is_constructed() {
+        let content = element.content(input);
+        let ok = match number {
+            0x00 => return Err("end-of-contents octets inside a definite length"),
+            0x01 => content.len() == 1,
+            0x02 | 0x0A => !content.is_empty() && integer_canonical(content).len() == content.len(),
+            0x03 => content.first().is_some_and(|&unused| unused <= 7),
+            0x05 => content.is_empty(),
+            0x06 => valid_oid(content),
+            0x0C | 0x1C | 0x1E => string_converts(number, content),
+            0x10 | 0x11 => return Err("a primitive SEQUENCE or SET"),
+            0x17 => content.len() >= 13,
+            0x18 => content.len() >= 15,
+            _ => true,
+        };
+        return if ok {
+            Ok(())
+        } else {
+            Err(match number {
+                0x01 => "a BOOLEAN that is not one octet",
+                0x02 | 0x0A => "an empty or non-minimal INTEGER",
+                0x03 => "a BIT STRING without a valid unused-bits octet",
+                0x05 => "a NULL with content",
+                0x06 => "an invalid OBJECT IDENTIFIER",
+                0x0C => "a UTF8String that is not UTF-8",
+                0x17 | 0x18 => "a time value that is too short",
+                0x1E if content.len().is_multiple_of(2) => {
+                    "a BMPString with a UTF-16 surrogate code unit, which OpenSSL cannot convert \
+                     to UTF-8 (ASN1_mbstring_ncopy: illegal characters)"
+                }
+                0x1C if content.len().is_multiple_of(4) => {
+                    "a UniversalString with a surrogate or a value above 10FFFF, which OpenSSL \
+                     cannot convert to UTF-8 (ASN1_mbstring_ncopy: illegal characters)"
+                }
+                _ => "a string of the wrong length for its type",
+            })
+        };
+    }
+    if !element.is_constructed() {
+        return Ok(());
+    }
+    if universal && matches!(number, 0x01 | 0x02 | 0x05 | 0x06 | 0x09 | 0x0A | 0x0D) {
+        return Err("a constructed encoding of a type that is always primitive");
+    }
+    // The string types, whose BER constructed form is a list of segments (X.690 §8.21).
+    let string = matches!(number, 0x03 | 0x04 | 0x0C | 0x12..=0x1C | 0x1E);
+    let segments_of = (universal && string).then_some(number);
+    for child in children(input, element, depth, max_depth) {
+        let child = child.map_err(|err| match err {
+            TlvError::Malformed(what) => what,
+            TlvError::TooDeep => "nested too deep",
+        })?;
+        if let Some(number) = segments_of
+            && (child.tag & 0xC0 != UNIVERSAL_CLASS || child.tag & 0x1F != number)
+        {
+            return Err("a constructed string with a segment of another type");
+        }
+        check_primitives(input, &child, depth + 1, max_depth)?;
+    }
+    Ok(())
+}
+
+/// Whether OBJECT IDENTIFIER content octets are valid (X.690 §8.19.2): not empty, the last
+/// octet ends a subidentifier, and no subidentifier starts with `0x80`.
+pub(crate) fn valid_oid(content: &[u8]) -> bool {
+    let Some(&last) = content.last() else {
+        return false;
+    };
+    let mut starts_subidentifier = true;
+    for &byte in content {
+        if starts_subidentifier && byte == 0x80 {
+            return false;
+        }
+        starts_subidentifier = byte & 0x80 == 0;
+    }
+    last & 0x80 == 0
 }
 
 /// The order of two encodings in a DER `SET OF`: compared as octet strings, the shorter one
@@ -578,6 +779,137 @@ mod tests {
         assert!(check(&seq));
         assert!(!check(&[0x30, 0x81, 0x03, 0x04, 0x01, 0x01]));
         assert!(!check(&[0x24, 0x03, 0x04, 0x01, 0x01]));
+    }
+
+    #[test]
+    fn der_contents_of_booleans_and_bit_strings() {
+        let check = |b: &[u8]| der_primitive_contents(b, &read_exact(b, DEPTH).unwrap(), 0, DEPTH);
+        // BOOLEAN TRUE is FF and FALSE 00 (X.690 §11.1), at any depth.
+        assert!(check(&[0x01, 0x01, 0xFF]));
+        assert!(check(&[0x01, 0x01, 0x00]));
+        assert!(!check(&[0x01, 0x01, 0x01]));
+        assert!(!check(&[0x30, 0x05, 0x31, 0x03, 0x01, 0x01, 0x01]));
+        assert!(check(&[0x30, 0x05, 0x31, 0x03, 0x01, 0x01, 0xFF]));
+        // BIT STRING: unused bits zero (§11.2.1), none when empty (§8.6.2.3).
+        assert!(check(&[0x03, 0x01, 0x00]));
+        assert!(check(&[0x03, 0x02, 0x00, 0xFF]));
+        assert!(check(&[0x03, 0x02, 0x04, 0xF0]));
+        assert!(!check(&[0x03, 0x02, 0x04, 0xF8]));
+        assert!(check(&[0x03, 0x02, 0x07, 0x80]));
+        assert!(!check(&[0x03, 0x02, 0x07, 0x81]));
+        assert!(!check(&[0x03, 0x01, 0x03]));
+        assert!(!check(&[0x03, 0x02, 0x08, 0x00]));
+        assert!(!check(&[0x03, 0x00]));
+        // Not universal: not looked into.
+        assert!(check(&[0x81, 0x01, 0x01]));
+        // A child that does not parse fails.
+        assert!(!check(&[0x30, 0x02, 0x01, 0x05]));
+    }
+
+    #[test]
+    fn primitives_are_checked_as_openssl_decodes_them() {
+        let check = |b: &[u8]| check_primitives(b, &read_exact(b, DEPTH).unwrap(), 0, DEPTH);
+        // A SEQUENCE of valid primitives, BER constructed string and indefinite length.
+        let good = [
+            0x30, 0x80, 0x01, 0x01, 0xFF, 0x02, 0x01, 0x00, 0x02, 0x02, 0x00, 0x80, 0x02, 0x01,
+            0xFF, 0x05, 0x00, 0x06, 0x03, 0x2A, 0x86, 0x48, 0x03, 0x02, 0x07, 0x80, 0x24, 0x80,
+            0x04, 0x01, 0x01, 0x00, 0x00, 0xA0, 0x02, 0x80, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(check(&good), Ok(()));
+        for (bad, why) in [
+            (&[0x30, 0x04, 0x01, 0x02, 0xFF, 0xFF][..], "boolean"),
+            (&[0x30, 0x02, 0x02, 0x00][..], "empty integer"),
+            (&[0x30, 0x04, 0x02, 0x02, 0x00, 0x01][..], "padded integer"),
+            (&[0x30, 0x04, 0x02, 0x02, 0xFF, 0x80][..], "padded negative"),
+            (
+                &[0x30, 0x04, 0x0A, 0x02, 0x00, 0x05][..],
+                "padded enumerated",
+            ),
+            (&[0x30, 0x03, 0x05, 0x01, 0x00][..], "null with content"),
+            (&[0x30, 0x02, 0x06, 0x00][..], "empty oid"),
+            (
+                &[0x30, 0x04, 0x06, 0x02, 0x2A, 0x86][..],
+                "oid open subidentifier",
+            ),
+            (&[0x30, 0x05, 0x06, 0x03, 0x2A, 0x80, 0x01][..], "oid 0x80"),
+            (&[0x30, 0x02, 0x03, 0x00][..], "empty bit string"),
+            (&[0x30, 0x03, 0x03, 0x01, 0x08][..], "unused bits"),
+            (&[0x30, 0x02, 0x00, 0x00][..], "end of contents"),
+            (&[0x30, 0x03, 0x1E, 0x01, 0x41][..], "odd bmp"),
+            (&[0x30, 0x04, 0x0C, 0x02, 0xC3, 0x28][..], "invalid utf-8"),
+            (
+                &[0x30, 0x05, 0x0C, 0x03, 0xED, 0xA0, 0x80][..],
+                "utf-8 surrogate",
+            ),
+            (&[0x30, 0x04, 0x17, 0x02, 0x32, 0x36][..], "short utc time"),
+            (&[0x30, 0x02, 0x10, 0x00][..], "primitive sequence"),
+            (
+                &[0x30, 0x05, 0x22, 0x03, 0x02, 0x01, 0x01][..],
+                "constructed integer",
+            ),
+            (
+                &[0x30, 0x05, 0x24, 0x03, 0x02, 0x01, 0x01][..],
+                "segment type",
+            ),
+        ] {
+            assert!(check(bad).is_err(), "{why}: {bad:02x?}");
+        }
+        // M4 QA round 4 finding 1: BMPString and UniversalString values OpenSSL cannot convert.
+        for (bad, why) in [
+            (
+                &[0x30, 0x04, 0x1E, 0x02, 0xD8, 0x00][..],
+                "bmp lone high surrogate",
+            ),
+            (&[0x30, 0x04, 0x1E, 0x02, 0xDB, 0xFF][..], "bmp DBFF"),
+            (
+                &[0x30, 0x04, 0x1E, 0x02, 0xDC, 0x00][..],
+                "bmp lone low surrogate",
+            ),
+            (&[0x30, 0x04, 0x1E, 0x02, 0xDF, 0xFF][..], "bmp DFFF"),
+            (
+                &[0x30, 0x06, 0x1E, 0x04, 0xD8, 0x3D, 0xDE, 0x00][..],
+                "bmp surrogate pair",
+            ),
+            (
+                &[0x30, 0x06, 0x1E, 0x04, 0xDC, 0x00, 0xD8, 0x00][..],
+                "bmp low surrogate first",
+            ),
+            (
+                &[0x30, 0x06, 0x1C, 0x04, 0x00, 0x00, 0xD8, 0x00][..],
+                "ucs-4 surrogate",
+            ),
+            (
+                &[0x30, 0x06, 0x1C, 0x04, 0x00, 0x11, 0x00, 0x00][..],
+                "ucs-4 above 10FFFF",
+            ),
+            (
+                &[0x30, 0x05, 0x1C, 0x03, 0x00, 0x00, 0x41][..],
+                "ucs-4 length",
+            ),
+        ] {
+            assert!(check(bad).is_err(), "{why}: {bad:02x?}");
+        }
+        let message = check(&[0x30, 0x04, 0x1E, 0x02, 0xD8, 0x00]).unwrap_err();
+        assert!(message.contains("surrogate"), "{message}");
+        // Non-characters, NUL, the last BMP and the last Unicode code point convert.
+        for good in [
+            &[0x30, 0x04, 0x1E, 0x02, 0xFF, 0xFE][..],
+            &[0x30, 0x04, 0x1E, 0x02, 0x00, 0x00],
+            &[0x30, 0x04, 0x1E, 0x02, 0xD7, 0xFF],
+            &[0x30, 0x04, 0x1E, 0x02, 0xE0, 0x00],
+            &[0x30, 0x06, 0x1C, 0x04, 0x00, 0x10, 0xFF, 0xFF],
+            &[0x30, 0x06, 0x1C, 0x04, 0x00, 0x01, 0xF6, 0x00],
+            &[0x30, 0x05, 0x0C, 0x03, 0xEF, 0xBF, 0xBE],
+            &[0x30, 0x02, 0x1E, 0x00],
+        ] {
+            assert_eq!(check(good), Ok(()), "{good:02x?}");
+        }
+        assert!(string_converts(0x13, &[0xFF]) && string_converts(0x14, &[0xD8, 0x00]));
+        // Implicitly tagged primitives and OCTET STRING contents are not looked into.
+        assert_eq!(check(&[0x30, 0x04, 0x80, 0x00, 0x04, 0x00]), Ok(()));
+        assert_eq!(check(&[0x30, 0x04, 0x04, 0x02, 0x02, 0x00]), Ok(()));
+        assert!(valid_oid(&[0x2A]) && valid_oid(&[0x2A, 0x86, 0x48]));
+        assert!(!valid_oid(&[0x80, 0x01]) && !valid_oid(&[0x86]));
     }
 
     #[test]

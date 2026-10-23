@@ -102,7 +102,27 @@ pub(crate) fn algorithm_name(dotted: &str) -> String {
 /// ```
 ///
 /// Returns the hash and the salt length. MGF1 must use the same hash, and the trailer must be 1.
-fn pss_parameters(params: Option<&[u8]>) -> std::result::Result<(DigestAlgorithm, usize), String> {
+/// Also read for an `id-RSASSA-PSS` SubjectPublicKeyInfo, whose parameters restrict the key
+/// (RFC 4055 §3.1; [`PublicKey::from_spki_der`]).
+///
+/// The SEQUENCE is read as its definition orders it (M4 final fix round 2, finding 2): each
+/// field at most once and in the order `[0]`, `[1]`, `[2]`, `[3]`, each explicit tag holding
+/// exactly one element, the INTEGERs minimal, and nothing else before the SEQUENCE's end. A
+/// repeated or out-of-order field is no `RSASSA-PSS-params` (X.680 §25, X.690 §8.9):
+/// asn1crypto refuses it ("Unknown element") and OpenSSL's template decoder cannot decode such
+/// a key, whereas a reader that lets a repeated field overwrite the earlier one takes another
+/// hash or salt length than a first-wins reader (pyHanko compares the first salt length). A
+/// default written out (`[0]` sha1, `[2] 20`) stays accepted, as by both references.
+///
+/// The two hash AlgorithmIdentifiers, the one of `[0]` and the one MGF1 takes as its
+/// parameter, have absent or NULL parameters and nothing else (RFC 4055 §2.1: the SHA
+/// functions take no parameters, and implementations "MUST accept" both encodings; M4 closing
+/// round, finding 7). pyHanko compares a key's parameters with a signature's structurally, so
+/// an INTEGER, an empty OCTET STRING or an empty SEQUENCE there had made a PSS-keyed trust
+/// anchor that pyHanko does not trust verify its certificates here.
+pub(crate) fn pss_parameters(
+    params: Option<&[u8]>,
+) -> std::result::Result<(DigestAlgorithm, usize), String> {
     let mut hash = DigestAlgorithm::Sha1;
     let mut mgf_hash = DigestAlgorithm::Sha1;
     let mut salt_len = 20usize;
@@ -114,15 +134,35 @@ fn pss_parameters(params: Option<&[u8]>) -> std::result::Result<(DigestAlgorithm
     if seq.tag != TAG_SEQUENCE {
         return Err(bad("not a SEQUENCE"));
     }
+    // The position of the field read last: the next one must come later in the definition.
+    let mut last: Option<u8> = None;
     for field in tlv::children(params, &seq, 0, 8) {
         let field = field.map_err(|_| bad("malformed"))?;
-        let inner = tlv::children(params, &field, 1, 8)
-            .next()
-            .and_then(std::result::Result::ok)
-            .ok_or_else(|| bad("empty field"))?;
+        let position = match field.tag {
+            TAG_CONTEXT_0 => 0,
+            TAG_CONTEXT_1 => 1,
+            TAG_CONTEXT_2 => 2,
+            TAG_CONTEXT_3 => 3,
+            _ => return Err(bad("unknown field")),
+        };
+        if last.is_some_and(|last| position <= last) {
+            return Err(bad("unknown field (a field repeated or out of order)"));
+        }
+        last = Some(position);
+        let inner = match tlv::children_vec(params, &field, 1, 8, 1).as_deref() {
+            Ok([inner]) => *inner,
+            Ok(_) => return Err(bad("empty field")),
+            Err(_) => return Err(bad("a field that is not one element")),
+        };
         match field.tag {
             TAG_CONTEXT_0 => {
                 let alg = algorithm_id(params, &inner, 2).map_err(|_| bad("hashAlgorithm"))?;
+                if !null_or_absent(alg.parameters.as_deref()) {
+                    return Err(bad(
+                        "unknown field (hashAlgorithm parameters that are neither absent nor \
+                         NULL, RFC 4055 §2.1)",
+                    ));
+                }
                 hash = alg
                     .digest()
                     .ok_or_else(|| bad(&format!("hash {} is not supported", alg.oid)))?;
@@ -140,6 +180,12 @@ fn pss_parameters(params: Option<&[u8]>) -> std::result::Result<(DigestAlgorithm
                     .ok()
                     .and_then(|el| algorithm_id(&mgf_params, &el, 0).ok())
                     .ok_or_else(|| bad("MGF1 hash"))?;
+                if !null_or_absent(mgf_alg.parameters.as_deref()) {
+                    return Err(bad(
+                        "unknown field (MGF1 hash parameters that are neither absent nor NULL, \
+                         RFC 4055 §2.1)",
+                    ));
+                }
                 mgf_hash = mgf_alg
                     .digest()
                     .ok_or_else(|| bad(&format!("MGF1 hash {} is not supported", mgf_alg.oid)))?;
@@ -163,12 +209,23 @@ fn pss_parameters(params: Option<&[u8]>) -> std::result::Result<(DigestAlgorithm
     Ok((hash, salt_len))
 }
 
+/// Whether AlgorithmIdentifier `parameters` (the whole element) are absent or exactly a DER
+/// NULL (`05 00`).
+pub(crate) fn null_or_absent(parameters: Option<&[u8]>) -> bool {
+    parameters.is_none_or(|p| p == [tlv::TAG_NULL, 0x00])
+}
+
+/// The value of a minimal, non-negative INTEGER of at most four octets (X.690 §8.3.2).
 fn small_unsigned(content: &[u8], tag: u8) -> Option<usize> {
     if tag != TAG_INTEGER {
         return None;
     }
     let value = tlv::integer_canonical(content);
-    if value.is_empty() || value.len() > 4 || value.first().is_some_and(|&b| b & 0x80 != 0) {
+    if value.len() != content.len()
+        || value.is_empty()
+        || value.len() > 4
+        || value.first().is_some_and(|&b| b & 0x80 != 0)
+    {
         return None;
     }
     Some(
@@ -188,10 +245,9 @@ fn oid_bytes(dotted: &'static str) -> Vec<u8> {
 /// Whether two AlgorithmIdentifiers are the same algorithm: equal OIDs, and parameters that are
 /// equal or both "absent or NULL" (RFC 5754 §2 allows either for SHA-2).
 pub(crate) fn same_algorithm(a: &AlgorithmId, b: &AlgorithmId) -> bool {
-    let null_or_absent = |p: &Option<Vec<u8>>| p.as_deref().is_none_or(|p| p == [0x05, 0x00]);
     a.oid == b.oid
         && (a.parameters == b.parameters
-            || (null_or_absent(&a.parameters) && null_or_absent(&b.parameters)))
+            || (null_or_absent(a.parameters.as_deref()) && null_or_absent(b.parameters.as_deref())))
 }
 
 /// Collects problems and whether any of them invalidates the signature.
@@ -217,9 +273,49 @@ impl Findings {
     }
 }
 
+/// What kind of SignedData a verification expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Content<'a> {
+    /// A detached signature over external data: eContentType `id-data`, no eContent, and an
+    /// ESS signing-certificate attribute that does not match the signer makes the signature
+    /// invalid.
+    Detached,
+    /// Encapsulated content of this eContentType (a timestamp token's TSTInfo): eContent
+    /// present; the ESS attributes are only reported in `pades_attrs` (the caller decides,
+    /// M4 brief §5 V7b step 5).
+    Encapsulated(&'a str),
+}
+
 /// See [`super::verify_detached`].
 pub(crate) fn verify_detached(
     parsed: &ParsedCms,
+    document_digest_for: &dyn Fn(DigestAlgorithm) -> Option<Vec<u8>>,
+    extra_certs: &[Vec<u8>],
+) -> CmsVerification {
+    verify_signed_data(parsed, Content::Detached, document_digest_for, extra_certs)
+}
+
+/// See [`super::verify_encapsulated`].
+pub(crate) fn verify_encapsulated(
+    parsed: &ParsedCms,
+    expected_econtent_type: &str,
+    extra_certs: &[Vec<u8>],
+) -> CmsVerification {
+    let content = parsed.econtent.as_deref();
+    let content_digest = |digest: DigestAlgorithm| content.map(|c| digest.digest(&[c]));
+    verify_signed_data(
+        parsed,
+        Content::Encapsulated(expected_econtent_type),
+        &content_digest,
+        extra_certs,
+    )
+}
+
+/// The verification of [`verify_detached`] and [`verify_encapsulated`]: `content_digest_for(d)`
+/// is the digest with `d` of the signed content (the external data, or the eContent octets).
+fn verify_signed_data(
+    parsed: &ParsedCms,
+    content: Content<'_>,
     document_digest_for: &dyn Fn(DigestAlgorithm) -> Option<Vec<u8>>,
     extra_certs: &[Vec<u8>],
 ) -> CmsVerification {
@@ -244,17 +340,35 @@ pub(crate) fn verify_detached(
         invalid: false,
     };
     let econtent_type = parsed.econtent_type.as_deref().unwrap_or_default();
-    if econtent_type != oid::ID_DATA {
-        findings.fail(
-            ProblemCode::ContentTypeMismatch,
-            format!("the eContentType is {econtent_type}, not id-data"),
-        );
-    }
-    if parsed.econtent.is_some() {
-        findings.fail(
-            ProblemCode::EContentPresent,
-            "a detached signature carries encapsulated content",
-        );
+    match content {
+        Content::Detached => {
+            if econtent_type != oid::ID_DATA {
+                findings.fail(
+                    ProblemCode::ContentTypeMismatch,
+                    format!("the eContentType is {econtent_type}, not id-data"),
+                );
+            }
+            if parsed.econtent.is_some() {
+                findings.fail(
+                    ProblemCode::EContentPresent,
+                    "a detached signature carries encapsulated content",
+                );
+            }
+        }
+        Content::Encapsulated(expected) => {
+            if econtent_type != expected {
+                findings.fail(
+                    ProblemCode::ContentTypeMismatch,
+                    format!("the eContentType is {econtent_type}, not {expected}"),
+                );
+            }
+            if parsed.econtent.is_none() {
+                findings.fail(
+                    ProblemCode::CmsMalformed,
+                    "the SignedData has no encapsulated content",
+                );
+            }
+        }
     }
 
     let digest = signer_info.digest_algorithm.digest();
@@ -320,6 +434,7 @@ pub(crate) fn verify_detached(
                 signer_info,
                 econtent_type,
                 signer_cert.as_deref(),
+                content == Content::Detached,
                 &mut pades_attrs,
                 &mut findings,
             );
@@ -418,7 +533,9 @@ fn check_value(
             .verify_rsa_pkcs1v15(digest, prehash, signature)
             .map(|_| ()),
         Scheme::RsaPss { salt_len } => key.verify_rsa_pss(digest, salt_len, prehash, signature),
-        Scheme::Ecdsa => key.verify_ecdsa(prehash, signature).map(|_| ()),
+        // An embedded value: strict DER only, as OpenSSL verifies it (M4 QA finding F1; the
+        // P1363 and non-minimal tolerance is for `finish` only, `verify_and_normalize`).
+        Scheme::Ecdsa => key.verify_ecdsa_der(prehash, signature),
     };
     result.map_err(|VerifyFailure::Invalid(message)| {
         Problem::new(ProblemCode::SignatureInvalid, message)
@@ -469,12 +586,15 @@ fn find_signer(sid: &SignerIdentifier, certs: &[Vec<u8>], extra: &[Vec<u8>]) -> 
     }
 }
 
-/// Checks the signed attributes (brief §5 V7) and fills `pades`.
+/// Checks the signed attributes (brief §5 V7) and fills `pades`. With `ess_fails`, an ESS
+/// signing-certificate attribute that does not identify the signer makes the signature invalid;
+/// without it the attribute is only reported in `pades`.
 fn check_signed_attributes(
     raw: &[u8],
     signer_info: &ParsedSignerInfo,
     econtent_type: &str,
     signer_cert: Option<&[u8]>,
+    ess_fails: bool,
     pades: &mut PadesAttrs,
     findings: &mut Findings,
 ) {
@@ -540,7 +660,7 @@ fn check_signed_attributes(
             .zip(signer_cert)
             .is_some_and(|(value, cert)| ess_cert_id_matches(value, cert, true));
         pades.signing_certificate_v2 = Some(matched);
-        if !matched && signer_cert.is_some() {
+        if ess_fails && !matched && signer_cert.is_some() {
             findings.fail(
                 ProblemCode::SigningCertificateMismatch,
                 "the signing-certificate-v2 attribute does not identify the signer certificate",
@@ -552,7 +672,7 @@ fn check_signed_attributes(
             .zip(signer_cert)
             .is_some_and(|(value, cert)| ess_cert_id_matches(value, cert, false));
         pades.signing_certificate_v1 = Some(matched);
-        if !matched && signer_cert.is_some() && v2.is_empty() {
+        if ess_fails && !matched && signer_cert.is_some() && v2.is_empty() {
             findings.fail(
                 ProblemCode::SigningCertificateMismatch,
                 "the signing-certificate attribute does not identify the signer certificate",
@@ -601,7 +721,8 @@ fn unique_value<'a>(found: &[&'a Vec<Vec<u8>>]) -> Option<&'a [u8]> {
 }
 
 /// Whether the attribute set is DER: minimal definite lengths, no constructed strings, the
-/// attributes and each attribute's values in DER `SET OF` order (X.690 §10, §11.6).
+/// attributes and each attribute's values in DER `SET OF` order (X.690 §10, §11.6), BOOLEANs
+/// `00` or `FF` and BIT STRINGs with clear unused bits (§11.1, §11.2.1).
 fn is_der_attribute_set(raw: &[u8], set: &Element) -> bool {
     if !set.minimal_length || set.indefinite {
         return false;
@@ -616,11 +737,23 @@ fn is_der_attribute_set(raw: &[u8], set: &Element) -> bool {
             return false;
         }
         previous = Some(encoded);
-        if !tlv::is_der_tree(raw, &attribute, 1, MAX_DEPTH) {
+        if !tlv::is_der_tree(raw, &attribute, 1, MAX_DEPTH)
+            || !tlv::der_primitive_contents(raw, &attribute, 1, MAX_DEPTH)
+        {
             return false;
         }
     }
     true
+}
+
+/// Whether the raw `signedAttrs` element (`[0] IMPLICIT SET OF Attribute`) is DER, as
+/// [`is_der_attribute_set`] checks it. RFC 5652 §5.4 computes the signature over the DER
+/// encoding of the attributes, and verifiers that re-encode before they verify (OpenSSL's
+/// `PKCS7_signatureVerify` re-encodes each attribute and sorts its values; BouncyCastle, under EU
+/// DSS, re-encodes the whole set) refuse a signature made over any other encoding (M4 QA round
+/// 3 finding 2).
+pub(crate) fn signed_attributes_are_der(raw: &[u8]) -> bool {
+    tlv::read_exact(raw, MAX_DEPTH).is_ok_and(|set| is_der_attribute_set(raw, &set))
 }
 
 /// Checks the first `ESSCertID(v2)` of a `SigningCertificate(V2)` value against `cert`:
@@ -660,6 +793,223 @@ fn ess_cert_id_matches(value: &[u8], cert: &[u8], v2: bool) -> bool {
         None => true,
         Some(issuer_serial) => issuer_serial_matches(value, issuer_serial, cert),
     }
+}
+
+/// The most `ESSCertID`s [`check_signing_certificates`] reads in one attribute.
+const MAX_ESS_CERT_IDS: usize = crate::cms::MAX_CERTIFICATES;
+
+/// One `ESSCertID` (RFC 2634 §5.4.1) or `ESSCertIDv2` (RFC 5035 §4), read strictly.
+struct EssCertId<'a> {
+    /// The hash algorithm of `cert_hash` (SHA-1 for v1, the DEFAULT SHA-256 for v2).
+    hash: DigestAlgorithm,
+    /// The certificate hash.
+    cert_hash: &'a [u8],
+    /// The `IssuerSerial`, when present (in `value`).
+    issuer_serial: Option<Element>,
+}
+
+/// The `ESSCertID(v2)`s of a `SigningCertificate(V2)` attribute value (RFC 2634 §5.4, RFC 5035
+/// §3), read as a whitelist: `SEQUENCE { certs SEQUENCE OF ESSCertID(v2), policies SEQUENCE
+/// OPTIONAL }` with at least one and at most [`MAX_ESS_CERT_IDS`] identifiers; each one a
+/// hash algorithm Folioxide implements with absent or NULL parameters (v2 only; RFC 5754 §2), a
+/// certHash of that algorithm's length, and an optional `IssuerSerial`, nothing else. A
+/// timestamp token's attribute has already been decoded whole, `policies` and the issuer names
+/// included, by the token's shape check (`tsp::shape`, QA round 3 finding 3); this reads what
+/// the binding needs.
+fn ess_cert_ids(value: &[u8], v2: bool) -> std::result::Result<Vec<EssCertId<'_>>, String> {
+    let malformed = |what: &str| format!("the signing-certificate attribute is malformed: {what}");
+    let outer = tlv::read_exact(value, MAX_DEPTH).map_err(|e| malformed(&e.to_string()))?;
+    let parts = tlv::children_vec(value, &outer, 0, MAX_DEPTH, 2)
+        .map_err(|_| malformed("more than certs and policies"))?;
+    let (certs, policies) = match parts.as_slice() {
+        [certs] => (certs, None),
+        [certs, policies] => (certs, Some(policies)),
+        _ => return Err(malformed("no certs")),
+    };
+    if outer.tag != TAG_SEQUENCE
+        || certs.tag != TAG_SEQUENCE
+        || policies.is_some_and(|p| p.tag != TAG_SEQUENCE)
+    {
+        return Err(malformed("not a SEQUENCE"));
+    }
+    let ids = tlv::children_vec(value, certs, 1, MAX_DEPTH, MAX_ESS_CERT_IDS).map_err(|_| {
+        malformed(&format!(
+            "more than {MAX_ESS_CERT_IDS} certificate identifiers"
+        ))
+    })?;
+    if ids.is_empty() {
+        return Err(malformed("the list of certificate identifiers is empty"));
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let fields = tlv::children_vec(value, id, 2, MAX_DEPTH, 3)
+            .map_err(|_| malformed("an identifier has too many fields"))?;
+        if id.tag != TAG_SEQUENCE {
+            return Err(malformed("an identifier is not a SEQUENCE"));
+        }
+        let mut fields = fields.iter().peekable();
+        let mut hash = if v2 {
+            DigestAlgorithm::Sha256
+        } else {
+            DigestAlgorithm::Sha1
+        };
+        if v2 && let Some(algorithm) = fields.next_if(|f| f.tag == TAG_SEQUENCE) {
+            let algorithm = algorithm_id(value, algorithm, 3)
+                .map_err(|_| malformed("the hash algorithm does not parse"))?;
+            hash = algorithm
+                .digest()
+                .filter(|_| {
+                    algorithm
+                        .parameters
+                        .as_deref()
+                        .is_none_or(|p| p == [0x05, 0x00])
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "the signing-certificate-v2 hash algorithm {} is not supported (or has \
+                         parameters other than NULL)",
+                        algorithm.oid
+                    )
+                })?;
+        }
+        let cert_hash = fields
+            .next()
+            .filter(|f| f.tag == TAG_OCTET_STRING)
+            .map(|f| f.content(value))
+            .ok_or_else(|| malformed("an identifier has no certHash OCTET STRING"))?;
+        if cert_hash.len() != hash.output_len() {
+            return Err(malformed(&format!(
+                "a {hash} certHash has {} bytes, not {}",
+                cert_hash.len(),
+                hash.output_len()
+            )));
+        }
+        let issuer_serial = fields.next().copied();
+        if issuer_serial.is_some_and(|f| f.tag != TAG_SEQUENCE) || fields.next().is_some() {
+            return Err(malformed(
+                "an identifier holds more than a hash algorithm, a certHash and an IssuerSerial",
+            ));
+        }
+        out.push(EssCertId {
+            hash,
+            cert_hash,
+            issuer_serial,
+        });
+    }
+    Ok(out)
+}
+
+/// Whether `id` (read from `value`) identifies `cert`: its certHash, and its `IssuerSerial` when
+/// present, which must be exactly `{ issuer, serialNumber }` (RFC 5035 §4, as OpenSSL's
+/// `ESS_ISSUER_SERIAL`).
+fn ess_cert_id_names(value: &[u8], id: &EssCertId<'_>, cert: &[u8], cert_digest: &[u8]) -> bool {
+    id.cert_hash == cert_digest
+        && id.issuer_serial.is_none_or(|issuer_serial| {
+            tlv::children_vec(value, &issuer_serial, 3, MAX_DEPTH, 2).is_ok_and(|f| f.len() == 2)
+                && issuer_serial_matches(value, &issuer_serial, cert)
+        })
+}
+
+/// The certificates that the later identifiers of an ESS signing-certificate attribute may name
+/// ([`check_signing_certificates`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EssIssuers<'a> {
+    /// The certificates of this pool linked to the signer by verified issuer signatures
+    /// ([`linked_issuers`](crate::x509info::linked_issuers)): the stand-in for a verified chain
+    /// when no validated path is at hand.
+    Linked(&'a [Vec<u8>]),
+    /// Exactly these certificates: a validated certification path above the signer, its trust
+    /// anchor included, which is the chain OpenSSL checks them against.
+    Path(&'a [Vec<u8>]),
+}
+
+/// Checks the ESS signing-certificate binding of a timestamp token as OpenSSL's
+/// `OSSL_ESS_check_signing_certs` does (RFC 3161 §2.4.1, RFC 5035 §5.4, RFC 2634 §5.4; M4 QA
+/// round 1 finding F3): at least one of signing-certificate (v1) and signing-certificate-v2
+/// is present among the raw `signed_attrs`; **each** one present is a single attribute with
+/// one value; its first identifier names `signer`, and every later identifier names one of the
+/// `issuers` other than `signer` (OpenSSL: a later identifier that names the signer is
+/// `ESS_R_ESS_CERT_ID_WRONG_ORDER`). pyHanko only reads the first identifier of v2 (or of v1
+/// without v2).
+///
+/// The issuers are never found by name alone (M4 QA round 2 finding 3): a decoy certificate
+/// that carries an issuer's subject name but not its key is not linked by a verified
+/// signature, so a later identifier naming it fails, as it fails in OpenSSL, which looks for it
+/// in the verified chain.
+///
+/// # Errors
+/// What is wrong, as one sentence.
+pub(crate) fn check_signing_certificates(
+    signed_attrs: &[u8],
+    signer: &[u8],
+    issuers: EssIssuers<'_>,
+) -> std::result::Result<(), String> {
+    let attrs = attributes(signed_attrs);
+    let mut present = 0;
+    let mut chain: Option<Vec<&[u8]>> = None;
+    let mut digests: std::collections::HashMap<(DigestAlgorithm, usize), Vec<u8>> =
+        std::collections::HashMap::new();
+    for (dotted, v2, name) in [
+        (oid::SIGNING_CERTIFICATE_V2, true, "signing-certificate-v2"),
+        (oid::SIGNING_CERTIFICATE, false, "signing-certificate"),
+    ] {
+        let wanted = oid_bytes(dotted);
+        let found: Vec<&Vec<Vec<u8>>> = attrs
+            .iter()
+            .filter(|(attr_type, _)| *attr_type == wanted)
+            .map(|(_, values)| values)
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        present += 1;
+        let value = unique_value(&found)
+            .ok_or_else(|| format!("the {name} attribute is not one attribute with one value"))?;
+        let ids = ess_cert_ids(value, v2)?;
+        let mut ids = ids.iter();
+        if !ids.next().is_some_and(|first| {
+            ess_cert_id_names(value, first, signer, &first.hash.digest(&[signer]))
+        }) {
+            return Err(format!(
+                "the first identifier of the {name} attribute does not name the TSA certificate"
+            ));
+        }
+        for later in ids {
+            let chain = chain.get_or_insert_with(|| match issuers {
+                EssIssuers::Linked(pool) => crate::x509info::linked_issuers(signer, pool),
+                EssIssuers::Path(path) => path
+                    .iter()
+                    .map(Vec::as_slice)
+                    .filter(|cert| *cert != signer)
+                    .collect(),
+            });
+            // Each certificate is hashed once per algorithm, however many identifiers there are.
+            let named = chain.iter().enumerate().any(|(index, cert)| {
+                let digest = digests
+                    .entry((later.hash, index))
+                    .or_insert_with(|| later.hash.digest(&[cert]));
+                ess_cert_id_names(value, later, cert, digest)
+            });
+            if !named {
+                return Err(match issuers {
+                    EssIssuers::Linked(_) => format!(
+                        "a later identifier of the {name} attribute names no certificate that \
+                         issued the TSA certificate or one of its issuers (each checked by name \
+                         and signature)"
+                    ),
+                    EssIssuers::Path(_) => format!(
+                        "a later identifier of the {name} attribute names no certificate of the \
+                         TSA certificate's validated path to the trust anchor, which is where \
+                         OpenSSL looks for it"
+                    ),
+                });
+            }
+        }
+    }
+    if present == 0 {
+        return Err("the token has no ESS signing-certificate attribute (v1 or v2)".to_owned());
+    }
+    Ok(())
 }
 
 /// `IssuerSerial ::= SEQUENCE { issuer GeneralNames, serialNumber, issuerUID OPTIONAL }`: exactly
@@ -769,4 +1119,306 @@ pub(crate) fn verify_and_normalize(
         SignatureAlgorithm::Ecdsa => key.verify_ecdsa(&hashed, signature),
     };
     result.map_err(|VerifyFailure::Invalid(message)| Error::SignatureInvalid(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cms::tlv::{TAG_NULL, tlv, tlv_parts};
+
+    /// The raw `signedAttrs` (`[0]`) holding `attrs` (whole `Attribute`s).
+    fn signed_attrs(attrs: &[Vec<u8>]) -> Vec<u8> {
+        tlv(TAG_CONTEXT_0, &attrs.concat())
+    }
+
+    /// An `Attribute` of the dotted type `oid` with the single value `value`.
+    fn attribute(dotted: &'static str, value: &[u8]) -> Vec<u8> {
+        tlv_parts(
+            TAG_SEQUENCE,
+            &[&tlv(TAG_OID, &oid_bytes(dotted)), &tlv(TAG_SET, value)],
+        )
+    }
+
+    /// `SigningCertificate(V2) { certs { ids } }`.
+    fn signing_certificate(ids: &[Vec<u8>]) -> Vec<u8> {
+        tlv(TAG_SEQUENCE, &tlv(TAG_SEQUENCE, &ids.concat()))
+    }
+
+    /// An `ESSCertID(v2)` without issuerSerial: `fields` then the certHash.
+    fn cert_id(fields: &[&[u8]], hash: &[u8]) -> Vec<u8> {
+        let mut content: Vec<u8> = fields.concat();
+        content.extend(tlv(TAG_OCTET_STRING, hash));
+        tlv(TAG_SEQUENCE, &content)
+    }
+
+    #[test]
+    fn ess_attributes_are_read_as_a_whitelist() {
+        // Not a certificate: nothing here parses it, the identifiers name its bytes.
+        let tsa: &[u8] = b"the TSA certificate";
+        let sha256 = DigestAlgorithm::Sha256.digest(&[tsa]);
+        let sha1 = DigestAlgorithm::Sha1.digest(&[tsa]);
+        let v2 =
+            |ids: &[Vec<u8>]| attribute(oid::SIGNING_CERTIFICATE_V2, &signing_certificate(ids));
+        let v1 = |ids: &[Vec<u8>]| attribute(oid::SIGNING_CERTIFICATE, &signing_certificate(ids));
+        let check = |attrs: &[Vec<u8>]| {
+            check_signing_certificates(&signed_attrs(attrs), tsa, EssIssuers::Linked(&[]))
+        };
+
+        assert_eq!(check(&[v2(&[cert_id(&[], &sha256)])]), Ok(()));
+        assert_eq!(check(&[v1(&[cert_id(&[], &sha1)])]), Ok(()));
+        assert_eq!(
+            check(&[v2(&[cert_id(&[], &sha256)]), v1(&[cert_id(&[], &sha1)])]),
+            Ok(())
+        );
+        let sha384 = tlv(TAG_SEQUENCE, &tlv(TAG_OID, &oid_bytes(oid::SHA384)));
+        let sha384_hash = DigestAlgorithm::Sha384.digest(&[tsa]);
+        assert_eq!(check(&[v2(&[cert_id(&[&sha384], &sha384_hash)])]), Ok(()));
+
+        let refused = |attrs: &[Vec<u8>], why: &str| {
+            let err = check(attrs).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        };
+        refused(&[], "no ESS signing-certificate attribute");
+        // Each attribute present is checked (OpenSSL), not v2 alone (pyHanko).
+        refused(
+            &[v2(&[cert_id(&[], &sha256)]), v1(&[cert_id(&[], &[0; 20])])],
+            "first identifier of the signing-certificate attribute",
+        );
+        // A later identifier must name a certificate of the chain: here there is none.
+        refused(
+            &[v2(&[cert_id(&[], &sha256), cert_id(&[], &[7; 32])])],
+            "a later identifier",
+        );
+        refused(&[v2(&[])], "list of certificate identifiers is empty");
+        refused(
+            &[v2(&[cert_id(&[], &sha256[..31])])],
+            "certHash has 31 bytes",
+        );
+        let sha256_octets = tlv(
+            TAG_SEQUENCE,
+            &[
+                tlv(TAG_OID, &oid_bytes(oid::SHA256)),
+                tlv(TAG_OCTET_STRING, &[]),
+            ]
+            .concat(),
+        );
+        refused(
+            &[v2(&[cert_id(&[&sha256_octets], &sha256)])],
+            "not supported (or has parameters other than NULL)",
+        );
+        let unknown = tlv(TAG_SEQUENCE, &tlv(TAG_OID, &[0x2A, 0x03]));
+        refused(
+            &[v2(&[cert_id(&[&unknown], &sha256)])],
+            "1.2.3 is not supported",
+        );
+        // Something after the issuerSerial, too many fields, an issuerSerial that is no SEQUENCE.
+        let null = tlv(TAG_NULL, &[]);
+        let after = [
+            tlv(TAG_OCTET_STRING, &sha256),
+            tlv(TAG_SEQUENCE, &[]),
+            null.clone(),
+        ]
+        .concat();
+        refused(
+            &[v2(&[tlv(TAG_SEQUENCE, &after)])],
+            "more than a hash algorithm",
+        );
+        let four = [after, null].concat();
+        refused(&[v2(&[tlv(TAG_SEQUENCE, &four)])], "too many fields");
+        let not_sequence = [tlv(TAG_OCTET_STRING, &sha256), tlv(TAG_INTEGER, &[1])].concat();
+        refused(
+            &[v2(&[tlv(TAG_SEQUENCE, &not_sequence)])],
+            "more than a hash algorithm",
+        );
+        // One attribute with two values, and two attributes.
+        let two_values = tlv_parts(
+            TAG_SEQUENCE,
+            &[
+                &tlv(TAG_OID, &oid_bytes(oid::SIGNING_CERTIFICATE_V2)),
+                &tlv_parts(
+                    TAG_SET,
+                    &[
+                        &signing_certificate(&[cert_id(&[], &sha256)]),
+                        &signing_certificate(&[cert_id(&[], &sha256)]),
+                    ],
+                ),
+            ],
+        );
+        refused(&[two_values], "not one attribute with one value");
+        let once = v2(&[cert_id(&[], &sha256)]);
+        refused(&[once.clone(), once], "not one attribute with one value");
+        // Garbage values never panic.
+        refused(
+            &[attribute(oid::SIGNING_CERTIFICATE_V2, &[0x05, 0x00])],
+            "malformed",
+        );
+        assert!(check_signing_certificates(b"garbage", tsa, EssIssuers::Linked(&[])).is_err());
+        assert!(check_signing_certificates(b"garbage", tsa, EssIssuers::Path(&[])).is_err());
+    }
+
+    #[test]
+    fn later_identifiers_name_a_listed_issuer_other_than_the_signer() {
+        // Not certificates: with `Path`, nothing parses them, the identifiers name their bytes.
+        let tsa: &[u8] = b"the TSA certificate";
+        let root = b"the root".to_vec();
+        let hash = |c: &[u8]| DigestAlgorithm::Sha256.digest(&[c]);
+        let v2 = |ids: &[Vec<u8>]| {
+            signed_attrs(&[attribute(
+                oid::SIGNING_CERTIFICATE_V2,
+                &signing_certificate(ids),
+            )])
+        };
+        let path = [tsa.to_vec(), root.clone()];
+        let named = v2(&[cert_id(&[], &hash(tsa)), cert_id(&[], &hash(&root))]);
+        assert_eq!(
+            check_signing_certificates(&named, tsa, EssIssuers::Path(&path)),
+            Ok(())
+        );
+        // The root is not a linked issuer of bytes that are no certificate.
+        let err = check_signing_certificates(&named, tsa, EssIssuers::Linked(&path)).unwrap_err();
+        assert!(err.contains("checked by name and signature"), "{err}");
+        // A later identifier never names the signer itself (OpenSSL: wrong order).
+        let twice = v2(&[cert_id(&[], &hash(tsa)), cert_id(&[], &hash(tsa))]);
+        let err = check_signing_certificates(&twice, tsa, EssIssuers::Path(&path)).unwrap_err();
+        assert!(err.contains("validated path to the trust anchor"), "{err}");
+    }
+
+    #[test]
+    fn pss_parameters_are_read_in_their_order_each_field_once() {
+        // M4 final fix round 2, finding 2: a repeated or out-of-order field let the last
+        // value win, where pyHanko reads the first and OpenSSL cannot decode the parameters.
+        let hash = |dotted: &'static str| {
+            tlv_parts(
+                TAG_SEQUENCE,
+                &[&tlv(TAG_OID, &oid_bytes(dotted)), &[TAG_NULL, 0x00]],
+            )
+        };
+        let sha256 = hash("2.16.840.1.101.3.4.2.1");
+        let sha1 = hash("1.3.14.3.2.26");
+        let mgf1 = |h: &[u8]| tlv_parts(TAG_SEQUENCE, &[&tlv(TAG_OID, &oid_bytes(oid::MGF1)), h]);
+        let int = |v: &[u8]| tlv(TAG_INTEGER, v);
+        let params = |fields: &[Vec<u8>]| tlv(TAG_SEQUENCE, &fields.concat());
+        let f0 = |h: &[u8]| tlv(TAG_CONTEXT_0, h);
+        let f1 = |h: &[u8]| tlv(TAG_CONTEXT_1, &mgf1(h));
+        let f2 = |v: &[u8]| tlv(TAG_CONTEXT_2, &int(v));
+        let f3 = |v: &[u8]| tlv(TAG_CONTEXT_3, &int(v));
+        let read = |fields: &[Vec<u8>]| pss_parameters(Some(&params(fields)));
+
+        // Accepted: the defaults, absent or written out, and every field once, in order.
+        assert_eq!(pss_parameters(None), Ok((DigestAlgorithm::Sha1, 20)));
+        assert_eq!(read(&[]), Ok((DigestAlgorithm::Sha1, 20)));
+        assert_eq!(
+            read(&[f0(&sha1), f1(&sha1), f2(&[20]), f3(&[1])]),
+            Ok((DigestAlgorithm::Sha1, 20))
+        );
+        assert_eq!(
+            read(&[f0(&sha256), f1(&sha256), f2(&[32])]),
+            Ok((DigestAlgorithm::Sha256, 32))
+        );
+        assert_eq!(
+            read(&[f0(&sha256), f1(&sha256), f2(&[0x00, 0x80])]),
+            Ok((DigestAlgorithm::Sha256, 128))
+        );
+
+        // Refused: QA's variants (r8-pss-spkiq-dup-hash-last-sha1, -dup-salt-last-20,
+        // -out-of-order; r8-pss-tokparams-dup-hash-last-sha1, -dup-salt-last-20) and their
+        // neighbours.
+        let refused: [(&str, Vec<Vec<u8>>); 9] = [
+            (
+                "hash twice",
+                vec![f0(&sha256), f0(&sha1), f1(&sha1), f2(&[20])],
+            ),
+            (
+                "salt twice",
+                vec![f0(&sha1), f1(&sha1), f2(&[64]), f2(&[20])],
+            ),
+            ("mgf twice", vec![f0(&sha1), f1(&sha256), f1(&sha1)]),
+            ("trailer twice", vec![f3(&[1]), f3(&[1])]),
+            ("out of order", vec![f1(&sha1), f0(&sha1), f2(&[20])]),
+            (
+                "salt before hash",
+                vec![f2(&[32]), f0(&sha256), f1(&sha256)],
+            ),
+            (
+                "two elements in one field",
+                vec![tlv(TAG_CONTEXT_2, &[int(&[32]), int(&[20])].concat())],
+            ),
+            ("a padded salt length", vec![f2(&[0x00, 0x20])]),
+            (
+                "an element after the fields",
+                vec![f0(&sha256), f1(&sha256), f2(&[32]), int(&[1])],
+            ),
+        ];
+        for (name, fields) in refused {
+            assert!(read(&fields).is_err(), "{name}: {:?}", read(&fields));
+        }
+        let err = read(&[f0(&sha256), f0(&sha1)]).unwrap_err();
+        assert!(err.contains("repeated or out of order"), "{err}");
+        // An empty explicit tag, and bytes after the SEQUENCE.
+        assert!(read(&[tlv(TAG_CONTEXT_0, &[])]).is_err());
+        let mut trailing = params(&[f2(&[20])]);
+        trailing.push(0x00);
+        assert!(pss_parameters(Some(&trailing)).is_err());
+    }
+
+    #[test]
+    fn pss_hash_parameters_are_absent_or_null() {
+        // M4 closing round, finding 7 (variants r9-pssanchor-int-hash-only, -int-mgf-only,
+        // -int-both, -octets-both, -seq-both, r9-pss256-anchor-hash-alg-int-params): RFC 4055
+        // §2.1 allows only absent or NULL parameters on the hash AlgorithmIdentifiers, and
+        // pyHanko compares them structurally.
+        let sha256 = |parameters: &[&[u8]]| {
+            let mut parts: Vec<&[u8]> = Vec::new();
+            let oid = tlv(TAG_OID, &oid_bytes("2.16.840.1.101.3.4.2.1"));
+            parts.push(&oid);
+            parts.extend_from_slice(parameters);
+            tlv_parts(TAG_SEQUENCE, &parts)
+        };
+        let mgf1 = |h: &[u8]| tlv_parts(TAG_SEQUENCE, &[&tlv(TAG_OID, &oid_bytes(oid::MGF1)), h]);
+        let read = |hash: &[u8], mgf_hash: &[u8]| {
+            let fields = [
+                tlv(TAG_CONTEXT_0, hash),
+                tlv(TAG_CONTEXT_1, &mgf1(mgf_hash)),
+                tlv(TAG_CONTEXT_2, &tlv(TAG_INTEGER, &[32])),
+            ];
+            pss_parameters(Some(&tlv(TAG_SEQUENCE, &fields.concat())))
+        };
+        let null: &[u8] = &[TAG_NULL, 0x00];
+        let (with_null, absent) = (sha256(&[null]), sha256(&[]));
+        // Accepted: NULL or absent, in both places and in any mix (the r9 controls).
+        for (hash, mgf_hash) in [
+            (&with_null, &with_null),
+            (&absent, &absent),
+            (&with_null, &absent),
+            (&absent, &with_null),
+        ] {
+            assert_eq!(read(hash, mgf_hash), Ok((DigestAlgorithm::Sha256, 32)));
+        }
+        // Refused: any other parameters, in the hash, in the MGF1 hash, or in both.
+        let integer = tlv(TAG_INTEGER, &[1]);
+        let octets = tlv(TAG_OCTET_STRING, &[]);
+        let sequence = tlv(TAG_SEQUENCE, &[]);
+        let null_with_content = tlv(TAG_NULL, &[0x00]);
+        for (name, odd) in [
+            ("INTEGER", &integer),
+            ("empty OCTET STRING", &octets),
+            ("empty SEQUENCE", &sequence),
+            ("NULL with content", &null_with_content),
+        ] {
+            let odd = sha256(&[odd]);
+            for (place, hash, mgf_hash) in [
+                ("hash", &odd, &with_null),
+                ("MGF1 hash", &with_null, &odd),
+                ("both", &odd, &odd),
+            ] {
+                let err = read(hash, mgf_hash).unwrap_err();
+                assert!(
+                    err.contains("neither absent nor NULL"),
+                    "{name} {place}: {err}"
+                );
+            }
+        }
+        // Two parameters (r9-pssanchor-two-params-hash) are no AlgorithmIdentifier at all.
+        assert!(read(&sha256(&[null, null]), &with_null).is_err());
+    }
 }

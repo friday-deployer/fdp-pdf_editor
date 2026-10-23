@@ -65,7 +65,9 @@ pub fn incremental_suffix(store: &Store, opts: &IncrementalOptions) -> Result<Ve
 ///   the section lists, if that is higher) and lists itself. A freed object gets a
 ///   free entry with the next generation (§7.5.4; 65535 stays 65535), linked from object 0;
 /// - a trailer with every entry of the newest one but those the writer computes (`/Size`: the
-///   highest number + 1; `/Prev`: the newest revision's `startxref`), the edits of
+///   highest number + 1, or the newest revision's own `/Size` when that is a larger direct
+///   integer within [`Limits::max_objects`](crate::Limits::max_objects), so an update never
+///   shrinks it; `/Prev`: the newest revision's `startxref`), the edits of
 ///   [`Store::set_trailer_entry`] applied, and `/ID [orig0 new1]` (see
 ///   [`IncrementalOptions::id1`]; generated from the content when the source has none);
 /// - `startxref` and `%%EOF`.
@@ -232,7 +234,8 @@ fn build_update(
         .fold(store.max_object_number(), u32::max);
     let size = highest
         .checked_add(1)
-        .ok_or_else(|| Error::limit(LimitKind::MaxObjects, u64::from(u32::MAX), None))?;
+        .ok_or_else(|| Error::limit(LimitKind::MaxObjects, u64::from(u32::MAX), None))?
+        .max(carried_size(store, &last.trailer));
     let mut trailer = Dict::with_capacity(carried.len() + 3);
     trailer.insert(keys::SIZE, Object::from(size));
     for (key, value) in carried {
@@ -293,6 +296,31 @@ fn build_update(
             XrefKind::Table
         }),
     })
+}
+
+/// The `/Size` of the newest revision's trailer (as written, [`Revision::trailer`]) that an
+/// update keeps when it is larger than the highest number + 1: a direct, non-negative integer
+/// no larger than [`Limits::max_objects`](crate::Limits::max_objects); otherwise 0, which
+/// keeps nothing.
+///
+/// ISO 32000-2 §7.5.5 (Table 15) makes `/Size` one greater than the highest object number, so
+/// for a conforming file the highest number + 1 is never smaller. A revision may over-declare it
+/// (`/Size 100` over objects numbered up to 11); an update whose `/Size` fell below it would
+/// shrink the object table of a reader that keeps only the objects below the newest `/Size`
+/// (PDFium), which is why a signature verifier treats such an update as suspect (manager ruling
+/// R-30 (a)). pyHanko's incremental writer keeps the previous `/Size` too. The numbers between
+/// the highest one in use and the kept `/Size` stay unused (§7.3.10: an unlisted object is
+/// `null`).
+///
+/// [`Revision::trailer`]: crate::Revision::trailer
+fn carried_size(store: &Store, trailer: &Dict) -> u32 {
+    match trailer.get(keys::SIZE) {
+        Some(&Object::Int(size)) => u32::try_from(size)
+            .ok()
+            .filter(|&size| size <= store.limits().max_objects)
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// The objects to write, by identifier in object-number order: the store's edits, with the

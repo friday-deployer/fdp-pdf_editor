@@ -27,6 +27,8 @@ napi-build.workspace = true
 folioxide = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
+# The mock TSA of the B-T tests (M4).
+folioxide-testkit.workspace = true
 
 # Same as [workspace.lints] except `unsafe_code`, which is `deny` instead of `forbid`: the
 # `#[napi]` macros expand to `unsafe` FFI glue wrapped in `#[allow(unsafe_code)]`, and `forbid`

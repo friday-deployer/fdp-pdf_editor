@@ -35,6 +35,15 @@
 //!   [`verify_bytes`], [`VerifyOptions`]) with a [`SignatureReport`] per signature
 //!   (integrity, validity, [`Coverage`], [`ModificationLevel`], certificate information
 //!   ([`CertificateInfo`]) and trust). The whole signature layer is [`mod@sign`].
+//! - M4, signatures II (feature `signatures`): PAdES B-T with RFC 3161 signature timestamps
+//!   through a [`Timestamper`] ([`SignRequest::with_timestamper`]) or in two phases for
+//!   asynchronous hosts ([`PreparedSignature::timestamp_request`],
+//!   [`PreparedSignature::finish_with_timestamp`], [`TimestampParams`]); certification
+//!   signatures with DocMDP permissions ([`DocMdpPermissions`],
+//!   [`SignatureOptions::certification`]); visible signatures ([`SignatureAppearance`]); and
+//!   verification of signature timestamps and document timestamps ([`TimestampInfo`] in
+//!   [`SignatureReport::timestamp`], and `docmdp_ok`). The content kit that visible signatures
+//!   are drawn with is [`mod@content`].
 //! - Errors are one [`enum@Error`] with a stable [`ErrorCode`], whichever layer failed.
 //!
 //! Bytes in, bytes out: the core reads no files and has no clock, so the caller reads and writes
@@ -190,6 +199,72 @@
 //! # }
 //! # Ok::<(), folioxide::Error>(())
 //! ```
+//!
+//! PAdES B-T and certification (M4): a [`Timestamper`] sends the DER `TimeStampReq` to a TSA
+//! and returns its DER `TimeStampResp`. The core has no network I/O, so the host implements it
+//! (here a mock TSA stands in); any `Fn(&[u8]) -> sign::Result<Vec<u8>> + Send + Sync` closure
+//! is one. A certification signature (DocMDP `P = 2` here) allows later form filling and
+//! signing, and each report says whether later revisions kept to the permissions in force
+//! (`docmdp_ok`, which [`SignatureReport::is_acceptable`] requires).
+//!
+//! ```
+//! # #[cfg(feature = "signatures")] {
+//! use folioxide::{
+//!     DocMdpPermissions, Document, LocalSigner, ModificationLevel, OpenOptions, PadesLevel,
+//!     PdfDate, SignRequest, TimestampParams, VerifyOptions, certificates_from_pem, sign,
+//!     verify_bytes,
+//! };
+//!
+//! # let pki = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/pki");
+//! # let read = |name: &str| std::fs::read_to_string(pki.join(name)).unwrap();
+//! # let first = |name: &str| certificates_from_pem(&read(name)).unwrap().remove(0);
+//! # let tsa_key = LocalSigner::from_pem(&read("tsa.key.pem"), &read("tsa.pem"), None)?;
+//! # let mock = folioxide_testkit::tsa::MockTsa::new(
+//! #     first("tsa.pem"),
+//! #     vec![first("root.pem")],
+//! #     Box::new(move |attrs| {
+//! #         folioxide::Signer::sign(&tsa_key, folioxide::DigestAlgorithm::Sha256, attrs).unwrap()
+//! #     }),
+//! # );
+//! # let original = folioxide_testkit::fixtures::syntax::minimal();
+//! let signer = LocalSigner::from_pem(
+//!     &read("signer-p256.key.pem"),
+//!     &(read("signer-p256.pem") + &read("intermediate.pem")),
+//!     None,
+//! )?;
+//! let time = PdfDate::parse(b"D:20261010120000Z").unwrap();
+//! // The TSA. In an application: an HTTP POST of `application/timestamp-query`.
+//! let tsa = |request: &[u8]| -> folioxide::sign::Result<Vec<u8>> { Ok(mock.respond(request)) };
+//!
+//! // Certify (P = 2) with a signature timestamp, in one step.
+//! let doc = Document::open(original, &OpenOptions::default())?;
+//! let request = SignRequest::new(&signer, time);
+//! let options = request
+//!     .options
+//!     .clone()
+//!     .with_certification(Some(DocMdpPermissions::FormFilling));
+//! let request = request
+//!     .with_options(options)
+//!     .with_timestamper(&tsa, TimestampParams::new());
+//! let certified = sign(&doc, &request)?;
+//!
+//! // An approval signature on top: P = 2 allows it.
+//! let doc = Document::open(certified, &OpenOptions::default())?;
+//! let approved = sign(&doc, &SignRequest::new(&signer, time))?;
+//!
+//! let roots = certificates_from_pem(&read("root.pem"))?;
+//! let reports = verify_bytes(approved, &VerifyOptions::new().with_trust_anchors_der(roots))?;
+//! let certification = &reports[0];
+//! assert_eq!(certification.docmdp, Some(2));
+//! assert_eq!(certification.docmdp_ok, Some(true));
+//! assert_eq!(certification.modification, ModificationLevel::FormFilling);
+//! assert_eq!(certification.pades_level, Some(PadesLevel::BT));
+//! let timestamp = certification.timestamp.as_ref().expect("a signature timestamp");
+//! assert!(timestamp.intact && timestamp.valid && timestamp.trusted == Some(true));
+//! assert!(certification.is_acceptable(ModificationLevel::FormFilling));
+//! # }
+//! # Ok::<(), folioxide::Error>(())
+//! ```
 
 /// The version of the `folioxide` crate, for example `"0.1.0"`.
 ///
@@ -251,6 +326,29 @@ pub use folioxide_sign::{
     verify_pdf::{VerifyOptions, verify, verify_bytes},
     x509info::{TrustResult, UnixTime, build_trust, certificate_info},
 };
+// Signatures II (M4 brief §3; WP4.3B): RFC 3161 timestamps and PAdES B-T, certification
+// signatures (DocMDP) and visible signatures. The lower-level TSP and CMS items stay in
+// `sign::tsp` and `sign::cms`.
+#[cfg(feature = "signatures")]
+pub use folioxide_sign::{
+    appearance::{AppearanceText, ImagePosition, SignatureAppearance, Standard14Font},
+    bt::TimestampParams,
+    docmdp::DocMdpPermissions,
+    report::TimestampInfo,
+    sign::TSA_RETRY_MARGIN,
+    tsp::{
+        Accuracy, DEFAULT_TSA_RESERVE, GenTime, MAX_TIMESTAMP_TOKENS, MessageImprint, PkiStatus,
+        PkiStatusInfo, TimeStampReq, TimeStampResp, Timestamper, TokenVerification, TstInfo,
+        ValidatedToken, random_nonce, validate_response, verify_token,
+    },
+    x509info::{TrustPurpose, build_trust_for, check_tsa_certificate},
+};
+
+/// The content layer (`folioxide-content`): the content-stream builder, the standard-14 font
+/// metrics, WinAnsiEncoding and JPEG passthrough images that visible signature appearances are
+/// drawn with (M4). Its errors are [`SyntaxError`]s, which convert into [`enum@Error`] with `?`
+/// (an unreadable image is [`ErrorCode::Image`]).
+pub use folioxide_content as content;
 
 #[cfg(test)]
 mod tests {
@@ -346,7 +444,52 @@ mod tests {
             assert_serde::<PreparedSignature>();
             assert_serde::<FieldSpec>();
             assert_serde::<SignatureField>();
+            // M4.
+            assert_serde::<TimestampInfo>();
+            assert_serde::<TimestampParams>();
+            assert_serde::<DocMdpPermissions>();
+            assert_serde::<SignatureAppearance>();
+            assert_serde::<AppearanceText>();
+            assert_serde::<ImagePosition>();
+            assert_serde::<Standard14Font>();
         }
+    }
+
+    /// The M4 DTOs have the JSON shape the Node binding mirrors (ARCHITECTURE §A.7, §A.8):
+    /// DocMDP permissions as their number, PAdES levels as `"B-B"` and `"B-T"`, `camelCase`
+    /// timestamp fields.
+    #[cfg(all(feature = "serde", feature = "signatures"))]
+    #[test]
+    fn m4_dtos_serialize_as_the_binding_expects() {
+        use serde_json::json;
+
+        fn value<T: serde::Serialize>(dto: &T) -> serde_json::Value {
+            serde_json::to_value(dto).unwrap()
+        }
+        assert_eq!(value(&DocMdpPermissions::NoChanges), json!(1));
+        assert_eq!(value(&PadesLevel::BT), json!("B-T"));
+        assert_eq!(
+            value(&Standard14Font::HelveticaBold),
+            json!("Helvetica-Bold")
+        );
+        assert_eq!(value(&ImagePosition::Background), json!("background"));
+        let mut info = TimestampInfo::default();
+        info.gen_time = "2026-10-10T12:00:30Z".to_owned();
+        info.accuracy_micros = Some(1_000_000);
+        assert_eq!(
+            value(&info),
+            json!({
+                "genTime": "2026-10-10T12:00:30Z", "tsa": null, "tsaName": null, "policy": null,
+                "serialHex": null, "accuracyMicros": 1_000_000, "ordering": false,
+                "imprintAlgorithm": null, "signatureAlgorithm": null, "intact": false,
+                "valid": false, "trusted": null, "problems": [], "warnings": [],
+            })
+        );
+        let params: TimestampParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(params, TimestampParams::new());
+        let permissions: DocMdpPermissions = serde_json::from_str("3").unwrap();
+        assert_eq!(permissions, DocMdpPermissions::FormFillingAndAnnotations);
+        assert!(serde_json::from_str::<DocMdpPermissions>("4").is_err());
     }
 
     /// The signing and verification API of M3 is reachable from the facade root with the
@@ -382,6 +525,86 @@ mod tests {
         assert_eq!(SignatureKind::DocTimeStamp.as_str(), "docTimeStamp");
         assert_eq!(SubFilter::default().name(), "ETSI.CAdES.detached");
         assert_eq!(FieldSpec::default().mode, FieldMode::CreateOrUse);
+    }
+
+    /// The signatures-II API of M4 (brief §3.1–§3.3) is reachable from the facade root with the
+    /// brief's signatures, and its types are `Send + Sync + 'static` (ARCHITECTURE §A.8).
+    #[cfg(feature = "signatures")]
+    #[test]
+    // The function-pointer types spell out the signatures on purpose.
+    #[allow(clippy::type_complexity)]
+    fn m4_api_is_reexported() {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<TimestampInfo>();
+        assert_send_sync_static::<TimestampParams>();
+        assert_send_sync_static::<DocMdpPermissions>();
+        assert_send_sync_static::<SignatureAppearance>();
+        assert_send_sync_static::<TimeStampReq>();
+        assert_send_sync_static::<TimeStampResp>();
+        assert_send_sync_static::<TstInfo>();
+        assert_send_sync_static::<ValidatedToken>();
+        assert_send_sync_static::<TokenVerification>();
+        assert_send_sync_static::<Box<dyn Timestamper>>();
+
+        let _: fn(&PreparedSignature, &[u8], &TimestampParams) -> sign::Result<Vec<u8>> =
+            PreparedSignature::timestamp_request;
+        let _: fn(PreparedSignature, &[u8], &[u8], &[u8]) -> sign::Result<Vec<u8>> =
+            PreparedSignature::finish_with_timestamp;
+        let _: fn(
+            PreparedSignature,
+            &[u8],
+            &[u8],
+            &[u8],
+        ) -> std::result::Result<Vec<u8>, FinishError> =
+            PreparedSignature::try_finish_with_timestamp;
+        let _: fn(&TimeStampReq, &[u8]) -> sign::Result<ValidatedToken> = validate_response;
+        let _: fn(
+            &[u8],
+            &dyn Fn(DigestAlgorithm) -> Option<Vec<u8>>,
+            &[Vec<u8>],
+        ) -> TokenVerification = verify_token;
+        let _: fn(TrustPurpose, &[u8], &[Vec<u8>], &[Vec<u8>], UnixTime) -> TrustResult =
+            build_trust_for;
+        let _: fn(&[u8]) -> std::result::Result<(), String> = check_tsa_certificate;
+        let _: fn(&[u8]) -> sign::Result<GenTime> = GenTime::parse;
+        let _: fn() -> sign::Result<u64> = random_nonce;
+        let _: fn(i64) -> Option<DocMdpPermissions> = DocMdpPermissions::from_p;
+
+        // A closure is a timestamper; the options and requests take the M4 settings.
+        let tsa = |_: &[u8]| -> sign::Result<Vec<u8>> { Ok(Vec::new()) };
+        let signer = LocalSigner::from_pem(
+            include_str!("../../../fixtures/pki/signer-p256.key.pem"),
+            include_str!("../../../fixtures/pki/signer-p256.pem"),
+            None,
+        )
+        .unwrap();
+        let time = PdfDate::parse(b"D:20261010120000Z").unwrap();
+        let request =
+            SignRequest::new(&signer, time).with_timestamper(&tsa, TimestampParams::new());
+        assert!(request.timestamper.is_some());
+        let options = SignatureOptions::new(time)
+            .with_certification(Some(DocMdpPermissions::NoChanges))
+            .with_appearance(Some(SignatureAppearance::new(Rect::new(
+                10.0, 10.0, 210.0, 70.0,
+            ))))
+            .with_tsa_reserve(Some(DEFAULT_TSA_RESERVE));
+        assert_eq!(options.certification.map(DocMdpPermissions::p), Some(1));
+        assert_eq!(options.tsa_reserve, Some(8192));
+        assert_eq!(MAX_TIMESTAMP_TOKENS, 8);
+        assert_eq!(TSA_RETRY_MARGIN, 1024);
+        assert_eq!(PadesLevel::BT.as_str(), "B-T");
+        assert_eq!(Standard14Font::default(), Standard14Font::Helvetica);
+        assert_eq!(ImagePosition::default(), ImagePosition::Left);
+        assert_eq!(AppearanceText::default(), AppearanceText::Default);
+        assert_eq!(
+            check_tsa_certificate(
+                &certificates_from_pem(include_str!("../../../fixtures/pki/tsa.pem")).unwrap()[0]
+            ),
+            Ok(())
+        );
+        // The content kit is reachable as `folioxide::content`.
+        let width = content::standard14::Standard14Font::Helvetica.text_width(b"A", 10.0);
+        assert!((width - 6.67).abs() < 1e-9, "{width}");
     }
 
     /// A document without signatures verifies to an empty list; one with pending edits is

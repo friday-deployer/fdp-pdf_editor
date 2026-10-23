@@ -26,6 +26,11 @@
 //! checks but give the prepared signature back with the error ([`FinishError`]), so a caller
 //! whose external signer returned a wrong value can try again without preparing again.
 //!
+//! **Signature timestamps** (M4 brief §3.1): a CMS given to `embed_cms` may carry
+//! `id-aa-signatureTimeStampToken` unsigned attributes; every token must then verify over the
+//! CMS's signature value (brief §5 V7b: intact and valid), or the CMS is refused. The B-T flow
+//! that timestamps a signature value itself is [`bt`](crate::bt).
+//!
 //! **Embedding** (brief §4.2 step 7): the DER is written as uppercase hexadecimal digits right
 //! after the `/Contents` `<`; the rest of the `2R` digits stay `0`. The DER length delimits the
 //! CMS, so verifiers ignore the zero padding. A CMS longer than the reserve `R` fails with
@@ -56,7 +61,8 @@ pub struct FinishError {
 }
 
 impl FinishError {
-    fn new(error: Error, prepared: PreparedSignature) -> FinishError {
+    /// A refusal of `prepared` with `error` (also used by [`bt`](crate::bt)).
+    pub(crate) fn new(error: Error, prepared: PreparedSignature) -> FinishError {
         FinishError {
             error,
             prepared: Box::new(prepared),
@@ -232,11 +238,32 @@ impl PreparedSignature {
     /// # Errors
     /// As [`finish`](Self::finish), except [`Error::PlaceholderTooSmall`].
     fn signature_cms(&self, signature: &[u8]) -> Result<Vec<u8>> {
+        let value = self.normalized_signature(signature)?;
+        let der = cms::assemble(
+            &self.signed_attrs_der,
+            &value,
+            &self.chain_der,
+            self.algorithm,
+            self.key_kind,
+            self.digest,
+        )?;
+        self.check_assembled(&der, None)?;
+        Ok(der)
+    }
+
+    /// `signature` verified with the signer certificate over
+    /// [`to_be_signed`](Self::to_be_signed) and normalized as it is embedded
+    /// ([`cms::verify_and_normalize`]): the value a signature timestamp covers (M4 brief §4.5).
+    ///
+    /// # Errors
+    /// [`Error::SignatureInvalid`] when it does not verify; the certificate errors of
+    /// [`cms::verify_and_normalize`].
+    pub(crate) fn normalized_signature(&self, signature: &[u8]) -> Result<Vec<u8>> {
         let signer = self
             .chain_der
             .first()
             .ok_or_else(|| Error::InvalidArgument("the certificate chain is empty".to_owned()))?;
-        let value = cms::verify_and_normalize(
+        cms::verify_and_normalize(
             signer,
             self.algorithm,
             self.digest,
@@ -249,27 +276,19 @@ impl PreparedSignature {
                  prepared signed attributes: {message}"
             )),
             other => other,
-        })?;
-        let der = cms::assemble(
-            &self.signed_attrs_der,
-            &value,
-            &self.chain_der,
-            self.algorithm,
-            self.key_kind,
-            self.digest,
-        )?;
-        self.check_assembled(&der)?;
-        Ok(der)
+        })
     }
 
     /// Verifies the CMS `finish` assembled as a verifier will (brief §4.4, defence in depth):
     /// it parses, signs the prepared byte ranges, verifies with its signer certificate, has no
-    /// problem, and for `ETSI.CAdES.detached` is PAdES baseline B-B and DER.
+    /// problem, and for `ETSI.CAdES.detached` is PAdES baseline B-B and DER. With `token`, the
+    /// SignerInfo carries exactly that signature timestamp token, and it verifies over the
+    /// signature value (M4 brief §5 V7b: intact and valid).
     ///
     /// # Errors
     /// - [`Error::Crypto`]: it does not verify (an inconsistent prepared signature).
     /// - [`Error::InvalidArgument`]: for `ETSI.CAdES.detached`, a chain certificate is not DER.
-    fn check_assembled(&self, der: &[u8]) -> Result<()> {
+    pub(crate) fn check_assembled(&self, der: &[u8], token: Option<&[u8]>) -> Result<()> {
         let parsed = cms::parse(der)
             .map_err(|err| Error::Crypto(format!("the assembled CMS does not parse: {err}")))?;
         let verification = cms::verify_detached(&parsed, &|d| Some(self.digest_for(d)), &[]);
@@ -285,6 +304,23 @@ impl PreparedSignature {
             && !verification.pades_attrs.is_baseline_b()
         {
             failures.push("it is not PAdES baseline B-B".to_owned());
+        }
+        if let Some(token) = token {
+            match parsed.signer_infos.as_slice() {
+                [signer_info] => {
+                    let tokens = cms::signature_timestamp_tokens(signer_info);
+                    if tokens.as_slice() != [token] {
+                        failures.push(
+                            "it does not carry exactly the one signature timestamp token"
+                                .to_owned(),
+                        );
+                    }
+                    if let Err(reason) = token_verifies(token, &signer_info.signature) {
+                        failures.push(reason);
+                    }
+                }
+                _ => failures.push("it does not have exactly one SignerInfo".to_owned()),
+            }
         }
         if !failures.is_empty() {
             return Err(Error::Crypto(format!(
@@ -306,7 +342,7 @@ impl PreparedSignature {
     }
 
     /// The digest of the prepared byte ranges with `algorithm`.
-    fn digest_for(&self, algorithm: DigestAlgorithm) -> Vec<u8> {
+    pub(crate) fn digest_for(&self, algorithm: DigestAlgorithm) -> Vec<u8> {
         if algorithm == self.digest {
             self.document_digest.clone()
         } else {
@@ -379,6 +415,9 @@ impl PreparedSignature {
     ///   signature.
     /// - [`Error::PlaceholderTooSmall`]: the CMS is longer than the reserve (`needed` is its
     ///   length: prepare again with that `contents_reserve`).
+    /// - [`Error::InvalidArgument`] `"the CMS's signature timestamp is not valid: …"`: an
+    ///   `id-aa-signatureTimeStampToken` unsigned attribute holds a token that does not verify
+    ///   over the signature value (M4 brief §3.1, §5 V7b: intact and valid).
     pub fn embed_cms(self, cms_der: &[u8]) -> Result<Vec<u8>> {
         self.try_embed_cms(cms_der).map_err(FinishError::into_error)
     }
@@ -494,6 +533,16 @@ impl PreparedSignature {
                 needs.join(", ")
             )));
         }
+        // Signature timestamps (M4 brief §3.1): every token verifies over the signature value.
+        if let [signer_info] = parsed.signer_infos.as_slice() {
+            for token in cms::signature_timestamp_tokens(signer_info) {
+                token_verifies(&token, &signer_info.signature).map_err(|reason| {
+                    Error::InvalidArgument(format!(
+                        "the CMS's signature timestamp is not valid: {reason}"
+                    ))
+                })?;
+            }
+        }
         Ok(der)
     }
 
@@ -502,7 +551,7 @@ impl PreparedSignature {
     ///
     /// # Errors
     /// [`Error::PlaceholderTooSmall`] when `der` is longer than the reserve.
-    fn embed_der(self, der: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn embed_der(self, der: &[u8]) -> Result<Vec<u8>> {
         let at = self.embed_position(der)?;
         Ok(self.write_der(at, der))
     }
@@ -512,7 +561,7 @@ impl PreparedSignature {
     /// # Errors
     /// [`Error::PlaceholderTooSmall`] when `der` is longer than the reserve;
     /// [`Error::InvalidArgument`] when the range is not in the file.
-    fn embed_position(&self, der: &[u8]) -> Result<Range<usize>> {
+    pub(crate) fn embed_position(&self, der: &[u8]) -> Result<Range<usize>> {
         let reserved = self.contents_capacity();
         if der.len() > reserved {
             return Err(Error::PlaceholderTooSmall {
@@ -538,7 +587,7 @@ impl PreparedSignature {
 
     /// Writes `der` as uppercase hexadecimal digits at `at` (from
     /// [`embed_position`](Self::embed_position), which checked it) and returns the file.
-    fn write_der(self, at: Range<usize>, der: &[u8]) -> Vec<u8> {
+    pub(crate) fn write_der(self, at: Range<usize>, der: &[u8]) -> Vec<u8> {
         let mut pdf = self.pdf;
         if let Some(digits) = pdf.get_mut(at) {
             for (pair, &byte) in digits.chunks_exact_mut(2).zip(der) {
@@ -552,11 +601,35 @@ impl PreparedSignature {
     }
 }
 
+/// Brief §5 V7b on a signature timestamp token over `signature_value`: `Ok` when it is intact
+/// and valid, else the problems as one sentence.
+fn token_verifies(token: &[u8], signature_value: &[u8]) -> std::result::Result<(), String> {
+    let expected = |digest: DigestAlgorithm| Some(digest.digest(&[signature_value]));
+    let verification = crate::tsp::verify_token(token, &expected, &[]);
+    if verification.intact && verification.valid {
+        return Ok(());
+    }
+    let problems: Vec<String> = verification
+        .problems
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    Err(if problems.is_empty() {
+        "the token does not verify".to_owned()
+    } else {
+        problems.join("; ")
+    })
+}
+
 /// Whether the `ContentInfo` of `parsed` (in `der`) is DER-encoded as a whole, as EN 319 142-1
 /// requires for PAdES (brief §4.3, §4.6): definite minimal lengths, no constructed strings,
 /// every universal `SET OF` sorted (X.690 §10, §11.6), and the implicitly tagged `SET OF`s too:
 /// the certificates and each SignerInfo's signed and unsigned attributes. Certificates count:
 /// a SignedData that carries a non-DER certificate is not DER.
+///
+/// The values of `id-aa-signatureTimeStampToken` unsigned attributes are opaque (M4 brief §4.3,
+/// DECISIONS D13 D-12): a TSA's token is embedded verbatim, so a BER token does not make the
+/// signer's CMS non-DER (the attribute around it must still be DER).
 pub(crate) fn is_der_cms(der: &[u8], parsed: &cms::ParsedCms) -> bool {
     let Some(raw) = der.get(parsed.raw.clone()) else {
         return false;
@@ -564,7 +637,24 @@ pub(crate) fn is_der_cms(der: &[u8], parsed: &cms::ParsedCms) -> bool {
     let Ok(outer) = tlv::read_exact(raw, cms::MAX_DEPTH) else {
         return false;
     };
-    if !tlv::is_der_tree(raw, &outer, 0, cms::MAX_DEPTH) {
+    // The token values, in `raw` coordinates.
+    let base = parsed.raw.start;
+    let mut opaque: Vec<Range<usize>> = Vec::new();
+    for info in &parsed.signer_infos {
+        let Some(start) = info.raw.start.checked_sub(base) else {
+            return false;
+        };
+        let Ok(signer_info) = tlv::read(raw, start, raw.len(), 0, cms::MAX_DEPTH) else {
+            return false;
+        };
+        let unsigned = tlv::children(raw, &signer_info, 0, cms::MAX_DEPTH)
+            .filter_map(std::result::Result::ok)
+            .find(|child| child.tag == tlv::TAG_CONTEXT_1);
+        if let Some(unsigned) = unsigned {
+            opaque.extend(cms::timestamp_value_ranges(raw, &unsigned, 1));
+        }
+    }
+    if !tlv::is_der_tree_except(raw, &outer, 0, cms::MAX_DEPTH, &opaque) {
         return false;
     }
     let certificates_sorted = parsed
@@ -582,14 +672,17 @@ pub(crate) fn is_der_cms(der: &[u8], parsed: &cms::ParsedCms) -> bool {
 }
 
 /// Whether an implicitly tagged `SET OF` (`[n] IMPLICIT`) is DER, its elements sorted: checked
-/// with the universal `SET` tag, which [`tlv::is_der_tree`] orders.
+/// with the universal `SET` tag, which [`tlv::is_der_tree`] orders. Timestamp token values are
+/// opaque, as in [`is_der_cms`].
 fn implicit_set_is_der(element: &[u8]) -> bool {
     let mut retagged = element.to_vec();
     if let Some(tag) = retagged.first_mut() {
         *tag = tlv::TAG_SET;
     }
-    tlv::read_exact(&retagged, cms::MAX_DEPTH)
-        .is_ok_and(|set| tlv::is_der_tree(&retagged, &set, 0, cms::MAX_DEPTH))
+    tlv::read_exact(&retagged, cms::MAX_DEPTH).is_ok_and(|set| {
+        let opaque = cms::timestamp_value_ranges(&retagged, &set, 0);
+        tlv::is_der_tree_except(&retagged, &set, 0, cms::MAX_DEPTH, &opaque)
+    })
 }
 
 /// The uppercase hexadecimal digit of a nibble (brief §4.2: `hex = UPPER(cms)`).

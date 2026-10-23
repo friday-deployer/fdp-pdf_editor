@@ -12,6 +12,7 @@ workspace and needs the nightly toolchain and `cargo install cargo-fuzz`. CI fuz
 | `fuzz_parse_document_default_limits` | the same read path with `Limits::default()` as shipped (512 MiB per stream, 4 GiB per document), lenient and strict, so amplification that only the default limits allow is reachable. Asserts the same guarantees and the per-input time budget; libFuzzer's 2 GB RSS limit applies | the whole input is the PDF file |
 | `fuzz_cms_parse` | `folioxide_sign::cms::parse` (raw-slice BER/DER walker, depth 32, ≤ 64 certificates and attributes), `cms::verify_detached` over a fixed document digest, `x509info::certificate_info` of every certificate, and `x509info::build_trust` without and with an anchor. Asserts the parser's bounds, the verification invariants (a valid signature names its certificate and digest, one SignerInfo; an intact one has a message digest) and that nothing is trusted without an anchor; 60 s watchdog | a CMS `ContentInfo` (the bytes of a signature's `/Contents`) |
 | `fuzz_verify` | `Document::open` (lenient) and `folioxide_sign::verify_pdf::verify` without trust anchors and with the test PKI root: discovery, `/ByteRange` and `/Contents` checks, CMS, coverage, revision comparison, trust. Asserts the report invariants (`is_valid` implies a sound, intact, valid signature inside the file; PAdES level and `trusted` only for intact, valid signatures; no trust verdict without anchors) and a time budget (the read allowance, plus 2 s per report); 120 s watchdog | the whole input is the PDF file |
+| `fuzz_tsp_parse` | `folioxide_sign::tsp` (M4): `TimeStampReq::from_der`, `TimeStampResp::from_der`, `TstInfo::from_der`, `GenTime::parse`, `validate_response` against a fixed request and `verify_token` against a fixed imprint. Asserts the round trips (a decoded request through `to_der`, a `genTime` through its RFC 3339 text), that `validate_response` returns only a version-1 TSTInfo with the request's imprint and nonce, and the token invariants (intact implies a decoded TSTInfo, valid a TSA certificate, and anything less names a problem); 60 s watchdog | the input is read as each of a request, a response, a TSTInfo, a `genTime` and a token |
 
 ### Time and memory budgets
 
@@ -79,6 +80,19 @@ cp fixtures/sign/*.p7s fuzz/corpus/fuzz_cms_parse/
 cargo +nightly fuzz run fuzz_verify fuzz/corpus/fuzz_verify -- -max_total_time=60 -max_len=262144
 cargo +nightly fuzz run fuzz_cms_parse fuzz/corpus/fuzz_cms_parse -- -max_total_time=60
 ```
+
+`fuzz_tsp_parse` (M4) starts from the TSA files of `fixtures/sign/tsa/` (OpenSSL `ts -reply` and
+pyHanko requests and responses); the tokens, TSTInfos and `genTime`s inside the responses are
+useful extra seeds:
+
+```sh
+mkdir -p fuzz/corpus/fuzz_tsp_parse
+cp fixtures/sign/tsa/* fuzz/corpus/fuzz_tsp_parse/
+cargo +nightly fuzz run fuzz_tsp_parse fuzz/corpus/fuzz_tsp_parse -- -max_total_time=60
+```
+
+The M4 smoke run (60 s, AddressSanitizer, 4 workers, 10 seeds: the four TSA files plus their
+tokens, TSTInfos and `genTime`s) found nothing in about 1.1 million runs.
 
 The M3 smoke runs (60 s each, AddressSanitizer, 4 cores) found nothing: `fuzz_cms_parse` made
 about 160,000 runs from 130 seeds, `fuzz_verify` about 9,700 runs from 129 signed seeds

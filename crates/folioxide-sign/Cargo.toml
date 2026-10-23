@@ -24,6 +24,10 @@ folioxide-syntax.workspace = true
 folioxide-model.workspace = true
 # Only for visible signature appearances (ARCHITECTURE §A.2 dependency direction).
 folioxide-content.workspace = true
+# The strict zlib decoding (header, deflate, Adler-32) of a `/Metadata` stream for the XMP check,
+# as pyHanko's `zlib.decompress` reads it (M4 QA round 3, finding 20); the workspace's pin, also
+# used by folioxide-syntax and folioxide-content.
+miniz_oxide.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 # RustCrypto stack. These types never appear in the public API (ARCHITECTURE §A.5 gap 5).

@@ -196,7 +196,11 @@ test('signPdf with a PKCS#12 key: one trusted, whole-file signature', async (t) 
   assert.deepEqual(report.sigObject, { num: report.sigObject.num, gen: 0 })
   assert.deepEqual(report.changedObjects, [])
   assert.equal(report.docmdp, null)
-  assert.equal(report.docmdpOk, null)
+  // M4 (D-13): docmdpOk is computed for every signature, with P = 2 when none is certified.
+  assert.equal(report.docmdpOk, true)
+  assert.equal(report.timestamp, null)
+  assert.deepEqual(report.timestamps, [])
+  assert.equal(report.padesLevel, 'B-B')
   // The report is plain JSON data (the shape of the core's serde DTOs).
   const json = JSON.parse(JSON.stringify(report))
   assert.equal(json.coverage, 'entireFile')
@@ -702,7 +706,11 @@ test('isSignatureAcceptable gates on what was appended after signing, not only o
   assert.equal(report.modification, 'other')
   assert.equal(isSignatureAcceptable(report), false)
   assert.equal(isSignatureAcceptable(report, 'annotations'), false)
-  assert.equal(isSignatureAcceptable(report, 'other'), true)
+  // M4 (D-13): a change that is 'other' breaks the DocMDP permissions in force (P = 2 without a
+  // certification), so not even 'other' accepts it; the modification bound alone would.
+  assert.equal(report.docmdpOk, false)
+  assert.equal(isSignatureAcceptable(report, 'other'), false)
+  assert.equal(isSignatureAcceptable({ ...report, docmdpOk: null }, 'other'), true)
 
   // A second signature is form filling for the first: accepted by default, not with 'ltaUpdates'.
   const twice = await signPdf(PdfDocument.open(signed), { signer: rsaP12() })
@@ -772,6 +780,37 @@ test("isSignatureAcceptable: 'formFilling' includes a visible signature field ad
   assert.equal(isSignatureAcceptable(report), true)
   assert.equal(isSignatureAcceptable(report, 'ltaUpdates'), false)
   await oracle(t, overlaid, reports)
+})
+
+/**
+ * `signed` (one signature by Folioxide on `minimal.pdf`) with an empty incremental update whose
+ * trailer gives `/Prev` twice: the signed revision's section first, then the unsigned base's (M4
+ * QA round 2, finding 9).
+ */
+function withTwoPrevs(signed) {
+  const text = signed.toString('latin1')
+  const sections = [...text.matchAll(/startxref\s+(\d+)/g)].map((m) => Number(m[1]))
+  assert.equal(sections.length, 2, 'the signed file has two revisions')
+  const [base, real] = sections
+  const root = [...text.matchAll(/\/Root (\d+) 0 R/g)].at(-1)[1]
+  const size = [...text.matchAll(/\/Size (\d+)/g)].at(-1)[1]
+  const update =
+    `xref\n0 1\n0000000000 65535 f \ntrailer\n<</Size ${size} /Root ${root} 0 R /Prev ${real} /Prev ${base}>>\n` +
+    `startxref\n${signed.length}\n%%EOF\n`
+  return Buffer.concat([signed, Buffer.from(update, 'latin1')])
+}
+
+test('verifySignatures rejects a trailer that gives /Prev twice with E_XREF', async () => {
+  // First-wins readers (pyHanko, pypdf) follow the signed revision and list the signature; a
+  // last-wins reader follows the unsigned base and would list none. An empty list would let a
+  // "no signatures" policy branch through, so verification fails instead.
+  const signed = await signPdf(PdfDocument.open(INPUT), { signer: p256Pem() })
+  const doc = PdfDocument.open(withTwoPrevs(signed))
+  try {
+    await assertRejectsCode(doc.verifySignatures({ trustAnchors: [ROOT] }), 'E_XREF')
+  } finally {
+    doc.close()
+  }
 })
 
 /**

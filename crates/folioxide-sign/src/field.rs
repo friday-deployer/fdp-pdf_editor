@@ -24,6 +24,20 @@
 //!   exists; once one does, no AcroForm key but `/Fields` changes, because pyHanko's diff policy
 //!   would classify an earlier signature as `OTHER` otherwise (brief §4.5, D-6).
 //!   `/NeedAppearances` is never touched; a warning says when it is true (D-5).
+//! - A **visible** signature ([`SignatureOptions::appearance`]; M4 brief §4.7, DECISIONS D13
+//!   D-18): a new field's widget gets the appearance's `/Rect` (default user space of the page,
+//!   normalized and rounded as written; it must intersect the page's crop box), `/AP << /N … >>`
+//!   (the appearance stream of [`appearance`], with its font and image, in
+//!   the same incremental update) and `/MK << /R r >>` on a page rotated by `r ≠ 0`; `/F 132`
+//!   stays. An existing empty field merged with its widget keeps its `/Rect` (an appearance
+//!   rect must be `None` or equal to it) and gains only `/V` and `/AP`; a field whose widget is
+//!   a separate `/Kids` object is [`Error::Unsupported`], and one whose widget has no area is
+//!   [`Error::InvalidArgument`].
+//! - A certification signature (M4 brief §4.6) is named by the catalog's `/Perms /DocMDP`
+//!   (a new direct `/Perms`, or the existing `/Perms` dictionary or object edited; an existing
+//!   `/UR3` is kept with a warning). It must be the document's first signature, and an approval
+//!   signature on a certified document may not create a new visible field
+//!   ([`Error::DocMdpForbids`]).
 //!
 //! The objects that change are collected as an overlay for
 //! [`incremental_suffix_with_overlay`](folioxide_syntax::incremental_suffix_with_overlay): the
@@ -31,11 +45,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use folioxide_model::Document;
 use folioxide_model::text::{decode_text_string, encode_text_string};
+use folioxide_model::{Document, PageId, Rect, Rotation};
+use folioxide_syntax::serialize::canonical_real;
 use folioxide_syntax::{Dict, LimitKind, Object, ObjectId, PdfString, Store};
 
+use crate::appearance::{self, SignatureAppearance};
+use crate::docmdp;
 use crate::error::{Error, Result};
+use crate::prepare::SignatureOptions;
 
 /// The deepest `/Kids` nesting of the field tree that is followed (M3 brief §5 V1).
 pub const MAX_FIELD_DEPTH: usize = 32;
@@ -78,9 +96,9 @@ const T: &[u8] = b"T";
 const V: &[u8] = b"V";
 const PERMS: &[u8] = b"Perms";
 const DOC_MDP: &[u8] = b"DocMDP";
-const REFERENCE: &[u8] = b"Reference";
-const TRANSFORM_METHOD: &[u8] = b"TransformMethod";
-const TRANSFORM_PARAMS: &[u8] = b"TransformParams";
+const UR3: &[u8] = b"UR3";
+const AP: &[u8] = b"AP";
+const RECT: &[u8] = b"Rect";
 
 /// The `/SubFilter` of the signature dictionary (§12.8.3.1, Table 260).
 ///
@@ -620,62 +638,19 @@ fn type_mismatch(what: &str, expected: &str, found: &Object) -> Error {
 }
 
 // =================================================================================================
-// DocMDP (§12.8.2.2)
-// =================================================================================================
-
-/// The DocMDP permission `/P` of a certified document: from the catalog's `/Perms /DocMDP`
-/// signature dictionary, its `/Reference` entry with `/TransformMethod /DocMDP`, and that
-/// entry's `/TransformParams /P` (default 2, §12.8.2.2 Table 257). `None` for a document that
-/// is not certified.
-///
-/// # Errors
-/// The errors of [`Store::deref`].
-pub(crate) fn docmdp_permission(store: &Store, catalog: Option<&Dict>) -> Result<Option<i64>> {
-    let deref_dict = |obj: Option<&Object>| -> Result<Option<Dict>> {
-        match obj {
-            Some(obj) => Ok(store.deref(obj)?.as_dict().cloned()),
-            None => Ok(None),
-        }
-    };
-    let Some(perms) = deref_dict(catalog.and_then(|c| c.get(PERMS)))? else {
-        return Ok(None);
-    };
-    let Some(sig) = deref_dict(perms.get(DOC_MDP))? else {
-        return Ok(None);
-    };
-    let references = match sig.get(REFERENCE) {
-        Some(r) => store.deref(r)?.as_array().map(<[Object]>::to_vec),
-        None => None,
-    }
-    .unwrap_or_default();
-    for reference in &references {
-        let Some(reference) = deref_dict(Some(reference))? else {
-            continue;
-        };
-        let is_docmdp = match reference.get(TRANSFORM_METHOD) {
-            Some(m) => store.deref(m)?.is_name(DOC_MDP),
-            None => false,
-        };
-        if !is_docmdp {
-            continue;
-        }
-        let params = deref_dict(reference.get(TRANSFORM_PARAMS))?;
-        let p = match params.as_ref().and_then(|p| p.get(b"P")) {
-            Some(p) => store.deref(p)?.as_int(),
-            None => None,
-        };
-        return Ok(Some(p.unwrap_or(2)));
-    }
-    // A /Perms /DocMDP signature without a DocMDP reference: certified, default permissions.
-    Ok(Some(2))
-}
-
-// =================================================================================================
 // Placement (brief §4.5)
 // =================================================================================================
 
+/// How many numbers below [`Limits::max_objects`](folioxide_syntax::Limits::max_objects) the
+/// newest trailer's `/Size` must leave for [`NewNumbers::new`] to number from it: far more than
+/// any signature writes (its dictionary, a widget, an appearance with its font and image
+/// objects, an AcroForm), so that following an over-declared `/Size` never makes signing run
+/// out of numbers where numbering from [`Store::next_object_number`] would not.
+const SIZE_HEADROOM: u32 = 1 << 16;
+
 /// Object numbers for the new objects of a signature: from [`Store::next_object_number`] up,
-/// never a freed number (brief R-7).
+/// or from the newest trailer's `/Size` when that is higher (see [`NewNumbers::new`]), never a
+/// freed number (brief R-7).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NewNumbers {
     next: u32,
@@ -683,12 +658,36 @@ pub(crate) struct NewNumbers {
 }
 
 impl NewNumbers {
-    /// Numbers from `store.next_object_number()`, below the store's
-    /// [`Limits::max_objects`](folioxide_syntax::Limits::max_objects).
+    /// Numbers from the larger of `store.next_object_number()` and the newest revision's
+    /// trailer `/Size` (a direct integer that leaves [`SIZE_HEADROOM`] numbers below the
+    /// limit), below the store's [`Limits::max_objects`](folioxide_syntax::Limits::max_objects).
+    ///
+    /// ISO 32000-2 §7.5.5 (Table 15) makes `/Size` one greater than the highest object number,
+    /// so for a conforming file both starts are the same. A revision may over-declare it
+    /// (`/Size 100` over objects up to 11). An update's `/Size` below the previous one makes
+    /// the verifier call every earlier signature `Other`
+    /// (`revisions::differential::size_ambiguity`, manager ruling R-26: PDFium keeps only the
+    /// objects below the newest `/Size`). Numbering from the previous `/Size`, as pyHanko's
+    /// incremental writer does, keeps the new `/Size` (the highest number it lists + 1) above
+    /// it, so a co-signature leaves the earlier signatures' level where pyHanko leaves it and
+    /// writes a conforming `/Size` (M4 final fix round 2, expert finding 1); the incremental
+    /// writer itself also never writes a `/Size` below the previous one (ruling R-30 (a)). Every
+    /// number from `next_object_number()` up is unused, so the numbers skipped below the
+    /// previous `/Size` stay unused (§7.3.10: an unlisted number is `null`).
     pub(crate) fn new(store: &Store) -> NewNumbers {
+        let max = store.limits().max_objects;
+        let next = store.next_object_number();
+        let declared = store
+            .revisions()
+            .last()
+            .and_then(|newest| match newest.trailer.get(b"Size") {
+                Some(Object::Int(size)) => u32::try_from(*size).ok(),
+                _ => None,
+            })
+            .filter(|&size| size <= max.saturating_sub(SIZE_HEADROOM));
         NewNumbers {
-            next: store.next_object_number(),
-            max: store.limits().max_objects,
+            next: declared.map_or(next, |size| size.max(next)),
+            max,
         }
     }
 
@@ -766,9 +765,11 @@ pub(crate) struct FieldPlan {
     pub(crate) name: String,
     /// Whether the field is new.
     pub(crate) created: bool,
-    /// The field, widget, page, `/Annots`, AcroForm, `/Fields` and catalog objects that change.
+    /// The field, widget, page, `/Annots`, AcroForm, `/Fields` and catalog objects that change,
+    /// and a visible signature's appearance stream, font and image.
     pub(crate) objects: BTreeMap<ObjectId, Object>,
-    /// Observations for the caller (for example `/NeedAppearances true`).
+    /// Observations for the caller (for example `/NeedAppearances true`, or appearance text
+    /// that was shortened).
     pub(crate) warnings: Vec<String>,
 }
 
@@ -781,9 +782,25 @@ enum Target {
 }
 
 /// Decides where the signature goes (brief §4.5) and builds the objects that change, without
-/// changing `doc`.
+/// changing `doc`: the field placement of `options.field`, and for a certification
+/// (`options.certification`) the catalog's `/Perms /DocMDP` (M4 brief §4.6).
+///
+/// **Certification rules** (M4 brief §4.6, [`Error::DocMdpForbids`] naming the rule):
+/// - (a) certifying is refused when any signature field of the document has a value (a
+///   signature or a document timestamp: "it shall be the first signed field", §12.8.2.2.1), and
+///   when the catalog already has `/Perms /DocMDP`, signed field or not;
+/// - (b) on a certified document an approval signature (`P = 2` or `3`; `P = 1` is refused by
+///   [`check_signable`](crate::placeholder::check_signable)) may use a new invisible field or an
+///   existing empty field, visible or not, but not a **new visible** field (D-3: pyHanko reports
+///   the certification `OTHER` then);
+/// - (c) a certification may have an appearance: the field is the certifier's own.
+///
+/// With [`SignatureOptions::appearance`] the widget becomes visible (module documentation;
+/// M4 brief §4.7): `signer` is the signer certificate's display name (common name, else
+/// subject) for the default text, when known.
 ///
 /// # Errors
+/// - [`Error::DocMdpForbids`]: the certification rules above.
 /// - [`Error::PageOutOfRange`]: `spec.page` is not a page (a document without pages cannot be
 ///   signed).
 /// - [`Error::InvalidArgument`]: an empty name, a new name with `.`, a name that
@@ -791,11 +808,23 @@ enum Target {
 ///   field that is not a terminal signature field or is signed already.
 /// - [`Error::NotFound`]: [`FieldMode::ExistingOnly`] and no field has the name.
 /// - [`Error::Unsupported`]: the field has a `/Lock` dictionary or a seed value dictionary with
-///   required constraints (M11), or is a direct object.
+///   required constraints (M11), or is a direct object; a visible signature in an existing field
+///   whose widget is a separate `/Kids` object (D-18).
+/// - [`Error::InvalidArgument`] for a visible signature: a new field without an appearance
+///   rect; a rect that is not finite, has no area or misses the page's crop box; an existing
+///   field whose widget has no area, lies on no page, has annotation flags other than Print,
+///   ReadOnly, Locked and LockedContents (Hidden, NoView, NoZoom, NoRotate, ToggleNoView:
+///   manager ruling R-3), or whose `/Rect` differs from the appearance rect; and the appearance errors of [`appearance`](crate::appearance) (font
+///   size, border width, text limits, an image that is not a supported JPEG).
 /// - [`ErrorCode::TypeMismatch`](folioxide_syntax::ErrorCode::TypeMismatch): the catalog, page,
-///   `/AcroForm`, `/Fields` or `/Annots` has the wrong type.
+///   `/AcroForm`, `/Fields`, `/Annots` or `/Perms` has the wrong type.
 /// - The errors of [`Document::page_ids`] and [`Store::resolve`].
-pub(crate) fn plan(doc: &Document, spec: &FieldSpec) -> Result<FieldPlan> {
+pub(crate) fn plan(
+    doc: &Document,
+    options: &SignatureOptions,
+    signer: Option<&str>,
+) -> Result<FieldPlan> {
+    let spec = &options.field;
     let store = doc.store();
     let page_ids = doc.page_ids()?;
     let page = page_ids
@@ -814,27 +843,101 @@ pub(crate) fn plan(doc: &Document, spec: &FieldSpec) -> Result<FieldPlan> {
         Some(acroform) => walk_fields(store, &acroform.dict)?,
         None => Vec::new(),
     };
-    let any_signed = fields
+    let signed_field = fields
         .iter()
-        .any(|f| f.terminal && f.is_signature() && f.is_signed(store));
+        .position(|f| f.terminal && f.is_signature() && f.is_signed(store));
+    let any_signed = signed_field.is_some();
+
+    // Certification rule (a), before anything else is decided (M4 brief §4.6).
+    if let Some(permissions) = options.certification {
+        if let Some(index) = signed_field {
+            let name = NameBudget::new().name(&fields, index).0;
+            return Err(Error::DocMdpForbids(format!(
+                "DocMDP rule (a): a certification signature (P = {}) must be the first signature \
+                 of the document (ISO 32000-2 §12.8.2.2.1), but the field {name:?} is signed \
+                 already",
+                permissions.p()
+            )));
+        }
+        if docmdp::has_perms_docmdp(doc)? {
+            return Err(Error::DocMdpForbids(
+                "DocMDP rule (a): the document is certified already (its catalog has /Perms \
+                 /DocMDP); a document has at most one certification signature (ISO 32000-2 \
+                 §12.8.2.2.1)"
+                    .to_owned(),
+            ));
+        }
+    }
 
     let target = choose_target(store, spec, &fields)?;
+
+    // Rule (b), D-3: an approval signature on a certified document may not create a new
+    // visible field (pyHanko's `valid_when_certifying`: the certification would be OTHER).
+    if options.certification.is_none()
+        && options.appearance.is_some()
+        && matches!(target, Target::New { .. })
+        && let Some(certified) = docmdp::certification(doc)?
+    {
+        return Err(Error::DocMdpForbids(format!(
+            "DocMDP rule (b): the document is certified (P = {}), and a new visible signature \
+             field would invalidate the certification (D-3; pyHanko reports such a change as \
+             OTHER); sign invisibly, or sign an existing empty signature field",
+            certified.p
+        )));
+    }
 
     let mut numbers = NewNumbers::new(store);
     let mut overlay = Overlay::new(store);
     let mut warnings = Vec::new();
+    let visible = options
+        .appearance
+        .as_ref()
+        .map(|app| (app, appearance::text_lines(app, options, signer)));
     let (sig, field, name, widget) = match target {
         Target::Existing { id, name } => {
             let sig = numbers.take()?;
             let mut dict = overlay.current_dict(id, "the signature field")?;
+            if any_signed && let Some(warning) = shared_appearance_warning(&fields, id, &dict) {
+                warnings.push(warning);
+            }
             dict.insert(V, sig);
+            if let Some((app, lines)) = &visible {
+                // D-18: the field's own /Rect, never changed; only /V and /AP are written
+                // (pyHanko's SigFieldModificationRule allows /AP when a field is signed).
+                let (rect, rotation) = existing_widget(doc, &page_ids, &dict, id, &name, app)?;
+                let built = appearance::build(app, rect, rotation, lines, &mut numbers)?;
+                dict.insert(AP, appearance::ap_dict(built.normal));
+                for (id, object) in built.objects {
+                    overlay.set(id, object);
+                }
+                warnings.extend(built.warnings);
+            }
             overlay.set(id, Object::Dict(dict));
             (sig, id, name, None)
         }
         Target::New { name } => {
             let widget = numbers.take()?;
             let sig = numbers.take()?;
-            overlay.set(widget, Object::Dict(widget_dict(&name, sig, page)));
+            let mut dict = widget_dict(&name, sig, page);
+            if let Some((app, lines)) = &visible {
+                let page_view = doc.page(spec.page)?;
+                let rect = app.rect.ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "a new visible signature field ({name:?}) needs an appearance rect; \
+                         SignatureAppearance::for_existing_field() is for an existing empty \
+                         signature field"
+                    ))
+                })?;
+                let rect = appearance::checked_rect(rect, page_view.crop_box())?;
+                let rotation = page_view.rotation();
+                let built = appearance::build(app, rect, rotation, lines, &mut numbers)?;
+                make_visible(&mut dict, rect, rotation, built.normal);
+                for (id, object) in built.objects {
+                    overlay.set(id, object);
+                }
+                warnings.extend(built.warnings);
+            }
+            overlay.set(widget, Object::Dict(dict));
             add_to_annots(&mut overlay, page, widget)?;
             (sig, widget, name, Some(widget))
         }
@@ -849,6 +952,9 @@ pub(crate) fn plan(doc: &Document, spec: &FieldSpec) -> Result<FieldPlan> {
         !any_signed,
         &mut warnings,
     )?;
+    if options.certification.is_some() {
+        add_perms(&mut overlay, catalog_id, sig, &mut warnings)?;
+    }
 
     Ok(FieldPlan {
         sig,
@@ -965,6 +1071,27 @@ fn auto_name(fields: &[FieldNode]) -> String {
         .unwrap_or_else(|| "Signature1".to_owned())
 }
 
+/// The warning for signing the existing field `id` (its dictionary `dict`) of a document that is
+/// signed already, when its `/AP` is an indirect dictionary that another field of `fields` names
+/// too (M4 final fix round 2, finding 1): pyHanko's `SigFieldModificationRule` then reports every
+/// earlier signature's modification as `other` once this field is signed, and so does
+/// Folioxide's verifier (manager ruling R-19), whether or not the new signature replaces the
+/// appearance.
+fn shared_appearance_warning(fields: &[FieldNode], id: ObjectId, dict: &Dict) -> Option<String> {
+    let ap = dict.get_ref(AP)?;
+    let mut names = NameBudget::new();
+    let other = fields
+        .iter()
+        .enumerate()
+        .find(|(_, node)| node.id != Some(id) && node.dict.get_ref(AP) == Some(ap))
+        .map(|(index, _)| names.name(fields, index).0)?;
+    Some(format!(
+        "the signature field's appearance dictionary {ap} is the field {other:?}'s too: \
+         pyHanko and Folioxide report the earlier signatures as modified (`other`) once this \
+         field is signed"
+    ))
+}
+
 /// The merged signature field and widget annotation dictionary of brief §4.1, keys in this
 /// order: `/Type /Annot /Subtype /Widget /FT /Sig /T (name) /V sig /F 132 /Rect [0 0 0 0] /P
 /// page` (§12.7.5.5, §12.5.6.19). The zero-area `/Rect` makes it invisible, so it needs no
@@ -988,6 +1115,136 @@ fn widget_dict(name: &str, sig: ObjectId, page: ObjectId) -> Dict {
     );
     dict.insert("P", page);
     dict
+}
+
+/// Makes the new widget `dict` visible (M4 brief §4.7 "Widget"): `/Rect` the widget rect
+/// (default user space), `/AP << /N normal >>`, and `/MK << /R r >>` on a page rotated by
+/// `r ≠ 0` (§12.5.6.19, Table 192: the widget's rotation, counter-clockwise like the page's
+/// display turn is clockwise; the appearance's `/Matrix` already compensates it).
+fn make_visible(dict: &mut Dict, rect: Rect, rotation: Rotation, normal: ObjectId) {
+    dict.insert(RECT, rect.to_object());
+    dict.insert(AP, appearance::ap_dict(normal));
+    if rotation != Rotation::R0 {
+        let mut mk = Dict::with_capacity(1);
+        mk.insert("R", i64::from(rotation.degrees()));
+        dict.insert("MK", mk);
+    }
+}
+
+/// The widget rect and page rotation of the existing signature field `id` (dictionary `field`,
+/// fully qualified name `name`) that a visible signature draws into (DECISIONS D13 D-18): the
+/// field must be merged with its widget (no `/Kids`), its `/Rect` must have an area and equal
+/// the appearance's rect when one is given, and its widget must be listed in a page's `/Annots`
+/// (or name a page as `/P`).
+fn existing_widget(
+    doc: &Document,
+    page_ids: &[PageId],
+    field: &Dict,
+    id: ObjectId,
+    name: &str,
+    app: &SignatureAppearance,
+) -> Result<(Rect, Rotation)> {
+    let store = doc.store();
+    let has_kids = match field.get(KIDS) {
+        Some(kids) => store.deref(kids)?.as_array().is_some_and(|k| !k.is_empty()),
+        None => false,
+    };
+    if has_kids {
+        return Err(Error::Unsupported(format!(
+            "the signature field {name:?} has its widget as a separate /Kids object; a visible \
+             signature can only use a field merged with its widget (D-18)"
+        )));
+    }
+    // Manager ruling R-3 (M4 QA round 1): a widget that is hidden, shown only on screen or only
+    // in print, or drawn at a fixed size or unrotated would show the appearance elsewhere than
+    // in its /Rect, and the verifier makes the earlier signatures OTHER for it.
+    if let Some(problem) = crate::revisions::geometry::annotation_flags_problem(store, field) {
+        return Err(Error::InvalidArgument(format!(
+            "the widget of the signature field {name:?} {problem}; it cannot show a visible \
+             signature (sign it without an appearance)"
+        )));
+    }
+    let rect = match field.get(RECT) {
+        Some(value) => Rect::from_object(store, value)?,
+        None => None,
+    };
+    let Some(rect) = rect else {
+        return Err(Error::InvalidArgument(format!(
+            "the signature field {name:?} has no widget area (its /Rect is missing or has no \
+             area), so it cannot show an appearance; sign it without one"
+        )));
+    };
+    // M4 QA round 4, finding 13, and manager ruling R-21: a /Rect beyond ±10^5 is placed
+    // elsewhere by PDFium, and the verifier makes such an appearance Other.
+    appearance::rect_within_magnitude(&rect).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "the signature field {name:?} has a /Rect beyond ±1e5, which viewers that map \
+             appearances in single precision place elsewhere; sign it without an appearance"
+        ))
+    })?;
+    if let Some(wanted) = app.rect {
+        // Both normalized (Rect::new orders the corners), compared as the serializer writes
+        // them; a coordinate that is not finite never matches.
+        let finite = [wanted.llx, wanted.lly, wanted.urx, wanted.ury]
+            .iter()
+            .all(|v| v.is_finite());
+        let normal = Rect::new(wanted.llx, wanted.lly, wanted.urx, wanted.ury);
+        let equal = [
+            (normal.llx, rect.llx),
+            (normal.lly, rect.lly),
+            (normal.urx, rect.urx),
+            (normal.ury, rect.ury),
+        ]
+        .iter()
+        .all(|(a, b)| canonical_real(*a) == canonical_real(*b));
+        if !(finite && equal) {
+            return Err(Error::InvalidArgument(format!(
+                "the appearance rect [{} {} {} {}] differs from the /Rect [{} {} {} {}] of the \
+                 existing field {name:?}; an existing field's /Rect is never changed (D-18): \
+                 give no rect, or this one",
+                wanted.llx,
+                wanted.lly,
+                wanted.urx,
+                wanted.ury,
+                rect.llx,
+                rect.lly,
+                rect.urx,
+                rect.ury
+            )));
+        }
+    }
+    let page = widget_page(store, page_ids, field, id)?.ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "the widget of the signature field {name:?} is on no page (no page's /Annots lists \
+             it), so it cannot show an appearance"
+        ))
+    })?;
+    Ok((rect, doc.page(page)?.rotation()))
+}
+
+/// The index of the page whose `/Annots` lists the widget `id`, else of the page its `/P`
+/// names; `None` when neither is a page.
+fn widget_page(
+    store: &Store,
+    page_ids: &[PageId],
+    widget: &Dict,
+    id: ObjectId,
+) -> Result<Option<usize>> {
+    for (index, page) in page_ids.iter().enumerate() {
+        let page = store.resolve(page.0)?;
+        let Some(annots) = page.as_dict().and_then(|p| p.get(ANNOTS)) else {
+            continue;
+        };
+        if store
+            .deref(annots)?
+            .as_array()
+            .is_some_and(|annots| annots.iter().any(|a| a.as_ref() == Some(id)))
+        {
+            return Ok(Some(index));
+        }
+    }
+    let named = widget.get_ref(b"P");
+    Ok(page_ids.iter().position(|page| Some(page.0) == named))
 }
 
 /// `text` as a text-string object (§7.9.2.2): a literal string when it is PDFDocEncoded, a
@@ -1146,6 +1403,58 @@ fn edit_acroform(
     Ok(())
 }
 
+/// Names the certification signature `sig` in the catalog's `/Perms /DocMDP` (§12.8.6, M4 brief
+/// §4.6): a new direct `/Perms` dictionary when the catalog has none; the catalog edited when
+/// `/Perms` is direct; the `/Perms` object edited when it is indirect. An existing `/UR3`
+/// usage-rights signature is kept, with a warning: the certification's update invalidates it.
+fn add_perms(
+    overlay: &mut Overlay<'_>,
+    catalog: ObjectId,
+    sig: ObjectId,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let mut catalog_dict = overlay.current_dict(catalog, "the document catalog")?;
+    let warn_ur3 = |perms: &Dict, warnings: &mut Vec<String>| {
+        if perms.contains_key(UR3) {
+            warnings.push(
+                "the catalog's /Perms has a /UR3 usage-rights signature; it is kept, but the \
+                 usage-rights signature will no longer validate"
+                    .to_owned(),
+            );
+        }
+    };
+    let direct = |mut perms: Dict, catalog_dict: &mut Dict| {
+        perms.insert(DOC_MDP, sig);
+        catalog_dict.insert(PERMS, Object::Dict(perms));
+    };
+    match catalog_dict.get(PERMS).cloned() {
+        None | Some(Object::Null) => {
+            direct(Dict::with_capacity(1), &mut catalog_dict);
+            overlay.set(catalog, Object::Dict(catalog_dict));
+        }
+        Some(Object::Dict(perms)) => {
+            warn_ur3(&perms, warnings);
+            direct(perms, &mut catalog_dict);
+            overlay.set(catalog, Object::Dict(catalog_dict));
+        }
+        Some(Object::Ref(id)) => match overlay.current(id)? {
+            Object::Dict(mut perms) => {
+                warn_ur3(&perms, warnings);
+                perms.insert(DOC_MDP, sig);
+                overlay.set(id, Object::Dict(perms));
+            }
+            // A reference to a missing object is `null` (§7.3.10): no /Perms yet.
+            Object::Null => {
+                direct(Dict::with_capacity(1), &mut catalog_dict);
+                overlay.set(catalog, Object::Dict(catalog_dict));
+            }
+            other => return Err(type_mismatch("the catalog's /Perms", "dictionary", &other)),
+        },
+        Some(other) => return Err(type_mismatch("the catalog's /Perms", "dictionary", &other)),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,6 +1549,40 @@ mod tests {
     }
 
     #[test]
+    fn new_numbers_start_at_an_over_declared_size() {
+        // M4 final fix round 2, expert finding 1: `minimal.pdf` lists objects 0-5 under
+        // `/Size 6`; its trailer respelled with another `/Size`.
+        let with_size = |size: &str| {
+            let source = folioxide_testkit::fixtures::syntax::minimal();
+            let at = source.windows(8).position(|w| w == b"/Size 6 ").unwrap();
+            let mut out = source[..at].to_vec();
+            out.extend_from_slice(format!("/Size {size} ").as_bytes());
+            out.extend_from_slice(&source[at + 8..]);
+            Store::open_bytes(out, &folioxide_syntax::OpenOptions::default()).unwrap()
+        };
+        let start = |size: &str| NewNumbers::new(&with_size(size)).take().unwrap().num;
+        // Conforming: the next number.
+        assert_eq!(start("6"), 6);
+        // Over-declared: from the declared /Size, as pyHanko numbers, so the update's /Size
+        // (the highest number + 1) is not below it.
+        assert_eq!(start("100"), 100);
+        // Under-declared, not a direct integer, negative or too close to the object limit: the
+        // next number (the verifier reports such a /Size, never the signer's numbering).
+        let near_limit = (folioxide_syntax::Limits::default().max_objects - 10).to_string();
+        for size in [
+            "3",
+            "0",
+            "-5",
+            "100.0",
+            "5 0 R",
+            near_limit.as_str(),
+            "4294967296",
+        ] {
+            assert_eq!(start(size), 6, "/Size {size}");
+        }
+    }
+
+    #[test]
     fn widget_dict_has_the_brief_keys_in_order() {
         let dict = widget_dict("Sig\u{e9}", ObjectId::new(9, 0), ObjectId::new(3, 0));
         let keys: Vec<&[u8]> = dict.keys().map(|k| k.as_bytes()).collect();
@@ -1265,6 +1608,16 @@ mod tests {
                 b"\xFE\xFF\x30\x42".to_vec()
             )))
         );
+    }
+
+    #[test]
+    fn our_widget_flags_are_ones_the_verifier_allows() {
+        // Ruling R-3: the signer never writes Hidden, NoZoom, NoRotate, NoView or ToggleNoView.
+        assert_eq!(
+            WIDGET_FLAGS & !crate::revisions::geometry::ALLOWED_ANNOTATION_FLAGS,
+            0
+        );
+        assert_eq!(WIDGET_FLAGS & (2 | 8 | 16 | 32 | 256), 0);
     }
 
     #[cfg(feature = "serde")]

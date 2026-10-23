@@ -65,7 +65,7 @@ const fn row(
 /// `fixtures/pki/root.pem` as the trust root (`pyhanko-empty-field.pdf` has no signature).
 const PYHANKO: &[PyHanko] = {
     use Coverage::{EntireFile, EntireRevision};
-    use ModificationLevel::{LtaUpdates, None};
+    use ModificationLevel::{LtaUpdates, None, Other};
     &[
         row(
             "openssl-p256-cades.pdf",
@@ -92,6 +92,32 @@ const PYHANKO: &[PyHanko] = {
             None,
             Option::None,
         ),
+        // M4: a PAdES B-T signature with pyHanko's in-process TSA (ESS v1, fractional genTime).
+        row(
+            "pyhanko-bt-rsa2048.pdf",
+            "Signature1",
+            true,
+            EntireFile,
+            None,
+            Option::None,
+        ),
+        // M4: P=1, then a document timestamp (ltaUpdates; docmdpOk true for pyHanko).
+        row(
+            "pyhanko-certified-p1-dts.pdf",
+            "Signature1",
+            true,
+            EntireRevision,
+            LtaUpdates,
+            Some(1),
+        ),
+        row(
+            "pyhanko-certified-p1-dts.pdf",
+            "DocTimeStamp1",
+            true,
+            EntireFile,
+            None,
+            Option::None,
+        ),
         row(
             "pyhanko-certified-p1.pdf",
             "Signature1",
@@ -99,6 +125,24 @@ const PYHANKO: &[PyHanko] = {
             EntireFile,
             None,
             Some(1),
+        ),
+        // M4: P=2, then an approval in a new visible field: pyHanko's valid_when_certifying=False
+        // makes the certification `other` (M4 brief §0, probe `p2_approval_visible`).
+        row(
+            "pyhanko-certified-p2-visible-approval.pdf",
+            "Signature1",
+            true,
+            EntireRevision,
+            Other,
+            Some(2),
+        ),
+        row(
+            "pyhanko-certified-p2-visible-approval.pdf",
+            "Signature2",
+            true,
+            EntireFile,
+            None,
+            Option::None,
         ),
         row(
             "pyhanko-certified-p2.pdf",
@@ -168,26 +212,22 @@ const PYHANKO: &[PyHanko] = {
 };
 
 /// Where Folioxide deliberately differs from pyHanko on these fixtures: `(file, field, key,
-/// ours, pyhanko, reason)`.
-const DIFFERENCES: &[(&str, &str, &str, &str, &str, &str)] = &[
-    (
-        "pyhanko-doc-timestamp.pdf",
-        "DocTimeStamp1",
-        "valid",
-        "false",
-        "true",
-        "M3 lists document timestamps without verifying the RFC 3161 token \
-         (PendingTimestampVerification, brief §5 V1); M4 verifies them",
-    ),
-    (
-        "pyhanko-doc-timestamp.pdf",
-        "DocTimeStamp1",
-        "trusted",
-        "none",
-        "true",
-        "no trust verdict for an unverified document timestamp (M4)",
-    ),
-];
+/// ours, pyhanko, reason)`. Since M4 verifies document timestamps (brief §5 V7c), there is no
+/// difference left.
+const DIFFERENCES: &[(&str, &str, &str, &str, &str, &str)] = &[];
+
+/// Comparisons not made yet because the rule that brings Folioxide to pyHanko's value belongs to
+/// a parallel work package: `(file, field, key, work package)`. Empty since the stage-1 merge of
+/// M4: WP4.2A's C1 (a new visible signature field after a certification is `other`) agrees with
+/// pyHanko on `pyhanko-certified-p2-visible-approval.pdf`.
+const PENDING: &[(&str, &str, &str, &str)] = &[];
+
+/// Whether the comparison of `key` for `(file, field)` waits for another work package.
+fn pending(file: &str, field: &str, key: &str) -> bool {
+    PENDING
+        .iter()
+        .any(|(f, n, k, _)| *f == file && *n == field && *k == key)
+}
 
 /// Our value of `key` for `(file, field)` when it deliberately differs from pyHanko's.
 fn ours(file: &str, field: &str, key: &str) -> Option<&'static str> {
@@ -220,7 +260,11 @@ fn interop_fixtures_agree_with_pyhanko() {
             };
             assert_eq!(r.trusted, trusted, "{at}");
             assert_eq!(r.coverage, p.coverage, "{at}");
-            assert_eq!(r.modification, p.modification, "{at}");
+            if pending(file, p.field, "modification") {
+                assert!(r.modification >= ModificationLevel::FormFilling, "{at}");
+            } else {
+                assert_eq!(r.modification, p.modification, "{at}");
+            }
             assert_eq!(r.docmdp, p.docmdp, "{at}");
             // Our own fields are never more optimistic than pyHanko (brief §0).
             assert!(r.byte_range_ok, "{at}");
@@ -273,27 +317,60 @@ fn interop_report_details() {
     assert!(!r.is_valid());
     assert_eq!(r.digest_algorithm.as_deref(), Some("sha1"));
 
-    // A document timestamp is listed with its TSA, not verified.
+    // A document timestamp is verified as an RFC 3161 token (M4 brief §5 V7c).
     let reports = get("pyhanko-doc-timestamp.pdf");
     let ts = &reports[1];
     assert_eq!(ts.kind, SignatureKind::DocTimeStamp);
     assert_eq!(ts.sub_filter.as_deref(), Some("ETSI.RFC3161"));
-    assert!(ts.intact && ts.byte_range_ok);
-    assert!(ts.has_problem(ProblemCode::PendingTimestampVerification));
+    assert!(ts.is_valid() && ts.byte_range_ok, "{}", summary(ts));
+    assert!(!ts.has_problem(ProblemCode::PendingTimestampVerification));
     assert!(ts.signer.is_some(), "the TSA certificate");
+    assert_eq!(ts.pades_level, None);
+
+    // pyHanko's B-T signature is B-T for us too: its token (ESS v1, a fractional genTime) is
+    // intact, valid and trusted.
+    let r = &get("pyhanko-bt-rsa2048.pdf")[0];
+    assert!(r.is_valid(), "{}", summary(r));
+    assert_eq!(r.pades_level, Some(PadesLevel::BT), "{}", summary(r));
+    let token = r.timestamp.as_ref().expect("a signature timestamp");
+    assert!(token.intact && token.valid, "{token:?}");
+    assert_eq!(token.trusted, Some(true), "{token:?}");
+    assert!(token.gen_time.contains('.'), "{}", token.gen_time);
 
     // An unsigned field is not a signature.
     assert!(get("pyhanko-empty-field.pdf").is_empty());
 
-    // Certification: P from /Reference (or /Perms), docmdpOk until M4 is None.
+    // Certification: P from /Reference (or /Perms); docmdp_ok is computed since M4 (nothing
+    // was appended after these certifications).
     for (file, p) in [
         ("pyhanko-certified-p1.pdf", 1),
         ("pyhanko-certified-p2.pdf", 2),
     ] {
         let r = &get(file)[0];
         assert_eq!(r.docmdp, Some(p), "{file}");
-        assert_eq!(r.docmdp_ok, Option::None);
+        assert_eq!(r.docmdp_ok, Some(true), "{file}");
     }
+
+    // pyHanko's document timestamp after its P = 1 certification (catalog re-listed, /Annots and
+    // /Fields appended, XMP xmp:ModifyDate rewritten): docmdp_ok true, as pyHanko says; a
+    // document timestamp itself has no DocMDP verdict in pyHanko (none is compared). A new
+    // visible approval after its P = 2 certification is `other` (C1): docmdp_ok false.
+    let reports = get("pyhanko-certified-p1-dts.pdf");
+    assert_eq!(reports[0].modification, ModificationLevel::LtaUpdates);
+    assert_eq!(
+        reports[0].docmdp_ok,
+        Some(true),
+        "{:?}",
+        reports[0].warnings
+    );
+    let reports = get("pyhanko-certified-p2-visible-approval.pdf");
+    assert_eq!(reports[0].modification, ModificationLevel::Other);
+    assert_eq!(
+        reports[0].docmdp_ok,
+        Some(false),
+        "{:?}",
+        reports[0].warnings
+    );
 
     // pyHanko's second signature changes the catalog's /Version, /Extensions and adds an XMP
     // /Metadata stream: form filling for the first signature, as pyHanko says.
@@ -307,6 +384,18 @@ fn interop_report_details() {
         "{:?}",
         reports[0].warnings
     );
+}
+
+#[test]
+fn interop_pending_rows_name_real_rows() {
+    for (file, field, key, package) in PENDING {
+        assert!(
+            PYHANKO.iter().any(|p| p.file == *file && p.field == *field),
+            "{file} {field}"
+        );
+        assert_eq!(*key, "modification");
+        assert!(!package.is_empty());
+    }
 }
 
 #[test]
@@ -332,6 +421,11 @@ fn oracle_sign_interop() {
         let reports = verify(&pdf);
         if reports.is_empty() {
             continue; // pyhanko-empty-field.pdf: nothing to validate
+        }
+        if PENDING.iter().any(|(f, ..)| *f == file) {
+            // Our expectation would be the pending value; the oracles check it once the work
+            // package of the PENDING row is merged and the row is removed.
+            continue;
         }
         let doc = open(&pdf);
         let expect = ExpectJson::new()

@@ -26,7 +26,8 @@ Expect keys (§A.9). Implemented:
 * ``pages`` (int), ``version`` ("1.7"), ``info`` ({"Title": "...", "ModDate": null}): see
   ``check_pdf.py``
 * ``signatures`` ([{field, intact, valid, trusted, coverage, modification, docmdp, docmdpOk,
-  pades, timestamp}]): see ``validate_sig.py``. ``intact`` and ``valid`` default to true, and
+  pades, timestamp, timestampTrusted}]): see ``validate_sig.py``. ``timestamp`` is ``true``,
+  ``false`` or ``"invalid"`` (M4 brief D-22). ``intact`` and ``valid`` default to true, and
   every signature also gets the structural, pdfsig and OpenSSL checks. A negative case is
   ``{"field": ..., "rejected": true}`` (M3 brief D-3): it passes only when pyHanko, pdfsig and
   the OpenSSL route (extraction or ``cms -verify``) all reject that signature
@@ -36,6 +37,9 @@ Expect keys (§A.9). Implemented:
 * ``objectCount`` (int, M1 brief WP1.5): in-use objects, compared with pikepdf's
   ``len(pdf.objects)`` minus its null entries; see ``check_pdf.check_object_count`` for the
   exact rules
+* ``renderProbes`` (list, M4 brief D-22): ``[{page, rect, minDark, maxDarkOutside?}]``, dark
+  pixels inside and outside a default-user-space rectangle of ``pdftoppm -r 72 -gray``; see
+  ``render_check.py``
 * ``boxes`` (list, M2 brief acceptance criterion 5): one entry per page in the JSON shape of
   Folioxide's ``PageInfo`` (``{"index", "width", "height", "mediaBox", "cropBox",
   "rotation"}``), compared with ``pdfinfo -box -f 1 -l N``, one check per page and value
@@ -82,6 +86,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import check_pdf  # noqa: E402
+import render_check  # noqa: E402
 import text_check  # noqa: E402
 import validate_sig  # noqa: E402
 from oracle_common import (  # noqa: E402
@@ -101,8 +106,9 @@ from oracle_common import (  # noqa: E402
 
 EXPECT_SUFFIX = ".expect.json"
 
-#: Every expect key named in docs/ARCHITECTURE.md §A.9, plus ``objectCount`` (M1 brief WP1.5)
-#: and ``boxes`` (M2 brief, acceptance criterion 5), in the order checks run.
+#: Every expect key named in docs/ARCHITECTURE.md §A.9, plus ``objectCount`` (M1 brief WP1.5),
+#: ``boxes`` (M2 brief, acceptance criterion 5) and ``renderProbes`` (M4 brief D-22), in the order
+#: checks run.
 SPEC_KEYS = (
     "pages",
     "version",
@@ -116,6 +122,7 @@ SPEC_KEYS = (
     "annots",
     "textContains",
     "textAbsent",
+    "renderProbes",
     "fontsEmbedded",
     "images",
     "prefixOf",
@@ -194,6 +201,11 @@ def _check_text_contains(case: Case, value: Any) -> list[CheckResult]:
 @register("textAbsent")
 def _check_text_absent(case: Case, value: Any) -> list[CheckResult]:
     return text_check.check_text(case.pdf, absent=value)
+
+
+@register("renderProbes")
+def _check_render_probes(case: Case, value: Any) -> list[CheckResult]:
+    return render_check.check_render_probes(case.pdf, value)
 
 
 @register("prefixOf")

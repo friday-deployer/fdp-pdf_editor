@@ -2188,8 +2188,8 @@ pub fn shadow_acroform_q_changed(pdf: &[u8]) -> Option<Vec<u8>> {
 
 /// `form_field_value_changed`: on a document signed with the `Amount` text field
 /// ([`text_field_form_input`]), a revision that changes only the field's value `/V` to "1 EUR":
-/// generic form filling, which M3 does not classify (DECISIONS D10 D-9: Folioxide `OTHER` until
-/// M4 WP4.2); pyHanko: `FORM_FILLING`.
+/// generic form filling (M4 brief §5.1; `OTHER` in M3, D-9); Folioxide and pyHanko:
+/// `FORM_FILLING`.
 pub fn form_field_value_changed(pdf: &[u8]) -> Option<Vec<u8>> {
     edit_field(pdf, b"Amount", |_, dict| {
         dict.insert("V", Object::literal_string("1 EUR"));
@@ -2536,6 +2536,211 @@ pub fn metadata_changed_in_place(pdf: &[u8]) -> Option<Vec<u8>> {
     })
 }
 
+/// `metadata_changed_not_well_formed` (M4 QA round 1, finding 22; QA variant
+/// R4-approval-plain-update-invalid-xml): the catalog's XMP stream rewritten in place with a
+/// packet whose only fault is a duplicate attribute (`xml:lang` twice on one `rdf:li`): not
+/// well-formed XML (XML 1.0 §3.1 "Unique Att Spec"), so not an XMP packet. pyHanko's
+/// `MetadataUpdateRule` refuses it (`other`). `None` without a catalog metadata stream.
+pub fn metadata_changed_not_well_formed(pdf: &[u8]) -> Option<Vec<u8>> {
+    with_incremental(pdf, |store| {
+        let (_, metadata) = catalog_metadata(store)?;
+        retitle_metadata(
+            store,
+            metadata,
+            "Paid</rdf:li><rdf:li xml:lang=\"de\" xml:lang=\"fr\">Paid",
+        )
+    })
+}
+
+// ---- metadata streams pyHanko does not read as XMP (M4 QA round 3, findings 19 and 20) ------
+
+/// Replaces the data of the XMP metadata stream `metadata` with `data`: encoded with the filter
+/// `filter` as given, or (`None`) plain data the writer encodes.
+fn set_metadata_data(
+    store: &mut Store,
+    metadata: ObjectId,
+    data: Vec<u8>,
+    filter: Option<&str>,
+) -> Option<()> {
+    let mut dict = store.resolve(metadata).ok()?.as_stream()?.dict.clone();
+    for key in [b"Filter".as_slice(), b"DecodeParms", b"Length"] {
+        dict.remove(key);
+    }
+    let data = match filter {
+        Some(filter) => {
+            dict.insert("Filter", Object::name(filter));
+            StreamData::Encoded(data)
+        }
+        None => StreamData::Decoded(data),
+    };
+    let stream = folioxide_syntax::Stream::new(dict, data);
+    store.set(metadata, Object::Stream(Box::new(stream))).ok()
+}
+
+/// The catalog's XMP stream rewritten in place with `data` (encoded with `filter`, or plain).
+fn metadata_rewritten(pdf: &[u8], data: Vec<u8>, filter: Option<&str>) -> Option<Vec<u8>> {
+    with_incremental(pdf, |store| {
+        let (_, metadata) = catalog_metadata(store)?;
+        set_metadata_data(store, metadata, data, filter)
+    })
+}
+
+/// `metadata_xmp_comment_over_lxml_limit` (QA variant R4z-limit-comment-approval): the XMP
+/// packet rewritten with a comment of 10,000,001 bytes, which libxml2 refuses without
+/// `huge_tree` ("Comment too big found"), so pyHanko's `MetadataUpdateRule` does too (`other`).
+pub fn metadata_xmp_comment_over_lxml_limit(pdf: &[u8]) -> Option<Vec<u8>> {
+    let mut packet = b"<!--".to_vec();
+    packet.extend(std::iter::repeat_n(b'x', 10_000_001));
+    packet.extend_from_slice(b"-->");
+    packet.extend(xmp_packet("Paid"));
+    metadata_rewritten(pdf, packet, None)
+}
+
+/// `metadata_xmp_name_over_lxml_limit` (QA variant R4z-limit-elemname-50001-approval): the
+/// XMP packet with an element whose name has 50,001 bytes, which libxml2 refuses ("Name too
+/// long").
+pub fn metadata_xmp_name_over_lxml_limit(pdf: &[u8]) -> Option<Vec<u8>> {
+    let name = "n".repeat(50_001);
+    metadata_rewritten(pdf, xmp_packet(&format!("Paid<{name}/>")), None)
+}
+
+/// `metadata_flate_bad_adler` (QA variant R4z-filter-bad-adler-approval): the XMP packet
+/// Flate-encoded with a wrong Adler-32 (Python's `zlib.decompress`: "incorrect data check").
+pub fn metadata_flate_bad_adler(pdf: &[u8]) -> Option<Vec<u8>> {
+    let mut data = folioxide_syntax::filters::encode_flate(&xmp_packet("Paid"), 6);
+    *data.last_mut()? ^= 1;
+    metadata_rewritten(pdf, data, Some("FlateDecode"))
+}
+
+/// `metadata_runlength` (QA variant R4z-filter-runlength-approval): the XMP packet
+/// RunLength-encoded (§7.4.5), a filter pyHanko does not implement.
+pub fn metadata_runlength(pdf: &[u8]) -> Option<Vec<u8>> {
+    let mut data = Vec::new();
+    for chunk in xmp_packet("Paid").chunks(128) {
+        data.push(u8::try_from(chunk.len() - 1).ok()?);
+        data.extend_from_slice(chunk);
+    }
+    data.push(128);
+    metadata_rewritten(pdf, data, Some("RunLengthDecode"))
+}
+
+/// `metadata_ascii85_without_eod` (QA variant R4z-filter-ascii85-no-eod-approval): the XMP
+/// packet ASCII85-encoded (§7.4.3) without its `~>` end marker, which pyHanko requires.
+pub fn metadata_ascii85_without_eod(pdf: &[u8]) -> Option<Vec<u8>> {
+    metadata_rewritten(
+        pdf,
+        ascii85_digits(&xmp_packet("Paid"))?,
+        Some("ASCII85Decode"),
+    )
+}
+
+/// The ASCII85 digits of `data` (§7.4.3, no `z` groups), without the `~>` end marker.
+pub(crate) fn ascii85_digits(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for chunk in data.chunks(4) {
+        let mut group = [0u8; 4];
+        group.get_mut(..chunk.len())?.copy_from_slice(chunk);
+        let mut value = u32::from_be_bytes(group);
+        let mut digits = [0u8; 5];
+        for digit in digits.iter_mut().rev() {
+            *digit = u8::try_from(value % 85).ok()? + b'!';
+            value /= 85;
+        }
+        out.extend_from_slice(digits.get(..chunk.len() + 1)?);
+    }
+    Some(out)
+}
+
+/// The ASCIIHex encoding of `data` (§7.4.2) with its `>` end marker.
+pub(crate) fn ascii_hex_encoded(data: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = data
+        .iter()
+        .flat_map(|b| format!("{b:02X}").into_bytes())
+        .collect();
+    out.push(b'>');
+    out
+}
+
+/// `data` encoded for the filter chain `[/FlateDecode <ascii>]`, with `/Crypt` (the Identity
+/// filter) between them when `crypt` and a second FlateDecode when `twice`: the ASCII encoding
+/// first, then Flate (so a reader decodes Flate first). `ascii85` picks ASCII85 over ASCIIHex.
+/// Returns the data and the filter names.
+pub(crate) fn flate_then_ascii(
+    data: &[u8],
+    ascii85: bool,
+    crypt: bool,
+    twice: bool,
+) -> Option<(Vec<u8>, Vec<&'static str>)> {
+    let (inner, name) = if ascii85 {
+        let mut digits = ascii85_digits(data)?;
+        digits.extend_from_slice(b"~>");
+        (digits, "ASCII85Decode")
+    } else {
+        (ascii_hex_encoded(data), "ASCIIHexDecode")
+    };
+    let mut encoded = folioxide_syntax::filters::encode_flate(&inner, 6);
+    let mut filters = vec!["FlateDecode"];
+    if twice {
+        encoded = folioxide_syntax::filters::encode_flate(&encoded, 6);
+        filters.push("FlateDecode");
+    }
+    if crypt {
+        filters.push("Crypt");
+    }
+    filters.push(name);
+    Some((encoded, filters))
+}
+
+/// The catalog's XMP stream rewritten in place with the already encoded `data` and the filter
+/// array `filters` (`/DecodeParms` null for each).
+fn metadata_rewritten_chain(pdf: &[u8], data: Vec<u8>, filters: &[&str]) -> Option<Vec<u8>> {
+    with_incremental(pdf, |store| {
+        let (_, metadata) = catalog_metadata(store)?;
+        let mut dict = store.resolve(metadata).ok()?.as_stream()?.dict.clone();
+        for key in [b"Filter".as_slice(), b"DecodeParms", b"Length"] {
+            dict.remove(key);
+        }
+        dict.insert(
+            "Filter",
+            Object::Array(filters.iter().map(|f| Object::name(*f)).collect()),
+        );
+        let stream = folioxide_syntax::Stream::new(dict, StreamData::Encoded(data));
+        store.set(metadata, Object::Stream(Box::new(stream))).ok()
+    })
+}
+
+/// `metadata_flate_then_ahx` (M4 QA round 4, finding 11, variant R4w-dec-flate-then-ahx-approval):
+/// the XMP packet encoded for `/Filter [/FlateDecode /ASCIIHexDecode]`. pyHanko's FlateDecode
+/// returns a `memoryview`, on which its ASCIIHexDecode raises (`data.split`), so its
+/// `MetadataUpdateRule` cannot read the packet ("/Metadata XML syntax could not be validated",
+/// `other`).
+pub fn metadata_flate_then_ahx(pdf: &[u8]) -> Option<Vec<u8>> {
+    let (data, filters) = flate_then_ascii(&xmp_packet("Paid"), false, false, false)?;
+    metadata_rewritten_chain(pdf, data, &filters)
+}
+
+/// `metadata_flate_then_a85` (variant R4w-dec-flate-then-a85-approval): the same with
+/// `/Filter [/FlateDecode /ASCII85Decode]`.
+pub fn metadata_flate_then_a85(pdf: &[u8]) -> Option<Vec<u8>> {
+    let (data, filters) = flate_then_ascii(&xmp_packet("Paid"), true, false, false)?;
+    metadata_rewritten_chain(pdf, data, &filters)
+}
+
+/// `metadata_flate_crypt_ahx` (variant R4w-dec-flate-crypt-ahx-approval): `/Filter [/FlateDecode
+/// /Crypt /ASCIIHexDecode]`; pyHanko skips the Identity crypt filter, so the memoryview reaches
+/// ASCIIHexDecode all the same.
+pub fn metadata_flate_crypt_ahx(pdf: &[u8]) -> Option<Vec<u8>> {
+    let (data, filters) = flate_then_ascii(&xmp_packet("Paid"), false, true, false)?;
+    metadata_rewritten_chain(pdf, data, &filters)
+}
+
+/// `metadata_flate_flate_ahx` (variant R4w-dec-flate-flate-ahx-approval): `/Filter
+/// [/FlateDecode /FlateDecode /ASCIIHexDecode]`; the second FlateDecode returns a memoryview too.
+pub fn metadata_flate_flate_ahx(pdf: &[u8]) -> Option<Vec<u8>> {
+    let (data, filters) = flate_then_ascii(&xmp_packet("Paid"), false, false, true)?;
+    metadata_rewritten_chain(pdf, data, &filters)
+}
+
 // =================================================================================================
 // Writer-based helpers (reuse the real incremental writer for well-formed revisions).
 // =================================================================================================
@@ -2709,6 +2914,20 @@ fn der_total_len(der: &[u8]) -> Option<usize> {
     }
     2usize.checked_add(count)?.checked_add(len)
 }
+
+// M4 WP4.2A: form filling, annotations and timestamps after signing (M4 brief §5.4).
+mod annotations;
+mod appearances;
+mod certify;
+mod form_fill;
+mod parser_diff;
+mod rebuild;
+pub use annotations::*;
+pub use appearances::*;
+pub use certify::*;
+pub use form_fill::*;
+pub use parser_diff::*;
+pub use rebuild::*;
 
 #[cfg(test)]
 mod tests;

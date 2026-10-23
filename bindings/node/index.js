@@ -15,7 +15,8 @@
  *   `Date` and PDF date strings,
  * - composes the two phases of signing with a signer that may be asynchronous (a KMS, an HSM,
  *   WebCrypto, `node:crypto`) in {@link signPdf}: the native addon prepares and finishes on the
- *   libuv thread pool, and the signer is awaited in JavaScript in between.
+ *   libuv thread pool, and the signer is awaited in JavaScript in between, and so is the timestamp
+ *   authority of a PAdES B-T signature (the `timestamp` callback).
  *
  * The plain objects it returns (`PageInfo`, `DocInfo`, `Diagnostic`, `SignatureReport`) have the
  * JSON shape of the Rust core's serde DTOs, so a Tauri app built on the same core sees the same
@@ -198,6 +199,34 @@ function checkString(value, name) {
   if (typeof value !== 'string') {
     throw invalidArgument(`${name} must be a string`)
   }
+}
+
+/**
+ * Bytes given as a `Uint8Array` (a `Buffer` is one) or an `ArrayBuffer`, as a `Uint8Array`.
+ *
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {Uint8Array}
+ */
+function bytesOf(value, name) {
+  if (types.isUint8Array(value)) {
+    return value
+  }
+  if (types.isArrayBuffer(value)) {
+    return new Uint8Array(value)
+  }
+  throw invalidArgument(`${name} must be a Uint8Array, a Buffer or an ArrayBuffer`)
+}
+
+/**
+ * Optional bytes: `undefined` for `undefined` and `null`.
+ *
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {Uint8Array | undefined}
+ */
+function optionalBytes(value, name) {
+  return value === undefined || value === null ? undefined : bytesOf(value, name)
 }
 
 /**
@@ -508,10 +537,12 @@ class PdfDocument {
   }
 
   /**
-   * The first phase of signing: builds the incremental update that adds an invisible PAdES
-   * signature, digests the signed byte ranges and builds the bytes to sign. The document is not
-   * changed. Sign {@link PreparedSignature#toBeSigned} with the key of the first certificate,
-   * then call {@link PreparedSignature#finish}; {@link signPdf} does all of it.
+   * The first phase of signing: builds the incremental update that adds a PAdES signature
+   * (invisible, or visible with `appearance`; a certification with `certify`), digests the signed
+   * byte ranges and builds the bytes to sign. The document is not changed. Sign
+   * {@link PreparedSignature#toBeSigned} with the key of the first certificate, then call
+   * {@link PreparedSignature#finish} (after {@link PreparedSignature#timestampRequest} for B-T);
+   * {@link signPdf} does all of it.
    *
    * @param {import('./index').PrepareSignatureOptions} options `signingTime` defaults to now.
    * @returns {PreparedSignature}
@@ -541,21 +572,26 @@ class PdfDocument {
    * signature dictionary, in signing order.
    *
    * @param {import('./index').VerifyOptions} [options] `validationTime` defaults to now; `null`
-   *   validates at each signer's claimed signing time.
+   *   validates at a trusted signature timestamp's time, else at each signer's claimed signing
+   *   time. `timestampTrustAnchors` default to `trustAnchors`.
    * @returns {Promise<import('./index').SignatureReport[]>}
    */
   async verifySignatures(options) {
     checkOptionalObject(options, 'options')
-    const { trustAnchors, extraCertificates, validationTime } = options ?? {}
+    const { trustAnchors, extraCertificates, validationTime, timestampTrustAnchors } = options ?? {}
     if (trustAnchors !== undefined) {
       checkBytesArray(trustAnchors, 'options.trustAnchors')
     }
     if (extraCertificates !== undefined) {
       checkBytesArray(extraCertificates, 'options.extraCertificates')
     }
+    if (timestampTrustAnchors !== undefined) {
+      checkBytesArray(timestampTrustAnchors, 'options.timestampTrustAnchors')
+    }
     const native = {
       trustAnchors,
       extraCertificates,
+      timestampTrustAnchors,
       validationTime:
         validationTime === null
           ? undefined
@@ -575,17 +611,138 @@ class PdfDocument {
  */
 function nativePrepareOptions(options) {
   checkObject(options, 'options')
-  const { signingTime, ...rest } = /** @type {Record<string, any>} */ (options)
+  const { signingTime, certify, appearance, tsaReserve, ...rest } = /** @type {Record<string, any>} */ (
+    options
+  )
   checkBytesArray(rest.certificateChain, 'options.certificateChain')
   checkString(rest.algorithm, 'options.algorithm')
   checkOptionalObject(rest.field, 'options.field')
   if (rest.contentsReserve !== undefined && rest.contentsReserve !== null) {
     checkNumber(rest.contentsReserve, 'options.contentsReserve')
   }
-  return /** @type {any} */ ({
+  /** @type {Record<string, any>} */
+  const native = {
     ...rest,
     signingTime: pdfDateOption(signingTime ?? new Date(), 'options.signingTime'),
-  })
+  }
+  if (certify !== undefined && certify !== null) {
+    checkNumber(certify, 'options.certify')
+    native.certify = certify
+  }
+  if (tsaReserve !== undefined && tsaReserve !== null) {
+    checkNumber(tsaReserve, 'options.tsaReserve')
+    native.tsaReserve = tsaReserve
+  }
+  if (appearance !== undefined && appearance !== null) {
+    native.appearance = nativeAppearance(appearance)
+  }
+  return /** @type {any} */ (native)
+}
+
+/**
+ * A rectangle given as `[llx, lly, urx, ury]` or as a `Rect`, as a `Rect`. The native addon
+ * checks the numbers are finite, the core that the rectangle has an area and meets the page.
+ *
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {import('./index').Rect}
+ */
+function nativeRect(value, name) {
+  if (Array.isArray(value)) {
+    if (value.length !== 4 || !value.every((v) => typeof v === 'number')) {
+      throw invalidArgument(`${name} must be [llx, lly, urx, ury] (four numbers) or a Rect`)
+    }
+    const [llx, lly, urx, ury] = value
+    return { llx, lly, urx, ury }
+  }
+  if (value === null || typeof value !== 'object') {
+    throw invalidArgument(`${name} must be [llx, lly, urx, ury] (four numbers) or a Rect`)
+  }
+  const rect = /** @type {Record<string, unknown>} */ (value)
+  for (const key of ['llx', 'lly', 'urx', 'ury']) {
+    checkNumber(rect[key], `${name}.${key}`)
+  }
+  return /** @type {any} */ ({ llx: rect.llx, lly: rect.lly, urx: rect.urx, ury: rect.ury })
+}
+
+/**
+ * The native form of `options.appearance`: the types checked, the rectangle as a `Rect`.
+ *
+ * @param {unknown} value
+ * @returns {import('./binding.js').SignatureAppearanceOptions}
+ */
+function nativeAppearance(value) {
+  checkObject(value, 'options.appearance')
+  const { rect, lines, font, fontSize, image, imagePosition, borderWidth } = /** @type {Record<string, any>} */ (
+    value
+  )
+  /** @type {Record<string, any>} */
+  const native = {}
+  if (rect !== undefined && rect !== null) {
+    native.rect = nativeRect(rect, 'options.appearance.rect')
+  }
+  if (lines !== undefined && lines !== null) {
+    if (!Array.isArray(lines) || !lines.every((line) => typeof line === 'string')) {
+      throw invalidArgument('options.appearance.lines must be an array of strings')
+    }
+    native.lines = lines
+  }
+  if (font !== undefined && font !== null) {
+    checkString(font, 'options.appearance.font')
+    native.font = font
+  }
+  if (fontSize !== undefined && fontSize !== null) {
+    checkNumber(fontSize, 'options.appearance.fontSize')
+    native.fontSize = fontSize
+  }
+  if (image !== undefined && image !== null) {
+    checkBytes(image, 'options.appearance.image')
+    native.image = image
+  }
+  if (imagePosition !== undefined && imagePosition !== null) {
+    checkString(imagePosition, 'options.appearance.imagePosition')
+    native.imagePosition = imagePosition
+  }
+  if (borderWidth !== undefined && borderWidth !== null) {
+    checkNumber(borderWidth, 'options.appearance.borderWidth')
+    native.borderWidth = borderWidth
+  }
+  return /** @type {any} */ (native)
+}
+
+/**
+ * The native form of timestamp request options: the types checked, a numeric nonce as a bigint.
+ *
+ * @param {unknown} options
+ * @param {string} name
+ * @returns {import('./binding.js').TimestampRequestOptions | undefined}
+ */
+function nativeTimestampOptions(options, name) {
+  checkOptionalObject(options, name)
+  if (options === undefined || options === null) {
+    return undefined
+  }
+  const { digest, policy, nonce } = /** @type {Record<string, any>} */ (options)
+  /** @type {Record<string, any>} */
+  const native = {}
+  if (digest !== undefined && digest !== null) {
+    checkString(digest, `${name}.digest`)
+    native.digest = digest
+  }
+  if (policy !== undefined && policy !== null) {
+    checkString(policy, `${name}.policy`)
+    native.policy = policy
+  }
+  if (nonce !== undefined && nonce !== null) {
+    if (typeof nonce === 'bigint') {
+      native.nonce = nonce
+    } else if (typeof nonce === 'number' && Number.isSafeInteger(nonce) && nonce >= 1) {
+      native.nonce = BigInt(nonce)
+    } else {
+      throw invalidArgument(`${name}.nonce must be a bigint from 1 to 2^64 - 1`)
+    }
+  }
+  return /** @type {any} */ (native)
 }
 
 /**
@@ -682,26 +839,73 @@ class PreparedSignature {
   }
 
   /**
-   * Finishes the file with the signature value over `toBeSigned`: returns the signed PDF. A
-   * refused value leaves the prepared signature as it was.
+   * The DER `TimeStampReq` (RFC 3161) for a signature timestamp over `signature`, the value
+   * {@link PreparedSignature#finish} will embed: send it to a TSA, then call
+   * `finish(signature, timestampResponse)`. The value is verified first; the request is
+   * remembered for `finish` (not by `serialize`). Once it is remembered, `finish` without a
+   * response throws `E_INVALID_ARGUMENT`: call {@link PreparedSignature#discardTimestampRequest}
+   * to finish without a signature timestamp after all.
    *
-   * @param {Uint8Array} signature RSA: the modulus length; ECDSA: DER or IEEE P1363.
+   * @param {Uint8Array} signature The signature value over `toBeSigned`.
+   * @param {import('./index').TimestampRequestOptions} [options] `nonce` is a bigint from 1 to
+   *   2^64 - 1 (a positive safe integer is accepted too); default random.
    * @returns {Buffer}
    */
-  finish(signature) {
+  timestampRequest(signature, options) {
     checkBytes(signature, 'signature')
-    return callNative(() => this.#native.finish(signature))
+    const native = nativeTimestampOptions(options, 'options')
+    return callNative(() => this.#native.timestampRequest(signature, native))
   }
 
   /**
-   * Like {@link PreparedSignature#finish}, on the libuv thread pool.
+   * Forgets the request {@link PreparedSignature#timestampRequest} remembered, so that
+   * `finish(signature)` without a response finishes the file without a signature timestamp
+   * (PAdES B-B), for example when the TSA could not be reached. Without a remembered request it
+   * does nothing.
+   */
+  discardTimestampRequest() {
+    callNative(() => this.#native.discardTimestampRequest())
+  }
+
+  /**
+   * Finishes the file with the signature value over `toBeSigned`: returns the signed PDF. With
+   * `timestampResponse`, the TSA's response to the request of
+   * {@link PreparedSignature#timestampRequest} (or to `timestampRequest`), the token is validated
+   * and embedded as the signature timestamp (PAdES B-T). A refused value or response leaves the
+   * prepared signature as it was.
+   *
+   * After `timestampRequest`, a `finish` without `timestampResponse` (omitted or `null`) throws
+   * `E_INVALID_ARGUMENT`, so that a forgotten response never gives a file without a timestamp;
+   * {@link PreparedSignature#discardTimestampRequest} first finishes without one.
+   *
+   * @param {Uint8Array} signature RSA: the modulus length; ECDSA: DER or IEEE P1363.
+   * @param {Uint8Array} [timestampResponse] The TSA's DER `TimeStampResp` (an `ArrayBuffer` is
+   *   accepted too).
+   * @param {Uint8Array} [timestampRequest] The DER `TimeStampReq` it answers; default the one
+   *   `timestampRequest` returned last.
+   * @returns {Buffer}
+   */
+  finish(signature, timestampResponse, timestampRequest) {
+    checkBytes(signature, 'signature')
+    const response = optionalBytes(timestampResponse, 'timestampResponse')
+    const request = optionalBytes(timestampRequest, 'timestampRequest')
+    return callNative(() => this.#native.finish(signature, response, request))
+  }
+
+  /**
+   * Like {@link PreparedSignature#finish}, on the libuv thread pool (the same rule about a
+   * remembered timestamp request without a response).
    *
    * @param {Uint8Array} signature
+   * @param {Uint8Array} [timestampResponse]
+   * @param {Uint8Array} [timestampRequest]
    * @returns {Promise<Buffer>}
    */
-  async finishAsync(signature) {
+  async finishAsync(signature, timestampResponse, timestampRequest) {
     checkBytes(signature, 'signature')
-    return callNativeAsync(() => this.#native.finishAsync(signature))
+    const response = optionalBytes(timestampResponse, 'timestampResponse')
+    const request = optionalBytes(timestampRequest, 'timestampRequest')
+    return callNativeAsync(() => this.#native.finishAsync(signature, response, request))
   }
 
   /**
@@ -879,12 +1083,73 @@ function signatureValue(value) {
 }
 
 /**
+ * The timestamp token budget `signPdf` prepares with when a `timestamp` callback is given and
+ * `tsaReserve` is not: the core's `DEFAULT_TSA_RESERVE` (M4 brief D-8).
+ */
+const DEFAULT_TSA_RESERVE = 8192
+
+/**
+ * The margin added to the size a too-large token needed, when `signPdf` signs once more: the
+ * core's `TSA_RETRY_MARGIN` (M4 brief §3.1, D-8). A second token can differ by a few bytes.
+ */
+const TSA_RETRY_MARGIN = 1024
+
+/**
+ * The response a `timestamp` callback returned, as a `Uint8Array`. A throw becomes
+ * `E_TIMESTAMP_INVALID` with the error as the cause. The callback gets a copy of the request:
+ * what it does with its buffer (a `fill(0)`, a pool that reuses it) cannot change the request
+ * `finish` checks the response against.
+ *
+ * @param {(request: Buffer) => unknown} timestamp
+ * @param {Buffer} request
+ * @returns {Promise<Uint8Array>}
+ */
+async function askTsa(timestamp, request) {
+  let response
+  try {
+    response = await timestamp(Buffer.from(request))
+  } catch (err) {
+    throw new FolioxideError('E_TIMESTAMP_INVALID', 'options.timestamp() failed (see the cause)', { cause: err })
+  }
+  if (types.isUint8Array(response)) {
+    return response
+  }
+  if (types.isArrayBuffer(response)) {
+    return new Uint8Array(response)
+  }
+  throw invalidArgument(
+    'options.timestamp() must return (or resolve to) the DER TimeStampResp: a Uint8Array, a Buffer or an ArrayBuffer',
+  )
+}
+
+/**
+ * Whether `err` is the error of a finish whose CMS (with its timestamp token) did not fit the
+ * placeholder.
+ *
+ * @param {unknown} err
+ * @returns {err is FolioxideError}
+ */
+function isOverflow(err) {
+  return (
+    err instanceof FolioxideError &&
+    err.code === 'E_SIGNATURE_PLACEHOLDER_TOO_SMALL' &&
+    typeof err.details?.needed === 'number'
+  )
+}
+
+/**
  * Signs a document: prepares the signature on the libuv thread pool, awaits the signer, and
  * finishes the file. Returns the signed PDF (the original bytes followed by one incremental
  * update); the document is not changed.
  *
  * When an explicit `contentsReserve` is too small for the signature, it prepares once more with
  * the size needed, before the signer is called.
+ *
+ * With a `timestamp` callback (PAdES B-T) it prepares with `tsaReserve` (default 8192), awaits
+ * the signer, makes the timestamp request for the signature value, awaits the callback with it,
+ * and finishes with the response. When the token does not fit the placeholder, it does all of
+ * that **once more** with a placeholder of the size needed (plus 1024 bytes): the signer and the
+ * callback may each be called twice.
  *
  * @param {PdfDocument} doc
  * @param {import('./index').SignPdfOptions} options
@@ -895,7 +1160,16 @@ async function signPdf(doc, options) {
     throw invalidArgument('doc must be a PdfDocument')
   }
   checkObject(options, 'options')
-  const { signer, ...rest } = /** @type {Record<string, any>} */ (options)
+  const { signer, timestamp, timestampOptions, ...rest } = /** @type {Record<string, any>} */ (options)
+  if (timestamp !== undefined && timestamp !== null && typeof timestamp !== 'function') {
+    throw invalidArgument('options.timestamp must be a function that sends a DER TimeStampReq to a TSA')
+  }
+  if (timestampOptions !== undefined && timestampOptions !== null) {
+    if (typeof timestamp !== 'function') {
+      throw invalidArgument('options.timestampOptions needs options.timestamp')
+    }
+    nativeTimestampOptions(timestampOptions, 'options.timestampOptions')
+  }
   /** @type {Record<string, any>} */
   let prepareOptions
   /** @type {(prepared: PreparedSignature) => Promise<Uint8Array>} */
@@ -932,29 +1206,66 @@ async function signPdf(doc, options) {
       return signatureValue(value)
     }
   }
+  if (typeof timestamp === 'function') {
+    prepareOptions.tsaReserve = rest.tsaReserve ?? DEFAULT_TSA_RESERVE
+  }
 
-  let prepared
-  try {
-    prepared = await doc.prepareSignatureAsync(/** @type {any} */ (prepareOptions))
-  } catch (err) {
-    // An explicit reserve below what the CMS needs: once more with exactly that size (M3 brief
-    // §3.3), before anything is signed.
-    const needed = err instanceof FolioxideError ? err.details?.needed : undefined
-    if (
-      !(err instanceof FolioxideError) ||
-      err.code !== 'E_SIGNATURE_PLACEHOLDER_TOO_SMALL' ||
-      typeof needed !== 'number' ||
-      rest.contentsReserve === undefined ||
-      rest.contentsReserve === null
-    ) {
+  /**
+   * Prepares; an explicit reserve below what the CMS needs is retried once with exactly that size
+   * (M3 brief §3.3), before anything is signed.
+   *
+   * @param {Record<string, any>} opts
+   * @param {boolean} explicitReserve Whether `opts.contentsReserve` was given.
+   */
+  const prepare = async (opts, explicitReserve) => {
+    try {
+      return await doc.prepareSignatureAsync(/** @type {any} */ (opts))
+    } catch (err) {
+      if (!explicitReserve || !isOverflow(err)) {
+        throw err
+      }
+      return doc.prepareSignatureAsync(/** @type {any} */ ({ ...opts, contentsReserve: err.details?.needed }))
+    }
+  }
+
+  /**
+   * Prepares, signs, timestamps and finishes. A finish whose CMS with its token does not fit is
+   * returned as `{ overflow }` rather than thrown.
+   *
+   * @param {Record<string, any>} opts
+   * @param {boolean} explicitReserve
+   * @returns {Promise<{ pdf: Buffer } | { overflow: FolioxideError }>}
+   */
+  const attempt = async (opts, explicitReserve) => {
+    const prepared = await prepare(opts, explicitReserve)
+    const signature = await signWith(prepared)
+    if (typeof timestamp !== 'function') {
+      return { pdf: await prepared.finishAsync(signature) }
+    }
+    const request = prepared.timestampRequest(signature, timestampOptions)
+    const response = await askTsa(timestamp, request)
+    try {
+      return { pdf: await prepared.finishAsync(signature, response, request) }
+    } catch (err) {
+      if (isOverflow(err)) {
+        return { overflow: err }
+      }
       throw err
     }
-    prepared = await doc.prepareSignatureAsync(
-      /** @type {any} */ ({ ...prepareOptions, contentsReserve: needed }),
-    )
   }
-  const signature = await signWith(prepared)
-  return prepared.finishAsync(signature)
+
+  const explicit = rest.contentsReserve !== undefined && rest.contentsReserve !== null
+  let outcome = await attempt(prepareOptions, explicit)
+  if ('overflow' in outcome) {
+    // The token is larger than its budget: everything once more, with room for it (M4 brief
+    // §3.5, D-8). The signer and the TSA are called again.
+    const needed = /** @type {number} */ (outcome.overflow.details?.needed)
+    outcome = await attempt({ ...prepareOptions, contentsReserve: needed + TSA_RETRY_MARGIN }, true)
+    if ('overflow' in outcome) {
+      throw outcome.overflow
+    }
+  }
+  return outcome.pdf
 }
 
 // `using doc = PdfDocument.open(...)` closes the document at the end of the block, and
@@ -1024,8 +1335,10 @@ const MODIFICATION_LEVELS = ['none', 'ltaUpdates', 'formFilling', 'annotations',
 /**
  * The fail-safe verdict for accepting a signed document from a report of
  * {@link PdfDocument#verifySignatures}: the signature itself is sound (`byteRangeOk`, `intact`,
- * `signatureValid`, a field name, no problems, coverage `'entireFile'` or `'entireRevision'`)
- * **and** what was appended after the signed revision is at most `maxModification`.
+ * `signatureValid`, a field name, no problems, coverage `'entireFile'` or `'entireRevision'`),
+ * what was appended after the signed revision is at most `maxModification`, **and** the DocMDP
+ * permissions in force are respected (`docmdpOk` is not `false`: a certification with `P = 1`
+ * refuses even an `/Info` change, and `'annotations'` passes only under `P = 3`).
  *
  * The signature checks alone do not detect content changed after signing: a signature over an
  * earlier revision stays intact when a later incremental update replaces page content, fonts or
@@ -1055,6 +1368,7 @@ function isSignatureAcceptable(report, maxModification = 'formFilling') {
   }
   const level = MODIFICATION_LEVELS.indexOf(report.modification)
   return (
+    report.docmdpOk !== false &&
     report.byteRangeOk === true &&
     report.intact === true &&
     report.signatureValid === true &&

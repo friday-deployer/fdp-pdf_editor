@@ -148,7 +148,7 @@ impl PrivateKey {
     /// Whether `public` is this key's public half.
     pub(crate) fn matches(&self, public: &PublicKey) -> bool {
         match (self, public) {
-            (PrivateKey::Rsa(key, _), PublicKey::Rsa(pk, _)) => {
+            (PrivateKey::Rsa(key, _), PublicKey::Rsa(pk, ..)) => {
                 // Compare the values, independent of the integers' internal precision.
                 let strip = |b: Box<[u8]>| {
                     let skip = b.iter().take_while(|&&x| x == 0).count();

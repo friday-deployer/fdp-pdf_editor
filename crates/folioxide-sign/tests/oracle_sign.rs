@@ -18,12 +18,11 @@
 mod sign_support;
 
 use folioxide_model::{Document, InfoUpdate};
-use folioxide_sign::ProblemCode;
 use folioxide_sign::algorithms::DigestAlgorithm;
 use folioxide_sign::cms;
 use folioxide_sign::field::{FieldMode, FieldSpec, SubFilter};
 use folioxide_sign::prepare::{PrepareRequest, SignatureOptions, prepare};
-use folioxide_sign::report::{Coverage, ModificationLevel, SignatureKind};
+use folioxide_sign::report::{Coverage, ModificationLevel};
 use folioxide_sign::sign::{SignRequest, sign};
 use folioxide_sign::signer::{LocalSigner, Signer};
 use folioxide_syntax::OpenOptions;
@@ -50,24 +49,13 @@ fn bb_case(name: &str, input: &[u8], signed: Vec<u8>, require_trust: Option<bool
     let reports = verify(&signed);
     assert!(!reports.is_empty(), "{name}");
     for (i, r) in reports.iter().enumerate() {
-        if r.kind == SignatureKind::DocTimeStamp {
-            // A document timestamp of the input: listed, intact, not verified in M3.
-            assert!(r.intact && r.byte_range_ok, "{name}: {}", summary(r));
-            assert!(
-                r.problems
-                    .iter()
-                    .all(|p| p.code == ProblemCode::PendingTimestampVerification),
-                "{name}: {}",
-                summary(r)
-            );
-        } else {
-            assert!(
-                r.intact && r.signature_valid && r.byte_range_ok,
-                "{name}: {}",
-                summary(r)
-            );
-            assert!(r.problems.is_empty(), "{name}: {}", summary(r));
-        }
+        // A document timestamp of the input is verified as a token since M4 (brief §5 V7c).
+        assert!(
+            r.intact && r.signature_valid && r.byte_range_ok,
+            "{name}: {}",
+            summary(r)
+        );
+        assert!(r.problems.is_empty(), "{name}: {}", summary(r));
         let last = i + 1 == reports.len();
         if last {
             assert_eq!(r.coverage, Coverage::EntireFile, "{name}");
@@ -355,14 +343,19 @@ fn bb_cases() -> Vec<Case> {
         Some(false),
     ));
 
-    // On top of every pyHanko-made fixture that can be signed (WP3.2B; the P=1 certified one
+    // On top of every pyHanko-made fixture that can be signed (WP3.2B; the P=1 certified ones
     // cannot): the earlier signatures (and a document timestamp) become form filling, and a
-    // P=2 certification allows it (docmdp 2, docmdpOk true).
+    // P=2 certification allows it (docmdp 2, docmdpOk true). The P=2 certification followed by
+    // a new visible approval (M4) is already `other` for pyHanko (brief §5.3 C1): not a B-B
+    // case.
     let mut after = 0;
     for (file, source) in pyhanko_fixtures() {
+        if file == "pyhanko-certified-p2-visible-approval.pdf" {
+            continue;
+        }
         let doc = Document::open(source.clone(), &OpenOptions::default()).unwrap();
         if let Err(err) = folioxide_sign::placeholder::check_signable(&doc) {
-            assert_eq!(file, "pyhanko-certified-p1.pdf", "{err}");
+            assert!(file.starts_with("pyhanko-certified-p1"), "{file}: {err}");
             continue;
         }
         let stem = file.trim_end_matches(".pdf").replace('.', "-");
@@ -540,7 +533,158 @@ fn attack_known_failures(name: &str) -> Vec<(&'static str, &'static str)> {
         cross-reference data";
     const PART2_SHIFTED: &str = "attack by design: bytes inserted inside signed part 2 move every \
         later object and the cross-reference table away from their offsets";
-    match name.replace('-', "_").as_str() {
+    const DUPLICATE_KEY_QPDF: &str = "parser differential by design (R-1): the update writes a \
+        dictionary with a duplicate key, which qpdf reports ('dictionary has duplicated key; last \
+        occurrence overrides earlier ones')";
+    const DUPLICATE_KEY_PYPDF: &str = "parser differential by design (R-1): pypdf strict mode \
+        refuses a duplicate key ('Multiple definitions in dictionary') in an object it must \
+        read to list the pages";
+    let normalized = name.replace('-', "_");
+    if normalized.starts_with("form_inplace_ap_hidden_") {
+        // M4 QA round 4, finding 1: the signed page-tree root writes /Extra with a key twice,
+        // which qpdf reports and pypdf (strict) refuses while it lists the pages.
+        const HIDDEN_HOP: &str = "duplicate key by design (M4 QA round 4, finding 1): the \
+            signed page-tree root writes /Extra with a key twice (a use of the appearance \
+            stream that only first-wins readers reach), which qpdf reports ('dictionary has \
+            duplicated key') and pypdf strict mode refuses ('Multiple definitions in \
+            dictionary') while it lists the pages";
+        return vec![
+            ("structure.pikepdf", HIDDEN_HOP),
+            ("structure.pypdf", HIDDEN_HOP),
+        ];
+    }
+    if normalized == "form_ap_dict_shared_hidden_carrier" {
+        // M4 QA round 5, finding 7 (ruling R-19): the hidden use of the shared appearance
+        // dictionary is the first value of a key the signed page-tree root writes twice.
+        const HIDDEN_CARRIER: &str = "duplicate key by design (M4 QA round 5, finding 7): the \
+            signed page-tree root writes /Fx twice, the first value a use of the field's \
+            appearance dictionary that only first-wins readers see, which qpdf reports \
+            ('dictionary has duplicated key') and pypdf strict mode refuses ('Multiple \
+            definitions in dictionary') while it lists the pages";
+        return vec![
+            ("structure.pikepdf", HIDDEN_CARRIER),
+            ("structure.pypdf", HIDDEN_CARRIER),
+        ];
+    }
+    if normalized.starts_with("parser_tail_pad_") {
+        // M4 QA round 5, findings 10, 13 and 16–26 (ruling R-17): the padding after %%EOF is
+        // the attack; pyHanko cannot read the file (PYHANKO_RAISES).
+        const TAIL_PAD: &str = "file tail by design (M4 QA round 5, ruling R-17): 40,000 bytes \
+            of padding (or 31,500 bytes of comment lines) follow the final %%EOF, so qpdf finds \
+            no startxref and reconstructs the cross-reference data ('file is damaged', 'can't \
+            find startxref'), as poppler does";
+        let raises = pyhanko_raises(&normalized).unwrap_or_default();
+        return vec![
+            ("structure.pikepdf", TAIL_PAD),
+            ("signatures.pyhanko", raises),
+        ];
+    }
+    if normalized == "parser_trailer_size_over_declared_then_cosigned" {
+        // The co-signature after it numbers its objects from 100, so the newest /Size is the
+        // highest number + 1 again and qpdf has nothing to report.
+        return Vec::new();
+    }
+    if normalized == "parser_trailer_size_over_declared_info_only" {
+        // M4 final fix round 2 (verification round), expert finding 1: the control whose
+        // /Info update over-declares /Size 100 (non-conforming, but nothing is dropped).
+        return vec![(
+            "structure.pikepdf",
+            "/Size by design (M4 final fix round 2, expert finding 1): an /Info update's trailer \
+             over-declares /Size 100 above the highest object number + 1, which qpdf reports \
+             ('reported number of objects is not one plus the highest object number'); every \
+             object stays below the newest /Size, so no reader drops one",
+        )];
+    }
+    if normalized.starts_with("parser_trailer_size_") {
+        // M4 closing round, finding 13 (ruling R-26): the update's /Size is below the objects
+        // the file defines, which is the attack.
+        return vec![(
+            "structure.pikepdf",
+            "/Size by design (M4 closing round, finding 13): the update's trailer gives a /Size \
+             at or below the highest object number the file lists, which qpdf reports ('reported \
+             number of objects is not one plus the highest object number') and PDFium shrinks \
+             its object table to",
+        )];
+    }
+    if normalized == "annots_text_page_with_kids" {
+        return vec![(
+            "structure.pikepdf",
+            "page tree by design (M4 QA round 4, finding 10): the first page has /Type /Page \
+             and /Kids listing the second page, which the root lists too; qpdf repairs it (\
+             '/Type key should be /Pages', 'kid appears more than once in the pages tree')",
+        )];
+    }
+    if normalized == "parser_relisted_page_contents_zero_padded" {
+        // pyHanko lists the signature and raises when it analyses the update.
+        let raises = pyhanko_raises(&normalized).unwrap_or_default();
+        return vec![
+            ("signatures[0].pyhanko", raises),
+            ("signatures[0].coverage.pyhanko", raises),
+            ("signatures[0].modification.pyhanko", raises),
+            (
+                "structure.pypdf",
+                "number spelling by design (M4 QA round 4, finding 2): the page's /Contents \
+                 reference has an object number padded with leading zeros, which pypdf does not \
+                 read as a reference ('Expecting a NameObject for key')",
+            ),
+        ];
+    }
+    if normalized == "metadata_flate_crypt_ahx" {
+        return vec![(
+            "structure.pdfinfo",
+            "filter chain by design (M4 QA round 4, finding 11): the new /Metadata stream has \
+             /Filter [/FlateDecode /Crypt /ASCIIHexDecode] in a document that is not \
+             encrypted, which poppler reports ('Can't revert non decrypt streams'); pyHanko \
+             cannot decode the chain (other), nor does Folioxide",
+        )];
+    }
+    if normalized == "form_inplace_ap_shared_first_wins" {
+        // The fill rewrites the field and its appearance; the /XObject dictionary that writes
+        // /Fx twice stays the signed one, which qpdf reads.
+        const SIGNED_DUPLICATE: &str = "duplicate key by design (M4 QA round 3, ruling R-12 (2)): \
+            the signed revision writes an /XObject dictionary with /Fx twice, which qpdf reports \
+            ('dictionary has duplicated key; last occurrence overrides earlier ones')";
+        return vec![("structure.pikepdf", SIGNED_DUPLICATE)];
+    }
+    if matches!(
+        normalized.as_str(),
+        "parser_relisted_flags_multisign"
+            | "parser_relisted_rect_multisign"
+            | "sigfield_rect_multisign"
+    ) {
+        const MULTISIGN: &str = "number spelling by design (ruling R-12): a number written with \
+            two signs, which poppler reports ('Dictionary key must be a name object', or 'Bad \
+            bounding box for annotation' for the /Rect it cannot read) and qpdf reads as a string \
+            ('unknown token while reading object; treating as string')";
+        let raises = pyhanko_raises(&normalized).unwrap_or_default();
+        return vec![
+            ("signatures.pyhanko", raises),
+            ("structure.pdfinfo", MULTISIGN),
+            ("structure.pikepdf", MULTISIGN),
+        ];
+    }
+    if let Some(case) = normalized.strip_prefix("parser_dup_key_") {
+        let mut known = vec![("structure.pikepdf", DUPLICATE_KEY_QPDF)];
+        if matches!(
+            case,
+            "catalog_pages_new_first"
+                | "page_annots_empty_first"
+                | "page_contents_new_first"
+                | "trailer_root_new_first"
+        ) {
+            known.push(("structure.pypdf", DUPLICATE_KEY_PYPDF));
+        }
+        if case == "trailer_root_new_first" {
+            const OTHER_ROOT: &str = "parser differential by design (R-1): the update's trailer \
+                names /Root twice, the other document first; pyHanko and pypdf (extract_cms) \
+                keep the first value and open a document without a signature, which is the \
+                attack (Folioxide: OTHER)";
+            known.push(("signatures.count.pyhanko", OTHER_ROOT));
+            known.push(("signatures.count.fields", OTHER_ROOT));
+        }
+        return known;
+    }
+    match normalized.as_str() {
         "isa_bad_startxref_update" => vec![
             ("structure.pikepdf", BAD_STARTXREF),
             ("structure.pypdf", BAD_STARTXREF),
@@ -567,16 +711,37 @@ fn attack_known_failures(name: &str) -> Vec<(&'static str, &'static str)> {
                  dictionary, so the OpenSSL route cannot run; pdfsig validates the signature",
             ),
         ],
+        "parser_startxref_corrupted" => {
+            const STARTXREF_CORRUPTED: &str = "attack by design (M4 QA round 5, ruling R-17): \
+                the update's startxref names a position one byte past its cross-reference \
+                section, so the reader must reconstruct the cross-reference data (pikepdf warns \
+                'xref not found', pypdf strict mode refuses the broken xref table)";
+            vec![
+                ("structure.pikepdf", STARTXREF_CORRUPTED),
+                ("structure.pypdf", STARTXREF_CORRUPTED),
+            ]
+        }
         "swa_part2_shifted" => vec![
             ("structure.pdfinfo", PART2_SHIFTED),
             ("structure.pikepdf", PART2_SHIFTED),
             ("structure.pypdf", PART2_SHIFTED),
         ],
+        "sigfield_ap_state_dict" => vec![(
+            "structure.pdfinfo",
+            "attack by design (M4 QA round 1, finding R5): the new widget's /AP /N is a \
+             dictionary of appearance states without an /AS, which poppler reports",
+        )],
+        "sigfield_rect_wrong_length" => vec![(
+            "structure.pdfinfo",
+            "attack by design (M4 QA round 2, finding 4): the new widget's /Rect has three \
+             numbers, which poppler reports as a bad bounding box; Folioxide makes it other",
+        )],
         "shadow_overlay_sig_widget_no_rect" => vec![(
             "structure.pdfinfo",
             "attack by design: the new widget has no /Rect, which every annotation needs \
              (ISO 32000-2 §12.5.2), so poppler reports a bad bounding box; pyHanko treats it as \
-             invisible and its appearance as form filling, as Folioxide does (QA T3)",
+             invisible and its appearance as form filling (QA T3), Folioxide makes it other (M4 \
+             QA round 2, finding 4: a new signature widget's /Rect is four finite numbers)",
         )],
         // The gap row is the SWA defence itself (brief §5.1): intact and valid for pyHanko,
         // pdfsig and us, but the gap is not the /Contents token.

@@ -10,6 +10,8 @@
 //!   ([`field`], brief §4.5);
 //! - the signature dictionary, keys in this order: `/Type /Sig /Filter /Adobe.PPKLite
 //!   /SubFilter … /M (D:…)`, then `/Name`, `/Reason`, `/Location`, `/ContactInfo` when given,
+//!   then for a certification signature `/Reference [<</Type /SigRef /TransformMethod /DocMDP
+//!   /TransformParams <</Type /TransformParams /P n /V /1.2>>>>]` (all direct; M4 brief §4.6),
 //!   then `/ByteRange [0 a b c]` and `/Contents <00…00>` last, so the byte range lies in the first
 //!   signed part. It is never compressed (an incremental update has no object streams), and
 //!   `/Contents` is `2R` hexadecimal zeros with no white-space.
@@ -29,7 +31,8 @@
 //! without source bytes, junk before `%PDF-` (byte ranges are file-absolute while the file's
 //! offsets are not; pyHanko cannot read such files), a repaired cross-reference structure (other
 //! readers may see another document: a full save comes first), and a certified document whose
-//! DocMDP permissions are `P = 1` (§12.8.2.2).
+//! DocMDP permissions are `P = 1` (§12.8.2.2). The other certification rules of M4 brief §4.6
+//! belong to the field placement.
 
 use std::fmt;
 use std::ops::Range;
@@ -40,6 +43,7 @@ use folioxide_syntax::{
 };
 
 use crate::algorithms::DigestAlgorithm;
+use crate::docmdp;
 use crate::error::{Error, Result};
 use crate::field::{self, FieldPlan};
 use crate::prepare::SignatureOptions;
@@ -133,7 +137,9 @@ fn check_reserve(reserve: usize) -> Result<()> {
 /// - [`Error::Unsupported`]: bytes before `%PDF-` ("save a full copy first"); a repaired
 ///   cross-reference structure or an object away from its offset ("full save required", naming
 ///   the existing signatures a full save would invalidate).
-/// - [`Error::DocMdpForbids`]: the document is certified with DocMDP permissions `P = 1`.
+/// - [`Error::DocMdpForbids`]: the document is certified with DocMDP permissions `P = 1` (the
+///   catalog's `/Perms /DocMDP` signature, or a signed field's DocMDP reference; M4 brief §4.6
+///   rule (b)).
 /// - The errors of [`Store::resolve`](folioxide_syntax::Store::resolve) while reading the
 ///   catalog.
 pub fn check_signable(doc: &Document) -> Result<()> {
@@ -169,11 +175,10 @@ pub fn check_signable(doc: &Document) -> Result<()> {
         return Err(Error::Unsupported(message));
     }
     store.check_incremental()?;
-    let catalog = doc.catalog()?;
-    if field::docmdp_permission(store, catalog.as_dict())? == Some(1) {
+    if docmdp::certification(doc)?.is_some_and(|c| c.p == 1) {
         return Err(Error::DocMdpForbids(
-            "the document is certified with DocMDP permissions P = 1: no changes, signatures \
-             included, are allowed (ISO 32000-2 §12.8.2.2)"
+            "DocMDP rule (b): the document is certified with DocMDP permissions P = 1: no \
+             changes, signatures included, are allowed (ISO 32000-2 §12.8.2.2)"
                 .to_owned(),
         ));
     }
@@ -297,6 +302,11 @@ pub(crate) fn signed_digest(
 ///
 /// # Errors
 /// - The refusals of [`check_signable`].
+/// - The certification rules of M4 brief §4.6 ([`Error::DocMdpForbids`]; see
+///   [`SignatureOptions::certification`]).
+/// - The appearance errors of a visible signature ([`SignatureOptions::appearance`]; see
+///   [`appearance`](crate::appearance)). Without a certificate, the default appearance text
+///   names the signer only by [`SignatureOptions::name`].
 /// - The field placement errors (brief §4.5): [`Error::PageOutOfRange`],
 ///   [`Error::InvalidArgument`], [`Error::NotFound`], [`Error::Unsupported`]; see
 ///   [`FieldSpec`](crate::field::FieldSpec) and [`FieldMode`](crate::field::FieldMode).
@@ -307,7 +317,9 @@ pub fn write_placeholder(doc: &Document, options: &SignatureOptions) -> Result<P
     let reserve = options.contents_reserve.unwrap_or(MIN_CONTENTS_RESERVE);
     check_reserve(reserve)?;
     check_signable(doc)?;
-    let plan = field::plan(doc, &options.field)?;
+    // No certificate here: the default appearance text names the signer only by
+    // `options.name`.
+    let plan = field::plan(doc, options, None)?;
     write_with_plan(doc, plan, options, reserve)
 }
 
@@ -380,7 +392,7 @@ pub(crate) fn write_with_plan(
 /// The signature dictionary with its placeholders (brief §4.1), keys in the order of the module
 /// documentation: `/ByteRange` before `/Contents`, `/Contents` last.
 fn signature_dict(options: &SignatureOptions, reserve: usize) -> Dict {
-    let mut dict = Dict::with_capacity(10);
+    let mut dict = Dict::with_capacity(11);
     dict.insert("Type", Object::name("Sig"));
     dict.insert("Filter", Object::name("Adobe.PPKLite"));
     dict.insert("SubFilter", Object::name(options.sub_filter.name()));
@@ -402,6 +414,16 @@ fn signature_dict(options: &SignatureOptions, reserve: usize) -> Dict {
         if let Some(value) = value {
             dict.insert(key, field::text_object(value));
         }
+    }
+    // §12.8.2.2: a certification signature's DocMDP transform, before /ByteRange so that
+    // /Contents stays last (M4 brief §4.6).
+    if let Some(permissions) = options.certification {
+        dict.insert(
+            "Reference",
+            Object::Array(vec![Object::Dict(docmdp::reference_dictionary(
+                permissions,
+            ))]),
+        );
     }
     dict.insert(
         "ByteRange",

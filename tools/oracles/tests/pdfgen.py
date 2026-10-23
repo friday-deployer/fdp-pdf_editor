@@ -25,6 +25,7 @@ def build_pdf(
     catalog_version: str | None = None,
     page_entries: tuple[str, ...] | None = None,
     tree_entries: str = "",
+    page_contents: tuple[bytes, ...] | None = None,
 ) -> bytes:
     """Return the bytes of a minimal PDF with one text line per page.
 
@@ -33,6 +34,7 @@ def build_pdf(
     ``page_entries`` (one string per page) replaces each page's ``/MediaBox [0 0 612 792]`` with
     other dictionary entries, and ``tree_entries`` is added to the page tree root, which the
     pages inherit ``/MediaBox``, ``/CropBox`` and ``/Rotate`` from (§7.7.3.4).
+    ``page_contents`` (one content stream per page) replaces the text line of each page.
     """
     if page_entries is None:
         page_entries = ("/MediaBox [0 0 612 792]",) * len(page_texts)
@@ -64,8 +66,12 @@ def build_pdf(
         + b" ".join(b"/" + k.encode("ascii") + b" " + _pdf_string(v) for k, v in info.items())
         + b" >>"
     )
-    for pid, text, entries in zip(page_ids, page_texts, page_entries, strict=True):
+    if page_contents is not None and len(page_contents) != len(page_texts):
+        raise ValueError("page_contents needs one content stream per page")
+    for index, (pid, text, entries) in enumerate(zip(page_ids, page_texts, page_entries, strict=True)):
         content = b"BT /F1 24 Tf 72 720 Td " + _pdf_string(text) + b" Tj ET\n"
+        if page_contents is not None:
+            content = page_contents[index]
         objects[pid] = (
             b"<< /Type /Page /Parent 2 0 R " + entries.encode("ascii")
             + b" /Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % (pid + 1)

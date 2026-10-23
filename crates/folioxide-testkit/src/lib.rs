@@ -19,9 +19,10 @@
 //!   guarantees (for `no_panic_on_mutated_input` and the `fuzz_parse_document` fuzz target)
 //! - [`graph`]: graph equality of two documents modulo renumbering, with a readable difference
 //!   (writer and model round-trip tests)
+//! - [`tsa`]: [`MockTsa`](tsa::MockTsa), a deterministic RFC 3161 timestamp authority with its
+//!   own DER writer (M4)
 //!
-//! Later milestones add a loader for the test PKI in `fixtures/pki/` and a mock RFC 3161
-//! timestamp authority.
+//! Later milestones add a loader for the test PKI in `fixtures/pki/`.
 //!
 //! ## Oracle output
 //!
@@ -38,6 +39,8 @@ pub mod fixtures;
 pub mod mutate;
 // M2 WP2.4: graph equality of two documents (writer acceptance).
 pub mod graph;
+// M4 WP4.0: the mock RFC 3161 timestamp authority.
+pub mod tsa;
 
 pub use builder::{
     LengthSpec, ObjStmOpts, PdfBuilder, XrefEntry, XrefEol, XrefOpts, XrefStreamOpts,

@@ -14,6 +14,8 @@ pub mod syntax;
 pub mod model;
 // M3 WP3.1A-pre: byte-level generators for the signed-PDF attack corpus (brief §5.1).
 pub mod sign_attacks;
+// M4 WP4.1A: AcroForm documents and form-filling and annotating updates (M4 brief §3.4).
+pub mod forms;
 
 use std::path::{Path, PathBuf};
 

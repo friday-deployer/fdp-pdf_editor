@@ -14,7 +14,10 @@
 //!   `PdfDocument.prepareSignature` and [`PreparedSignature`] for the two-phase flow (the
 //!   JavaScript facade's `signPdf` awaits an external signer between the phases), and
 //!   `PdfDocument.verifySignatures`, whose [`SignatureReport`]s have the JSON shape of the core's
-//!   serde DTOs.
+//!   serde DTOs. M4 adds certification (`certify`), visible signatures
+//!   ([`SignatureAppearanceOptions`]) and PAdES B-T: `PreparedSignature.timestampRequest` and
+//!   `finish(signature, timestampResponse)`, around a TSA the facade's `signPdf` awaits, and the
+//!   reports' [`TimestampInfo`].
 //! - Errors (`error`): every error carries `err.code = "E_" + ErrorCode`, or `E_BUSY` or
 //!   `E_CLOSED`.
 
@@ -30,10 +33,11 @@ pub use dto::{
 };
 pub use error::{BindingError, E_BUSY, E_CLOSED, JsResult, MAX_MESSAGE_LEN};
 pub use sign::{
-    CertificateInfo, Coverage, DigestAlg, DocumentTaskError, FieldMode, FinishTask, KeyDescription,
-    LocalSigner, ModificationLevel, ObjectRef, PadesLevel, PrepareSignatureOptions, PrepareTask,
-    PreparedSignature, SigAlg, SignTask, SignatureFieldSpec, SignatureKind, SignatureProblem,
-    SignatureReport, SubFilter, VerifyOptions, VerifyTask,
+    AppearanceFont, CertificateInfo, Coverage, DigestAlg, DocumentTaskError, FieldMode, FinishTask,
+    ImagePosition, KeyDescription, LocalSigner, ModificationLevel, ObjectRef, PadesLevel,
+    PrepareSignatureOptions, PrepareTask, PreparedSignature, ProblemCode, SigAlg, SignTask,
+    SignatureAppearanceOptions, SignatureFieldSpec, SignatureKind, SignatureProblem,
+    SignatureReport, SubFilter, TimestampInfo, TimestampRequestOptions, VerifyOptions, VerifyTask,
 };
 
 use napi_derive::napi;
@@ -144,7 +148,10 @@ mod tests {
             ),
             (
                 "export type PadesLevel =",
-                vec![folioxide::PadesLevel::BB.as_str()],
+                vec![
+                    folioxide::PadesLevel::BB.as_str(),
+                    folioxide::PadesLevel::BT.as_str(),
+                ],
             ),
         ];
         for (start, values) in unions {
@@ -156,6 +163,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The hand-written JavaScript facade of the npm package.
+    const INDEX_JS: &str = include_str!("../index.js");
+
+    /// `signPdf`'s timestamp token budget and retry margin are the core's (M4 brief §3.5, D-8).
+    #[test]
+    fn index_js_timestamp_constants_are_the_cores() {
+        for (name, value) in [
+            ("DEFAULT_TSA_RESERVE", folioxide::DEFAULT_TSA_RESERVE),
+            ("TSA_RETRY_MARGIN", folioxide::TSA_RETRY_MARGIN),
+        ] {
+            let line = format!("const {name} = {value}\n");
+            assert!(INDEX_JS.contains(&line), "index.js lacks `{}`", line.trim());
+        }
+    }
+
+    /// The TypeScript declarations `napi build` generates (`pnpm build`).
+    const BINDING_D_TS: &str = include_str!("../binding.d.ts");
+
+    /// The generated `binding.d.ts` types `SignatureProblem.code` as its `ProblemCode` union,
+    /// which lists every core problem code (the binding's type-only `ProblemCode` enum keeps up
+    /// with the core), so the type tests can check `Equal<binding.TimestampInfo, TimestampInfo>`.
+    #[test]
+    fn binding_d_ts_lists_every_problem_code() {
+        let union = declaration(BINDING_D_TS, "export type ProblemCode =");
+        for &code in folioxide::ProblemCode::ALL {
+            let js = format!("'{}'", code.as_str());
+            assert!(union.contains(&js), "binding.d.ts ProblemCode lacks {js}");
+        }
+        assert_eq!(
+            union.matches('|').count() + 1,
+            folioxide::ProblemCode::ALL.len(),
+            "binding.d.ts ProblemCode has values the core does not: {union}"
+        );
     }
 
     /// The text of the declaration that starts with `start`, up to the next blank line.

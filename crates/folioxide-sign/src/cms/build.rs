@@ -13,14 +13,15 @@ use x509_cert::attr::Attribute;
 
 use super::SignedAttrsInput;
 use super::tlv::{
-    self, TAG_CONTEXT_0, TAG_CONTEXT_4, TAG_INTEGER, TAG_NULL, TAG_OCTET_STRING, TAG_OID,
-    TAG_SEQUENCE, TAG_SET,
+    self, TAG_CONTEXT_0, TAG_CONTEXT_1, TAG_CONTEXT_4, TAG_INTEGER, TAG_NULL, TAG_OCTET_STRING,
+    TAG_OID, TAG_SEQUENCE, TAG_SET,
 };
 use crate::algorithms::{
     DigestAlgorithm, KeyKind, SignatureAlgorithm, check_signing_combination, oid,
 };
 use crate::error::{Error, Result};
 use crate::keys::public::{ecdsa_der_from_fixed, ecdsa_der_to_fixed, rsa_left_pad};
+use crate::placeholder::MAX_CONTENTS_RESERVE;
 use crate::x509info::cert::CertParts;
 
 /// `ESSCertIDv2` (RFC 5035 §4):
@@ -68,6 +69,8 @@ const OID_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap(oid::CON
 const OID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap(oid::MESSAGE_DIGEST);
 const OID_SIGNING_CERTIFICATE_V2: ObjectIdentifier =
     ObjectIdentifier::new_unwrap(oid::SIGNING_CERTIFICATE_V2);
+const OID_SIGNATURE_TIME_STAMP_TOKEN: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap(crate::tsp::OID_AA_SIGNATURE_TIME_STAMP_TOKEN);
 const OID_SHA1_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap(oid::SHA1_WITH_RSA);
 const OID_SHA256_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap(oid::SHA256_WITH_RSA);
 const OID_SHA384_WITH_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap(oid::SHA384_WITH_RSA);
@@ -241,6 +244,7 @@ pub(crate) fn cms_len_upper_bound(
         alg,
         digest,
         &inputs.signer,
+        None,
     )
     .len())
 }
@@ -263,7 +267,92 @@ pub(crate) fn assemble(
         alg,
         digest,
         &inputs.signer,
+        None,
     ))
+}
+
+/// See [`super::assemble_with_timestamp`].
+#[allow(clippy::too_many_arguments)] // The brief's signature (M4 brief §3.1).
+pub(crate) fn assemble_with_timestamp(
+    signed_attrs: &[u8],
+    signature: &[u8],
+    chain_der: &[Vec<u8>],
+    alg: SignatureAlgorithm,
+    kind: KeyKind,
+    digest: DigestAlgorithm,
+    token_der: &[u8],
+) -> Result<Vec<u8>> {
+    let inputs = check_inputs(signed_attrs, chain_der, alg, kind, digest)?;
+    let value = normalize_signature(signature, kind)?;
+    match tlv::read_exact(token_der, super::MAX_DEPTH) {
+        Ok(element) if element.tag == TAG_SEQUENCE => {}
+        _ => {
+            return Err(Error::InvalidArgument(
+                "the timestamp token is not one BER or DER ContentInfo SEQUENCE".to_owned(),
+            ));
+        }
+    }
+    let unsigned = timestamp_unsigned_attrs(token_der);
+    Ok(encode(
+        signed_attrs,
+        &value,
+        chain_der,
+        alg,
+        digest,
+        &inputs.signer,
+        Some(&unsigned),
+    ))
+}
+
+/// See [`super::cms_len_upper_bound_with_timestamp`].
+pub(crate) fn cms_len_upper_bound_with_timestamp(
+    signed_attrs: &[u8],
+    chain_der: &[Vec<u8>],
+    alg: SignatureAlgorithm,
+    kind: KeyKind,
+    digest: DigestAlgorithm,
+    token_len: usize,
+) -> Result<usize> {
+    if token_len == 0 {
+        return cms_len_upper_bound(signed_attrs, chain_der, alg, kind, digest);
+    }
+    if token_len > MAX_CONTENTS_RESERVE {
+        return Err(Error::InvalidArgument(format!(
+            "a timestamp token of {token_len} bytes cannot fit in a /Contents of at most \
+             {MAX_CONTENTS_RESERVE} bytes"
+        )));
+    }
+    let inputs = check_inputs(signed_attrs, chain_der, alg, kind, digest)?;
+    let longest = vec![0u8; kind.max_signature_len()];
+    // The lengths do not depend on the token's bytes: a dummy of exactly `token_len` bytes.
+    let unsigned = timestamp_unsigned_attrs(&vec![0u8; token_len]);
+    Ok(encode(
+        signed_attrs,
+        &longest,
+        chain_der,
+        alg,
+        digest,
+        &inputs.signer,
+        Some(&unsigned),
+    )
+    .len())
+}
+
+/// `unsignedAttrs [1] IMPLICIT` holding exactly one `id-aa-signatureTimeStampToken` attribute
+/// with exactly one value, `token`, byte for byte (RFC 3161 Appendix A; M4 brief §4.3):
+///
+/// ```text
+/// A1 L { 30 L { 06 0B 2A 86 48 86 F7 0D 01 09 10 02 0E, 31 L { <token> } } }
+/// ```
+fn timestamp_unsigned_attrs(token: &[u8]) -> Vec<u8> {
+    let attribute = tlv::tlv_parts(
+        TAG_SEQUENCE,
+        &[
+            &tlv::tlv(TAG_OID, OID_SIGNATURE_TIME_STAMP_TOKEN.as_bytes()),
+            &tlv::tlv(TAG_SET, token),
+        ],
+    );
+    tlv::tlv(TAG_CONTEXT_1, &attribute)
 }
 
 /// The signature value to embed (brief §4.3 "Normalisation"):
@@ -303,8 +392,11 @@ pub(crate) fn normalize_signature(signature: &[u8], kind: KeyKind) -> Result<Vec
 /// SignedData  ::= SEQUENCE { version 1, digestAlgorithms SET { digestAlgorithm },
 ///                            encapContentInfo { id-data }, certificates [0] IMPLICIT, signerInfos SET }
 /// SignerInfo  ::= SEQUENCE { version 1, sid IssuerAndSerialNumber, digestAlgorithm,
-///                            signedAttrs [0] IMPLICIT, signatureAlgorithm, signature OCTET STRING }
+///                            signedAttrs [0] IMPLICIT, signatureAlgorithm, signature OCTET STRING,
+///                            unsignedAttrs [1] IMPLICIT OPTIONAL }
 /// ```
+///
+/// `unsigned_attrs` is the whole `[1]` element, appended as given.
 fn encode(
     signed_attrs: &[u8],
     signature: &[u8],
@@ -312,6 +404,7 @@ fn encode(
     alg: SignatureAlgorithm,
     digest: DigestAlgorithm,
     signer: &CertParts<'_>,
+    unsigned_attrs: Option<&[u8]>,
 ) -> Vec<u8> {
     let version_1 = [TAG_INTEGER, 0x01, 0x01];
     // RFC 5754 §2: SHA-2 AlgorithmIdentifiers omit the parameters.
@@ -352,6 +445,7 @@ fn encode(
             &implicit_attrs,
             &signature_algorithm,
             &tlv::tlv(TAG_OCTET_STRING, signature),
+            unsigned_attrs.unwrap_or_default(),
         ],
     );
 

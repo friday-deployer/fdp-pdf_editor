@@ -17,8 +17,8 @@ use folioxide_sign::signer::Signer;
 use folioxide_syntax::{Dict, IncrementalOptions, Object, ObjectId, OpenOptions, Store};
 use folioxide_testkit::fixtures::{sign_attacks as mutators, syntax};
 use sign_support::corpus::{
-    COSIGNER_FIELD, DELIBERATE_DIFFERENCES, PYHANKO_RAISES, Reference, attacked, corpus, our_value,
-    pyhanko_raises, signed_base,
+    COSIGNER_FIELD, DELIBERATE_DIFFERENCES, LATER_SIGNER_FIELDS, MORE_LENIENT, PYHANKO_RAISES,
+    Reference, attacked, certify_corpus, corpus, our_value, pyhanko_raises, signed_base,
 };
 use sign_support::*;
 
@@ -117,7 +117,11 @@ fn assert_deliberately_other(name: &str, needle: &str) -> SignatureReport {
 
 #[test]
 fn deliberate_differences_are_stricter_and_name_real_cases() {
-    let names: Vec<&str> = corpus().iter().map(|c| c.name).collect();
+    let names: Vec<&str> = corpus()
+        .iter()
+        .map(|c| c.name)
+        .chain(certify_corpus().iter().map(|c| c.name))
+        .collect();
     let coverage_rank = |c: &str| match c {
         "entireFile" => 3,
         "entireRevision" => 2,
@@ -144,8 +148,62 @@ fn deliberate_differences_are_stricter_and_name_real_cases() {
                     "{case}"
                 );
             }
+            // `docmdp_ok`: `false` is the stricter verdict.
+            "docmdpOk" => assert_eq!((*ours, *pyhanko), ("false", "true"), "{case}"),
+            // Manager ruling R-6: the one row where pyHanko raises and Folioxide reads the ISO
+            // default (a missing /P is 2), recorded and pinned by knownFailures.
+            "docmdp" => {
+                assert_eq!(
+                    (*case, *ours, *pyhanko),
+                    ("docmdp_p_missing", "2", "raises")
+                );
+                assert!(reason.starts_with("R-6"), "{case}: {reason}");
+            }
             other => panic!("{case}: field {other}"),
         }
+    }
+}
+
+/// D-1 (M4 brief §0.2) is the only deliberate difference where Folioxide is more lenient than
+/// pyHanko: markup annotations reported `Annotations` (pyHanko: `OTHER`) and, under `P = 3`,
+/// `docmdp_ok` true (pyHanko: false). Every row names a real case and nothing else.
+#[test]
+fn more_lenient_rows_are_d1_annotations_only() {
+    let names: Vec<&str> = corpus()
+        .iter()
+        .map(|c| c.name)
+        .chain(certify_corpus().iter().map(|c| c.name))
+        .collect();
+    for (case, field, ours, pyhanko, reason) in MORE_LENIENT {
+        assert!(names.contains(case), "{case} is not a corpus case");
+        assert!(reason.starts_with("D-1"), "{case}: {reason}");
+        // `<field name>.<field>` rows are another signature's (manager ruling R-7: the approval
+        // after a P = 3 certification).
+        let key: &str = match field.split_once('.') {
+            Some((signature, key)) => {
+                assert_eq!(signature, "Approval", "{case}");
+                assert_eq!(*case, "certify_p3_approval_then_markup", "{case}");
+                key
+            }
+            None => field,
+        };
+        match key {
+            "modification" => assert_eq!((*ours, *pyhanko), ("annotations", "other"), "{case}"),
+            "docmdpOk" => {
+                assert_eq!((*ours, *pyhanko), ("true", "false"), "{case}");
+                assert!(
+                    case.starts_with("certify_p3_"),
+                    "{case}: only P = 3 grants it"
+                );
+            }
+            other => panic!("{case}: field {other}"),
+        }
+        assert!(
+            !DELIBERATE_DIFFERENCES
+                .iter()
+                .any(|(c, f, ..)| c == case && f == field),
+            "{case}: {field} is in both tables"
+        );
     }
 }
 
@@ -162,7 +220,9 @@ fn every_generator_applies_and_no_attack_is_valid() {
         // The attacked signature is never reported valid with no modification (a co-signer's
         // own, later signature may be).
         let unchanged_valid = reports.iter().any(|r| {
-            r.field_name.as_deref() != Some(COSIGNER_FIELD)
+            !r.field_name
+                .as_deref()
+                .is_some_and(|f| LATER_SIGNER_FIELDS.contains(&f))
                 && r.is_valid()
                 && r.modification == ModificationLevel::None
                 && r.problems.is_empty()
@@ -184,7 +244,8 @@ fn every_generator_applies_and_no_attack_is_valid() {
         }
         if case.reference == Reference::PyhankoRaises {
             // The signed bytes are untouched (pdfsig and OpenSSL validate them); the attack is
-            // the unattributable structure after them.
+            // the unattributable structure after them, or (M4 QA round 3, ruling R-12) a
+            // number spelled with two signs, which pyHanko cannot read either.
             assert!(pyhanko_raises(case.name).is_some(), "{}", case.name);
             let r = &reports[0];
             assert!(
@@ -194,12 +255,14 @@ fn every_generator_applies_and_no_attack_is_valid() {
                 summary(r)
             );
             assert_eq!(r.modification, ModificationLevel::Other, "{}", case.name);
-            assert!(
-                r.has_problem(ProblemCode::StructureRepaired),
-                "{}",
-                case.name
-            );
-            assert!(!r.is_valid(), "{}", case.name);
+            if case.name.starts_with("isa_") {
+                assert!(
+                    r.has_problem(ProblemCode::StructureRepaired),
+                    "{}",
+                    case.name
+                );
+                assert!(!r.is_valid(), "{}", case.name);
+            }
         }
     }
 }
@@ -764,11 +827,10 @@ fn attacks_shadow_overlay_stamp_ft_sig() {
 
 #[test]
 fn attacks_shadow_overlay_sig_widget_no_rect() {
-    // QA T3: invisible (no /Rect, as pyHanko), but its new appearance stream is form filling.
-    assert_revision(
-        "shadow_overlay_sig_widget_no_rect",
-        ModificationLevel::FormFilling,
-    );
+    // QA T3, and M4 QA round 2 finding 4: a new signature widget needs a /Rect of four finite
+    // numbers (signers write [0 0 0 0] for an invisible one); without one viewers place its
+    // appearance elsewhere than its /Rect says. pyHanko treats it as invisible (formFilling).
+    assert_deliberately_other("shadow_overlay_sig_widget_no_rect", "four finite numbers");
 }
 
 #[test]
@@ -1132,9 +1194,18 @@ fn signing_an_unsigned_field_may_set_its_appearance() {
         let pdf = update(&signed, |store| {
             let id = object_named(store, field);
             let sig = new_sig_dict(store);
+            // A form XObject with a /BBox (QA finding R5: an appearance without one, or that
+            // is not a form XObject, is OTHER; `signing_an_unsigned_field_with_a_bare_stream`).
             let overlay = store
                 .add(Object::Stream(Box::new(folioxide_syntax::Stream::new(
-                    Dict::from_iter([("BBox".into(), Object::Array(vec![Object::Int(0); 4]))]),
+                    Dict::from_iter([
+                        ("Type".into(), Object::name("XObject")),
+                        ("Subtype".into(), Object::name("Form")),
+                        (
+                            "BBox".into(),
+                            Object::Array([0, 0, 100, 30].map(Object::Int).to_vec()),
+                        ),
+                    ]),
                     folioxide_syntax::StreamData::Decoded(b"0 g".to_vec()),
                 ))))
                 .unwrap();
@@ -1153,6 +1224,47 @@ fn signing_an_unsigned_field_may_set_its_appearance() {
             ModificationLevel::FormFilling,
             "{field}: {}",
             summary(&r)
+        );
+    }
+}
+
+#[test]
+fn signing_an_unsigned_field_with_a_bare_stream() {
+    // QA finding R5: an appearance that is not a form XObject with a /BBox (here a stream with
+    // neither, and one with a /BBox of no area on a visible widget) is not clipped to the
+    // widget's /Rect by every viewer (PDFium paints it over the page): OTHER.
+    let signed = sign_support::corpus::Base::UnsignedFields.bytes();
+    for dict in [
+        Dict::new(),
+        Dict::from_iter([
+            ("Subtype".into(), Object::name("Form")),
+            ("BBox".into(), Object::Array(vec![Object::Int(0); 4])),
+        ]),
+    ] {
+        let pdf = update(&signed, |store| {
+            let id = object_named(store, "CoSigner");
+            let sig = new_sig_dict(store);
+            let overlay = store
+                .add(Object::Stream(Box::new(folioxide_syntax::Stream::new(
+                    dict.clone(),
+                    folioxide_syntax::StreamData::Decoded(b"0 g 0 0 612 792 re f".to_vec()),
+                ))))
+                .unwrap();
+            let mut field = dict_of(store, id);
+            field.insert("V", Object::Ref(sig));
+            let mut ap = Dict::new();
+            ap.insert("N", Object::Ref(overlay));
+            field.insert("AP", Object::Dict(ap));
+            store.set(id, Object::Dict(field)).unwrap();
+        });
+        let r = first_signature(&pdf);
+        assert_eq!(r.modification, ModificationLevel::Other, "{}", summary(&r));
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("BBox") || w.contains("form XObject")),
+            "{:?}",
+            r.warnings
         );
     }
 }
@@ -2027,8 +2139,11 @@ fn an_indirect_dr_category_is_compared_by_its_names() {
 
 #[test]
 fn attacks_form_field_value_changed() {
-    // Generic form filling: OTHER until M4 WP4.2 (pyHanko: FORM_FILLING).
-    assert_deliberately_other("form_field_value_changed", "changes a form field");
+    // Generic form filling, classified since M4 WP4.2A (brief §5.1): a text field's new /V
+    // alone is form filling, as pyHanko says (it was OTHER in M3, D-9).
+    let r = assert_revision("form_field_value_changed", ModificationLevel::FormFilling);
+    assert_eq!(r.docmdp_ok, Some(true), "P = 2 is in force for an approval");
+    assert!(r.is_acceptable(ModificationLevel::FormFilling));
 }
 
 #[test]
@@ -2091,6 +2206,80 @@ fn attacks_shadow_metadata_removed_old_changed() {
 #[test]
 fn attacks_metadata_changed_in_place() {
     assert_revision("metadata_changed_in_place", ModificationLevel::LtaUpdates);
+}
+
+#[test]
+fn attacks_metadata_changed_not_well_formed() {
+    // QA finding 22 (variant R4-approval-plain-update-invalid-xml): a duplicate attribute makes
+    // the packet malformed XML, so not XMP: Other, as in pyHanko.
+    let r = assert_changed_after_signing("metadata_changed_not_well_formed");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("the new stream is not an XMP packet")),
+        "{:?}",
+        r.warnings
+    );
+}
+
+/// M4 QA round 3, findings 19 and 20: a new `/Metadata` packet pyHanko does not read as XMP
+/// (libxml2's limits, or data its filters do not decode): Other, as pyHanko.
+fn assert_metadata_not_xmp(name: &str) {
+    let r = assert_changed_after_signing(name);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("the new stream is not an XMP packet")),
+        "{name}: {:?}",
+        r.warnings
+    );
+    assert_eq!(
+        our_value(name, "modification"),
+        None,
+        "{name}: equal to pyHanko"
+    );
+}
+
+#[test]
+fn attacks_metadata_xmp_comment_over_lxml_limit() {
+    assert_metadata_not_xmp("metadata_xmp_comment_over_lxml_limit");
+}
+
+#[test]
+fn attacks_metadata_xmp_name_over_lxml_limit() {
+    assert_metadata_not_xmp("metadata_xmp_name_over_lxml_limit");
+}
+
+#[test]
+fn attacks_metadata_flate_bad_adler() {
+    assert_metadata_not_xmp("metadata_flate_bad_adler");
+}
+
+#[test]
+fn attacks_metadata_runlength() {
+    assert_metadata_not_xmp("metadata_runlength");
+}
+
+#[test]
+fn attacks_metadata_ascii85_without_eod() {
+    assert_metadata_not_xmp("metadata_ascii85_without_eod");
+}
+
+#[test]
+fn attacks_metadata_flate_then_ascii() {
+    // M4 QA round 4, finding 11 (variants R4w-dec-flate-then-ahx/-a85/-crypt-ahx/-flate-ahx,
+    // approval context): pyHanko's FlateDecode returns a memoryview, on which its ASCIIHex and
+    // ASCII85 decoders raise, so it cannot read the packet ("/Metadata XML syntax could not be
+    // validated"): Other, as pyHanko (docmdpOk false).
+    for name in [
+        "metadata_flate_then_ahx",
+        "metadata_flate_then_a85",
+        "metadata_flate_crypt_ahx",
+        "metadata_flate_flate_ahx",
+    ] {
+        assert_metadata_not_xmp(name);
+        assert_eq!(field_report(name).docmdp_ok, Some(false), "{name}");
+    }
 }
 
 #[test]
@@ -2328,8 +2517,15 @@ fn attacks_apply_to_ecdsa_signatures_on_xref_streams() {
         };
         let reports = verify_plain(&pdf);
         assert!(!reports.is_empty(), "{}", case.name);
+        // A co-signer's own, later signature may be valid and unchanged (as in
+        // `every_generator_applies_and_no_attack_is_valid`).
         let changed_or_broken = reports
             .iter()
+            .filter(|r| {
+                !r.field_name
+                    .as_deref()
+                    .is_some_and(|f| LATER_SIGNER_FIELDS.contains(&f))
+            })
             .all(|r| !r.is_valid() || r.modification != ModificationLevel::None);
         assert!(
             changed_or_broken,

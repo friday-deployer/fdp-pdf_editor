@@ -6,7 +6,13 @@ pyHanko (``validate_pdf_signature`` / ``validate_pdf_timestamp``) reports per si
 one of the trust roots validates; needs trust roots), ``coverage`` (entireFile, entireRevision,
 contiguousBlockFromStart, unclear), ``modification`` (none, ltaUpdates, formFilling, annotations,
 other; ``null`` when pyHanko cannot tell), ``docmdp`` (the certification level P, 1-3, or
-``null``), ``docmdpOk`` and ``timestamp`` (a signature timestamp token is present and valid).
+``null``), ``docmdpOk``, ``timestamp`` (a signature timestamp token is present and valid) and
+``timestampTrusted`` (pyHanko's ``timestamp_validity.trusted``; needs trust roots).
+
+``timestamp`` takes three values (M4 brief D-22): ``true`` (pyHanko's token is intact and valid,
+and ``openssl ts -verify`` of the token over the signature value succeeds), ``false`` (no token)
+and ``"invalid"`` (a token is present, pyHanko's token is not intact and valid, **and** ``openssl
+ts -verify`` fails).
 
 An expectation entry describes a good signature unless it says otherwise: ``intact`` and
 ``valid`` default to ``true``. A tamper case sets ``"intact": false`` (pyHanko still reports
@@ -109,7 +115,7 @@ from pades_profile import check_pades, profile  # noqa: E402
 #: Keys allowed inside one ``signatures[]`` expectation entry.
 SIGNATURE_KEYS = frozenset(
     {"field", "intact", "valid", "trusted", "coverage", "modification", "docmdp", "docmdpOk",
-     "pades", "timestamp", "rejected"}
+     "pades", "timestamp", "timestampTrusted", "rejected"}
 )
 
 #: The keys a ``"rejected": true`` entry may have besides ``rejected`` (M3 brief D-3).
@@ -156,6 +162,8 @@ class SigStatus:
     byte_range: list[int]
     #: pyHanko raised while validating this signature (``intact`` and ``valid`` are then false).
     error: str | None = None
+    #: pyHanko's ``timestamp_validity.trusted`` for the signature timestamp, if there is one.
+    timestamp_trusted: bool | None = None
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
@@ -164,7 +172,8 @@ class SigStatus:
             "intact": d["intact"], "valid": d["valid"], "trusted": d["trusted"],
             "coverage": d["coverage"], "modification": d["modification"], "docmdp": d["docmdp"],
             "docmdpOk": d["docmdp_ok"], "timestamp": d["timestamp"],
-            "timestampValid": d["timestamp_valid"], "mdAlgorithm": d["md_algorithm"],
+            "timestampValid": d["timestamp_valid"], "timestampTrusted": d["timestamp_trusted"],
+            "mdAlgorithm": d["md_algorithm"],
             "signer": d["signer"], "byteRange": d["byte_range"], "error": d["error"],
         }
 
@@ -226,6 +235,7 @@ def validate(path: Path, trust_roots: list[Path]) -> list[SigStatus]:
                     docmdp_ok=status.docmdp_ok,
                     timestamp=tst is not None,
                     timestamp_valid=(bool(tst.intact and tst.valid) if tst is not None else None),
+                    timestamp_trusted=(bool(tst.trusted) if tst is not None else None),
                     md_algorithm=status.md_algorithm,
                     signer=status.signing_cert.subject.human_friendly if status.signing_cert else None,
                     byte_range=list(sig.byte_range),
@@ -362,9 +372,11 @@ def _validate_entry(entry: Any, i: int) -> dict[str, Any]:
     if entry.get("rejected") and set(entry) - REJECTED_KEYS:
         raise ExpectError(f"signatures[{i}]: a rejected entry takes only {sorted(REJECTED_KEYS)}, "
                           f"not {sorted(set(entry) - REJECTED_KEYS)}")
-    for key in ("intact", "valid", "trusted", "timestamp"):
+    for key in ("intact", "valid", "trusted", "timestampTrusted"):
         if key in entry and not isinstance(entry[key], bool):
             raise ExpectError(f"signatures[{i}].{key} must be true or false")
+    if "timestamp" in entry and not (isinstance(entry["timestamp"], bool) or entry["timestamp"] == "invalid"):
+        raise ExpectError(f"signatures[{i}].timestamp must be true, false or \"invalid\"")
     if "docmdpOk" in entry and entry["docmdpOk"] is not None and not isinstance(entry["docmdpOk"], bool):
         raise ExpectError(f"signatures[{i}].docmdpOk must be true, false or null")
     if "docmdp" in entry and entry["docmdp"] not in (None, 1, 2, 3):
@@ -382,8 +394,9 @@ def check_signatures(path: Path, expected: Any, trust_roots: list[Path]) -> list
     if not isinstance(expected, list):
         raise ExpectError("'signatures' must be a list of objects")
     entries = [_validate_entry(e, i) for i, e in enumerate(expected)]
-    if any("trusted" in e for e in entries) and not trust_roots:
-        raise ExpectError("'trusted' needs trust roots: pass --trust-root or set \"trustRoots\" in expect.json")
+    if any("trusted" in e or "timestampTrusted" in e for e in entries) and not trust_roots:
+        raise ExpectError("'trusted' needs trust roots (so does 'timestampTrusted'): pass --trust-root or "
+                          "set \"trustRoots\" in expect.json")
     rejected = [bool(e.get("rejected")) for e in entries]
     if any(rejected) and len(entries) > 1 and not all("field" in e for e in entries):
         raise ExpectError("with a 'rejected' entry, every signatures[] entry must name its 'field'")
@@ -631,7 +644,19 @@ def _check_one(
                                       pdfsig_by_field, pdfsig_error, extract_failure))
 
     if "timestamp" in entry:
-        if entry["timestamp"]:
+        if entry["timestamp"] == "invalid":
+            # D-22: a token is present, pyHanko's token is not intact and valid, and OpenSSL fails.
+            ok = status.timestamp and status.timestamp_valid is False
+            results.append(CheckResult(f"{prefix}.timestamp.pyhanko", ok,
+                                       f"token present={status.timestamp}, valid={status.timestamp_valid}"
+                                       + ("" if ok else "; expected an invalid token")))
+            if blob is None:
+                results.append(failed(f"{prefix}.timestamp.openssl", "signature not found by extract_cms"))
+            else:
+                run = openssl_ts_verify_signature_timestamp(blob, ca_bundle, f"{prefix}.timestamp.openssl")
+                results.append(CheckResult(run.name, not run.ok,
+                                           run.detail if not run.ok else f"{run.detail}; expected a failure"))
+        elif entry["timestamp"]:
             ok = status.timestamp and bool(status.timestamp_valid)
             results.append(CheckResult(f"{prefix}.timestamp.pyhanko", ok,
                                        f"token present={status.timestamp}, valid={status.timestamp_valid}"))
@@ -646,6 +671,9 @@ def _check_one(
             else:
                 results.append(CheckResult(f"{prefix}.timestamp.pyhanko", not status.timestamp and token is None,
                                            f"token present={status.timestamp or token is not None}"))
+    if "timestampTrusted" in entry:
+        results.append(compare(f"{prefix}.timestampTrusted.pyhanko", entry["timestampTrusted"],
+                               status.timestamp_trusted))
     return results
 
 

@@ -14,6 +14,10 @@ emit = []
 
 [dependencies]
 folioxide-syntax.workspace = true
+# The mock TSA's ESS certHash and message-digest (M4 brief §1, §3.4; DECISIONS D13 D-21).
+sha2.workspace = true
+# The mock TSA's ESS signing-certificate v1 certHash (RFC 2634), for `tst_ess_v1_accepted`.
+sha1.workspace = true
 
 [lints]
 workspace = true

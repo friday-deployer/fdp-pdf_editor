@@ -246,3 +246,124 @@ All 24 open decisions in `docs/milestones/M4.md` §8 (D-1 … D-24) are accepted
    - MockTsa lives in the testkit (D-21).
    - New oracle runner keys: `renderProbes`, `timestamp: "invalid"` and `timestampTrusted` (D-22).
    - B-T through a later document timestamp is deferred to M11 (D-20).
+
+## D14: Decisions from M4, signatures II (manager, 2026-10-23)
+The M4 QA gate ran five review rounds, two final fix rounds, a closing round and their verification passes. The rulings were issued as R-1 … R-28. The binding outcomes:
+
+1. **Verification is a whitelist over unambiguous input.**
+   - The classifier grants a level below `Other` only when every object its decision reads is lexically canonical. Those objects are:
+     - every object written after the signed revision;
+     - the signed copies of the objects those writes relist or compare against;
+     - the page-tree objects it consults;
+     - the signature's own dictionary, field, `/Lock` and `/Reference` chain.
+   - Canonical means (R-1, R-12):
+     - no duplicate keys;
+     - integers `[+-]?[0-9]+` in 32-bit range;
+     - reals in plain decimal form within ISO 32000-2 Annex C limits;
+     - no `#00` in names;
+     - object streams and xref sections that list each object once, with canonical headers and 20-byte entries.
+   - The parser itself is unchanged (last value wins). A defect in the signature's own objects is the `SigDictAmbiguous` problem.
+2. **Updates must be rebuild-proof (R-17, R-18, R-21, R-26).** Otherwise the update is `Other`. The conditions:
+   - the final `startxref` lies in the last 1024 bytes;
+   - at most two EOL bytes follow the final `%%EOF`;
+   - the store needed no repair, and every new object sits at its xref offset;
+   - no text of the update (stream data, strings, names and comments included) is structure to a reader that rebuilds the cross-reference data. The final shape of the R-17 (d) scan:
+     - where poppler's `constructXRef` looks (a line start, the start of each 255-byte piece of a longer line, and the bytes after an `endobj`, past white space): no object header, and no `trailer` before a dictionary;
+     - at a line start or after an `endobj`: no `xref` or `startxref`;
+     - anywhere: no object header `N G obj` and no `trailer <<` written as words (PDFium's `RebuildCrossRef`, pdf.js's `indexObjects`);
+     - one scan, linear by construction (closing round findings 2 and 6, R-27: 16 MB runs of digits, white space, `endobj`, `trailer` and `%` each verify within a step budget);
+     - it fails closed on some honest values: `x endobj xref`, `see 12 0 obj`, `trailer <<` inside a fill value, or a line inside a string that begins with `xref`, are `Other` where pyHanko says `formFilling`. `see xref table` inside a line stays a fill.
+   - every member of a new object stream is listed by that revision's xref, at its index;
+   - **`/Size` (R-26, closing round finding 13):** every later trailer, and a hybrid section's cross-reference stream dictionary, gives `/Size` as a direct integer above every object number the file lists and not below the previous revision's `/Size`. So a hybrid `/XRefStm` stream without a direct `/Size` is `Other` (ISO 32000-2 Table 17 requires it). An over-declared `/Size` (above the highest number + 1) drops nothing and passes.
+     - The rule rests on the expert's recollection that PDFium shrinks its object table to the newest `/Size` (`ShrinkObjectMap`). That is unverified (brief §9; PDFium is not installed), so the rule is a whitelist, not a reproduced render difference. A pypdfium2 probe is on the backlog.
+     - Folioxide's signer numbers a signature's new objects from the previous `/Size` when that is above `next_object_number()`, as pyHanko's writer does. So its co-signature after an over-declared `/Size` keeps the earlier signatures' level (final fix round 2 verification, expert finding 1: it had made them `Other`). The plain incremental writer (`Document::save_incremental`, Node `saveIncremental`) carries the previous `/Size` the same way: it writes max(highest + 1, the previous direct `/Size` within `Limits::max_objects`). That change in `folioxide-syntax` is the one waiver of brief §6.1, ruling R-30 (a).
+3. **Page consistency (R-13).**
+   - Page-dependent rules need a page that the `/Kids` walk reaches exactly once and whose `/Parent` chain mirrors that walk.
+   - Rotation is inherited along that walk.
+4. **Geometry (R-2, R-3, R-14, R-21).**
+   - New markup annotations need an `/AP /N` form XObject with a `/BBox`, and all their geometry must lie inside `/Rect`.
+   - New annotation and signature widgets may set only `/F` bits 1, 4, 64, 128 and 512.
+   - Text annotations on rotated pages are `Other`.
+   - Form fills of widgets with NoZoom, NoRotate or reserved `/F` bits are `Other`.
+   - Geometry numbers are bounded at 1e5, and so are BBox corners mapped through `/Matrix`.
+   - The largest coordinate of a new appearance's `/BBox` mapped through its `/Matrix`, times its scale onto the `/Rect`, is at most 2^20 (final fix round 2, findings 2 and 4). Single-precision readers (PDFium) then place it as Folioxide does, to within 1/16 unit.
+     - The bound over-refuses some placements PDFium gets right: a 1-unit `/BBox` translated by 10^4 to 5·10^4 is `Other` in ours, `formFilling` in pyHanko, with 0 px outside in PDFium (closing round nit 4). A finer model (|mapped left| × scale) is on the backlog.
+   - A new signature widget's `/Rect` must be four numbers.
+   - `SIG_FIELD_KEYS` is a whitelist that includes `/Lock`, `/SV` and `/StructParent`.
+5. **DocMDP.**
+   - A field `/Lock /P` (ISO 32000-2 §12.7.5.5) sets the signature's DocMDP level; with a DocMDP reference too, the stricter value wins (R-4).
+   - An unreadable DocMDP declaration means P = 1 for both verification and signing (R-6).
+   - A missing `/P` in TransformParams means 2 (Table 257). This is the one DELIBERATE_DIFFERENCES row that is not stricter.
+   - `P_effective` = min(own P, P in force).
+   - `docmdp_ok` is `None` for DocTimeStamp entries (R-5). Their modification is still judged under the permissions in force, for markup annotations (R-20; P = 1 is item 13). This amends D13.5.
+6. **pyHanko parity rows.**
+   - A field whose signed `/AP` dictionary has more than one usage context makes every later change `Other`, as pyHanko does (R-19). This covers:
+     - every field node of the signed revision, terminal or not (pyHanko's `_list_fields` yields every named node; closing round finding 10);
+     - unnamed nodes and `/Fields` roots too, which is stricter than pyHanko;
+     - an unsigned signature field, for the revision that signs it (pyHanko's `SigFieldModificationRule`; final fix round 2, finding 1). The signer warns when it signs such a field.
+   - The approval-plus-P = 3 markup row is accepted as part of D-1 (R-7).
+   - Document-timestamp bookkeeping (the `/Info` ModDate and Producer, XMP `xmp:ModifyDate` and `pdf:Producer`, `/Version`, ESIC) is exempt only in the revision that adds the timestamp, and only for that object's last write in the window (R-8).
+   - The XMP comparison is a strict subset that libxml2 accepts: masked values, the XML declaration, namespace URIs, and Flate-only metadata filters. Anything else is `Metadata`.
+7. **Timestamps and certificate paths (R-11, R-14, R-22, R-26).**
+   - Tokens are read as a whitelist that OpenSSL can decode.
+   - ESS later identifiers must name certificates on the validated path.
+   - The `TsaNameMismatch` problem code covers RFC 3161 §2.4.2.
+   - AKI consistency is checked on every path edge.
+   - An RSASSA-PSS SPKI may verify PSS signatures only.
+   - TSA certificates with duplicate or undecodable known extensions are invalid.
+   - **OpenSSL's critical-extension rule (R-26, closing round findings 8 and 11).** A critical extension that OpenSSL 3.0's `X509_supported_extension` does not list (subjectKeyIdentifier, authorityKeyIdentifier, authorityInfoAccess, freshestCRL, qcStatements, private extensions) has two effects:
+     - it makes a TSA certificate unsuitable: the token is invalid, and the signer refuses it;
+     - it makes any signer or TSA path untrusted.
+     - This is stricter than pyHanko and equal to OpenSSL; RFC 5280 says SKI, AKI and AIA must be non-critical. Only keyUsage, subjectAltName, basicConstraints, cRLDistributionPoints, certificatePolicies, extKeyUsage and ocspNoCheck may be critical. A critical extension that OpenSSL handles but Folioxide does not process (nsCertType, name or policy constraints, RFC 3779, proxyCertInfo) stays a trust problem, stricter than both.
+   - **PSS hash parameters (R-26, closing round finding 7).** The hash and MGF1-hash AlgorithmIdentifiers inside `RSASSA-PSS-params` must have absent or NULL parameters (RFC 4055 §2.1).
+     - On an anchor's or intermediate's key this equals pyHanko (untrusted) and is stricter than OpenSSL, which ignores them.
+     - In a token's own signature algorithm, or on the TSA certificate's key, it makes the token invalid. That is stricter than pyHanko and than `openssl ts -verify`, which both ignore them there.
+   - **Certificate signature algorithm parameters (R-30 (b)).** On every certificate-signature check (path edges and the ESS links behind a TSA's signing-certificate list), the parameters of both `tbsCertificate.signature` and the outer `signatureAlgorithm` must be:
+     - absent or NULL for RSA PKCS#1 v1.5 (RFC 4055 §5). That equals pyHanko and is stricter than OpenSSL;
+     - absent for ECDSA (RFC 5758 §3.2). That is stricter than both pyHanko and OpenSSL, and recorded as deliberate-difference rows.
+     - Otherwise the edge is untrusted. A consequence: a TSA certificate with bad RSA parameters plus an ESS list with later identifiers makes the token not valid (`TimestampEssMismatch`), where pyHanko and OpenSSL call it valid. That case is stricter and has no dedicated test.
+   - **Limitation: trust anchors are trusted as given** (RFC 5280 §6.1.1 (d), pyHanko parity). Their validity, CA flag, key usage and extensions are not evaluated. So an anchor with a critical extension OpenSSL would refuse is trusted where `openssl ts -verify` fails (OpenSSL's `check_chain_extensions` also checks the anchor). This is on the backlog.
+   - **Limitation:** `signPdf` embeds, without a warning, a token whose TSA path can never become trusted (a well-formed RFC 3779 block or `proxyCertInfo`: untrusted at verification, stricter than pyHanko). An optional signing-time warning is on the backlog (closing round nit 9).
+   - RSASSA-PSS-signed tokens and subjectKeyIdentifier signer identifiers are **accepted**. This is a recorded exception to M4 §5.5 (iii): only OpenSSL 3.0's PKCS7-based `ts -verify` refuses them, while pyHanko and `openssl cms -verify` accept them.
+   - The request nonce is ≥ 1.
+   - Unsigned attributes beyond `MAX_ATTRIBUTES` are skipped with a warning.
+8. **The verify API.**
+   - A duplicate `/Prev` or `/XRefStm` with different values makes `verify` fail with `E_XREF`.
+   - ECDSA values in SignerInfos, tokens and certificates must be minimal DER; only `finish` normalizes signer output.
+9. **Node.**
+   - After `timestampRequest`, `finish` without a response is refused until `discardTimestampRequest()` is called.
+   - `signPdf` passes its own request explicitly.
+   - `accuracyMicros` is `null` above 2^53.
+10. **Signing side.**
+    - A new visible field on a certified document is refused (D-3).
+    - An existing empty field whose widget is Hidden or NoView is refused for visible signing.
+    - A split widget (`/Kids`) is refused, which is backed by pyHanko reporting OTHER for that case (D-18 probe).
+    - The appearance font carries a `/FontDescriptor`. It is not embedded until M7, so PDF/A conformance is not met.
+    - A signature's new objects are numbered from the larger of `next_object_number()` and the previous trailer's `/Size` (item 2).
+    - **Limitation (R-24):** only a JPEG's header is parsed. A JPEG whose scan data cannot hold the size its SOF declares (an empty scan, say) is embedded unchanged, and viewers then draw nothing or an error box inside the appearance. Decoding or sizing the scan belongs to M7's image work.
+11. **Residuals, stated in M4 brief §0.3 and ARCHITECTURE §A.6.7.** These are levels below `Other` whose change a viewer can still show:
+    - **The premise.** Every residual assumes that all readers read the bytes the same way. That is checked only for the lexical differentials of V10 (the canonical-input gate, R-12; page-tree consistency, R-13; rebuild-proof updates, item 2), not for every way two readers can differ.
+    - **`FormFilling`:** a filled field shows any text the filler chooses inside the widget's `/Rect`, and an opaque fill can cover signed page content beneath it. pyHanko and Acrobat allow both. The visible signature appearances of later signers likewise draw what they like inside their `/Rect`.
+    - **`Annotations` (D-1):** an opaque markup annotation inside its `/Rect` can cover signed content. That is what P = 3 grants.
+    - Text annotations' implicit NoZoom affects zoomed-out viewers.
+    - **Shared `/Annots` arrays** (QA round 5 finding 9): a later signature widget added to an indirect `/Annots` array that several pages share shows on each of those pages, inside its `/Rect` as each page maps it. A shared array that gains a markup annotation is `Other`, so D-1 does not reach this.
+    - JavaScript calculate, format and validate actions (`/AA`, `/CO`) of signed fields run in JS-capable viewers on filled values.
+    - Signature timestamps can be removed or replaced (until LTA in M11).
+    - **Retired TSA keys** (QA round 1 finding F8): without a validation time, the TSA path and the signer are validated at the token's own `genTime`. That time is the TSA's claim, so a TSA key that outlived its certificate can sign a token that makes itself and the signer trusted. Both carry a warning. A caller (and the Node binding, which passes "now" by default) breaks the circle with a validation time.
+    - **Document timestamps under P = 1:** the decision is item 13.
+    - pdf.js's rebuild (which runs only when its cross-reference data cannot be read) ends an object body at a word `xref` inside a line. It is not probed; item 2 leaves pdf.js nothing to rebuild for.
+    - Viewers that are not installed (PDFium, Acrobat, MuPDF, pdf.js) were not probed.
+12. **Process (M4 lesson).** The independent adversarial pass found new mechanism classes in every round.
+    - It is closed by an explicit criterion (R-25, R-28): saved variants are re-run and fixes are verified. Exploration is limited to 25 %, and to none in the closing pass.
+    - New classes go to the **verification-hardening backlog in ROADMAP** unless they are reproduced Blockers. The backlog section lists the items M4 deferred: a pypdfium2 probe of the `/Size` rule, the trust-anchor extension check, the nit 9 signing warning, an Acrobat `/F 28` sample, the stricter variant of item 13's timestamp decision, a finer single-precision bound, pdf.js's rebuild, and the probes of viewers that are not installed.
+    - Rulings are issued between rounds as numbered, binding text (`R-n`) that every agent reads.
+13. **Decisions the brief and ARCHITECTURE leave to D14.** Dev A proposed both in final fix round 2, and the manager confirms them as written.
+    - **Sticky notes with `/F 28`** (Print | NoZoom | NoRotate; brief §0.2): they stay `Other` on every page in M4 (A3, R-2).
+      - Reasons: no Acrobat-made sample was checked, and NoZoom draws a note at a fixed size, which spills out of its `/Rect` when zoomed out.
+      - Cost: this removes part of D-1's benefit, because Acrobat is believed to write `/F 28` for sticky notes.
+      - Relaxing it, for a Text annotation with an `/AP` on an upright page, needs an Acrobat sample and a render probe at several zoom levels. It is on the backlog.
+    - **Document timestamps under P = 1** (brief §0.3, ARCHITECTURE §A.6.7): M4 keeps pyHanko parity.
+      - A timestamp's window is judged under the P in force only for markup annotations. So after a P = 1 certification, a timestamp followed by a form fill, an `/Info` or XMP change or an approval signature reports `formFilling` or `ltaUpdates` with `docmdp_ok` `None`, and `is_acceptable(FormFilling)` accepts that report.
+      - The violation shows in the certification's own report (`docmdp_ok` false). The docs tell callers to check every report.
+      - Criterion (i) holds. Making such a timestamp entry `Other` would be stricter and safe; it is on the backlog, at the latest for LTA in M11.
+14. **Dependencies.** `ctutils` is bumped from 0.4.2 to 0.4.4 in `Cargo.lock` for RUSTSEC-2026-0385, a RustCrypto transitive dependency. This was needed for `cargo deny`, and adds no new dependency.

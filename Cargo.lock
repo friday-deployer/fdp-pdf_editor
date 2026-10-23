@@ -262,9 +262,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
  "subtle",
@@ -426,7 +426,9 @@ dependencies = [
  "folioxide-security",
  "folioxide-sign",
  "folioxide-syntax",
+ "folioxide-testkit",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -435,6 +437,7 @@ version = "0.1.0"
 dependencies = [
  "folioxide-model",
  "folioxide-syntax",
+ "proptest",
 ]
 
 [[package]]
@@ -463,6 +466,7 @@ name = "folioxide-node"
 version = "0.1.0"
 dependencies = [
  "folioxide",
+ "folioxide-testkit",
  "napi",
  "napi-build",
  "napi-derive",
@@ -510,6 +514,7 @@ dependencies = [
  "folioxide-syntax",
  "folioxide-testkit",
  "getrandom 0.4.3",
+ "miniz_oxide",
  "p12-keystore",
  "p256",
  "p384",
@@ -546,6 +551,8 @@ name = "folioxide-testkit"
 version = "0.1.0"
 dependencies = [
  "folioxide-syntax",
+ "sha1",
+ "sha2",
 ]
 
 [[package]]

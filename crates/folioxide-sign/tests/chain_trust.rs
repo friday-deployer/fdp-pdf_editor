@@ -174,7 +174,9 @@ fn chain_wrong_anchor_untrusted() {
     // An unrelated anchor.
     let result = build_trust(&signer, &[intermediate()], &[chain("self-signed")], now());
     assert_untrusted(&result, "no certification path");
-    // An anchor with the root's name but another key: the intermediate's signature fails.
+    // An anchor with the root's name but another key: the intermediate's authorityKeyIdentifier
+    // names the real root's key identifier, so the impostor is no issuer of it (manager ruling
+    // R-22 (a)); its signature would not verify either.
     let impostor = chain("impostor-root");
     let result = build_trust(
         &signer,
@@ -182,7 +184,7 @@ fn chain_wrong_anchor_untrusted() {
         std::slice::from_ref(&impostor),
         now(),
     );
-    assert_untrusted(&result, "does not verify");
+    assert_untrusted(&result, "is not the issuer's subjectKeyIdentifier");
     assert!(result.path.is_empty());
     // The real root in the pool is not an anchor.
     let result = build_trust(&signer, &[intermediate(), root()], &[impostor], now());

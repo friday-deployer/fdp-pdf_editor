@@ -1,9 +1,9 @@
 //! The expect.json `signatures[]` entries of the signature oracle suites (M3 brief §0, §6.3),
 //! written **from Folioxide's own report**, so that `cargo xtask oracle` is a pyHanko / pdfsig /
 //! OpenSSL versus Folioxide differential. Shared by `oracle_sign.rs` (`sign-bb`, `sign-tamper`,
-//! `sign-attacks`) and `interop_pyhanko.rs` (`sign-interop`).
+//! `sign-attacks`), `interop_pyhanko.rs` (`sign-interop`) and `oracle_certify.rs` (`certify`).
 
-use folioxide_sign::report::{ModificationLevel, PadesLevel, SignatureKind, SignatureReport};
+use folioxide_sign::report::{PadesLevel, SignatureKind, SignatureReport};
 use folioxide_testkit::emit::json_string;
 
 /// The trust root every signature case names (relative to the repository root).
@@ -14,17 +14,31 @@ pub const TRUST_ROOT: &str = "fixtures/pki/root.pem";
 /// suite): the profile check looks at the CMS alone, while Folioxide never calls a signature
 /// that is not intact B-B.
 ///
-/// Two values are not Folioxide's own, by design:
-/// - a document timestamp is `valid` when it is intact: M3 lists document timestamps without
-///   verifying the token (`PendingTimestampVerification`, `signature_valid` false; brief §5 V1),
-///   while pyHanko and `openssl ts -verify` validate it (`interop_pyhanko.rs` asserts ours);
-/// - `docmdpOk` (None in our report until M4, V11) is what ISO 32000-2 §12.8.2.2 allows at the
-///   reported modification level: P=1 nothing, P=2 form filling and signing, P=3 also
-///   annotations.
+/// `pades` is `"B-T"` or `"B-B"` as reported (M4 brief §5 V8), and `timestamp` is `true` for a
+/// sound selected signature timestamp, `"invalid"` for a token that is not (M4 brief D-22) and
+/// `false` without one (always for a document timestamp).
+///
+/// One value is not Folioxide's own, by design: a document timestamp is `valid` when it is
+/// intact (M3 listed document timestamps without verifying the token; pyHanko and `openssl ts
+/// -verify` validate it). `docmdp` and `docmdpOk` (M4 brief V11, §5.3; overridable as
+/// `"docmdpOk"`) are written for a signature that declares DocMDP permissions; `docmdpOk` never
+/// for a document timestamp (pyHanko has no such verdict for one).
 pub fn entry(
     report: &SignatureReport,
     overrides: &dyn Fn(&str) -> Option<&'static str>,
     pades: bool,
+) -> String {
+    entry_with(report, overrides, pades, false)
+}
+
+/// [`entry`], also writing `docmdpOk` for a signature that declares no DocMDP permissions when
+/// `every_docmdp_ok` (the `certify` suite: an approval's verdict under the certification in
+/// force, which pyHanko computes as well).
+pub fn entry_with(
+    report: &SignatureReport,
+    overrides: &dyn Fn(&str) -> Option<&'static str>,
+    pades: bool,
+    every_docmdp_ok: bool,
 ) -> String {
     let field = report.field_name.as_deref().unwrap_or_default();
     let coverage = overrides("coverage").unwrap_or(report.coverage.as_str());
@@ -42,21 +56,31 @@ pub fn entry(
     parts.push(format!("\"coverage\": {}", json_string(coverage)));
     parts.push(format!("\"modification\": {}", json_string(modification)));
     if let Some(p) = report.docmdp {
-        let allowed = match p {
-            1 => ModificationLevel::None,
-            2 => ModificationLevel::FormFilling,
-            _ => ModificationLevel::Annotations,
-        };
         parts.push(format!("\"docmdp\": {p}"));
-        parts.push(format!("\"docmdpOk\": {}", report.modification <= allowed));
+    }
+    // pyHanko's `validate_pdf_timestamp` reports no docmdp_ok for a document timestamp (its
+    // DocumentTimestampStatus leaves it None), so none is written for one.
+    if !timestamp && (report.docmdp.is_some() || every_docmdp_ok) {
+        let ok =
+            overrides("docmdpOk").or(report.docmdp_ok.map(|ok| if ok { "true" } else { "false" }));
+        if let Some(ok) = ok {
+            parts.push(format!("\"docmdpOk\": {ok}"));
+        }
     }
     if pades && !timestamp {
         parts.push(match report.pades_level {
+            Some(PadesLevel::BT) => "\"pades\": \"B-T\"".to_owned(),
             Some(PadesLevel::BB) => "\"pades\": \"B-B\"".to_owned(),
             _ => "\"pades\": false".to_owned(),
         });
     }
-    parts.push("\"timestamp\": false".to_owned());
+    let token = match &report.timestamp {
+        _ if timestamp => "false",
+        Some(t) if t.intact && t.valid => "true",
+        Some(_) => "\"invalid\"",
+        None => "false",
+    };
+    parts.push(format!("\"timestamp\": {token}"));
     format!("{{{}}}", parts.join(", "))
 }
 

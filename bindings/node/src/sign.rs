@@ -12,7 +12,16 @@
 //!   so the caller can try again. `serialize`/`deserialize` carry it between processes in the
 //!   core's versioned binary form.
 //! - `PdfDocument.verifySignatures`: verification on the thread pool, one
-//!   [`SignatureReport`] per signature dictionary.
+//!   [`SignatureReport`] per signature dictionary, with its signature timestamps
+//!   ([`TimestampInfo`]) and the DocMDP verdict.
+//!
+//! M4 (brief §3.5) adds PAdES B-T, certification and visible signatures: the prepare options
+//! `certify` (DocMDP `P`), `appearance` ([`SignatureAppearanceOptions`]) and `tsaReserve`, and
+//! the two-phase timestamp flow on [`PreparedSignature`]: `timestampRequest(signature)` returns
+//! the DER `TimeStampReq` (and remembers it), the host sends it to its TSA, and
+//! `finish(signature, timestampResponse)` validates the response and embeds the token. The
+//! JavaScript facade's `signPdf` awaits an asynchronous TSA callback between the two in the same
+//! way it awaits the signer, so no thread-safe function is needed here either.
 //!
 //! The JavaScript facade (`index.js`) composes these into `signPdf(doc, { signer })`, awaiting
 //! an asynchronous signer (a KMS, WebCrypto, `node:crypto`) between the two phases in
@@ -28,13 +37,13 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use folioxide::{DigestAlgorithm, SignatureAlgorithm, Signer as _};
-use napi::bindgen_prelude::{AsyncTask, Buffer, Either, ObjectFinalize, Uint8Array};
+use napi::bindgen_prelude::{AsyncTask, BigInt, Buffer, Either, ObjectFinalize, Uint8Array};
 use napi::{Env, Task};
 use napi_derive::napi;
 use zeroize::Zeroizing;
 
 use crate::document::{PdfDocument, Pending, Shared};
-use crate::dto::{integer_in, page_index};
+use crate::dto::{Rect, integer_in, page_index};
 use crate::error::{
     self, BindingError, JsResult, closed, finishing, from_core, invalid_argument, signer_closed,
 };
@@ -101,7 +110,8 @@ pub enum FieldMode {
 pub enum SignatureKind {
     /// A signature.
     Signature,
-    /// A document timestamp (listed, not verified, until RFC 3161 support).
+    /// A document timestamp (ISO 32000-2 §12.8.5): its RFC 3161 token is verified, and the
+    /// report's `timestamp` describes it.
     DocTimeStamp,
 }
 
@@ -144,6 +154,32 @@ pub enum PadesLevel {
     /// PAdES-B-B.
     #[napi(value = "B-B")]
     BB,
+    /// PAdES-B-T: B-B plus a signature timestamp whose selected token is intact and valid.
+    #[napi(value = "B-T")]
+    BT,
+}
+
+/// The standard-14 font of a visible signature's text (WinAnsiEncoding; characters it cannot
+/// show become `?`, with a warning).
+#[napi(string_enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppearanceFont {
+    /// Helvetica. The default.
+    #[napi(value = "Helvetica")]
+    Helvetica,
+    /// Helvetica-Bold.
+    #[napi(value = "Helvetica-Bold")]
+    HelveticaBold,
+}
+
+/// Where a visible signature's image goes.
+#[napi(string_enum = "camelCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImagePosition {
+    /// A column on the left, the text to its right. The default.
+    Left,
+    /// Fitted and centred behind the text.
+    Background,
 }
 
 /// The JavaScript name of a signature algorithm.
@@ -206,6 +242,36 @@ pub fn parse_field_mode(text: &str) -> JsResult<folioxide::FieldMode> {
         "createOnly" => Ok(folioxide::FieldMode::CreateOnly),
         other => Err(invalid_argument(format!(
             "field.mode must be 'createOrUse', 'existingOnly' or 'createOnly', not {:?}",
+            short(other)
+        ))),
+    }
+}
+
+/// Parses `'Helvetica'` or `'Helvetica-Bold'`.
+///
+/// # Errors
+/// `E_INVALID_ARGUMENT` for any other string.
+pub fn parse_font(text: &str) -> JsResult<folioxide::Standard14Font> {
+    match text {
+        "Helvetica" => Ok(folioxide::Standard14Font::Helvetica),
+        "Helvetica-Bold" => Ok(folioxide::Standard14Font::HelveticaBold),
+        other => Err(invalid_argument(format!(
+            "appearance.font must be 'Helvetica' or 'Helvetica-Bold', not {:?}",
+            short(other)
+        ))),
+    }
+}
+
+/// Parses `'left'` or `'background'`.
+///
+/// # Errors
+/// `E_INVALID_ARGUMENT` for any other string.
+pub fn parse_image_position(text: &str) -> JsResult<folioxide::ImagePosition> {
+    match text {
+        "left" => Ok(folioxide::ImagePosition::Left),
+        "background" => Ok(folioxide::ImagePosition::Background),
+        other => Err(invalid_argument(format!(
+            "appearance.imagePosition must be 'left' or 'background', not {:?}",
             short(other)
         ))),
     }
@@ -327,6 +393,17 @@ pub struct PrepareSignatureOptions {
     /// plus a margin, at least 8192. A value below what the CMS needs throws
     /// `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` with `details.needed`.
     pub contents_reserve: Option<f64>,
+    /// Make this a certification signature (ISO 32000-2 §12.8.2.2) with the DocMDP permissions
+    /// `P`: 1 (no changes), 2 (form filling and signing) or 3 (2 plus annotations). It must be
+    /// the document's first signature (`E_DOC_MDP_FORBIDS` otherwise). Default: an approval
+    /// signature.
+    #[napi(ts_type = "1 | 2 | 3")]
+    pub certify: Option<f64>,
+    /// Make the signature visible with this appearance. Default: invisible.
+    pub appearance: Option<SignatureAppearanceOptions>,
+    /// The bytes of signature timestamp token to budget in `/Contents` (for B-T). Default 0
+    /// (the facade's `signPdf` with a `timestamp` callback uses 8192).
+    pub tsa_reserve: Option<f64>,
 }
 
 impl PrepareSignatureOptions {
@@ -335,7 +412,7 @@ impl PrepareSignatureOptions {
     /// # Errors
     /// `E_INVALID_ARGUMENT` for an empty certificate chain, an unknown algorithm, digest,
     /// SubFilter or field mode, a signing time that is not a PDF date, or a reserve that is not
-    /// a non-negative integer; the errors of [`certificates`] and
+    /// a non-negative integer; the errors of `certificates` and
     /// [`SignatureFieldSpec::into_core`].
     pub fn into_core(self) -> JsResult<folioxide::PrepareRequest> {
         let chain = certificates(&self.certificate_chain, "certificateChain")?;
@@ -365,7 +442,136 @@ impl PrepareSignatureOptions {
             let reserve = integer_in(reserve, 0, MAX_SAFE_INTEGER, "contentsReserve")?;
             options = options.with_contents_reserve(Some(usize::try_from(reserve).unwrap_or(0)));
         }
+        if let Some(p) = self.certify {
+            let p = integer_in(p, 1, 3, "certify")?;
+            options = options.with_certification(folioxide::DocMdpPermissions::from_p(p));
+        }
+        if let Some(appearance) = self.appearance {
+            options = options.with_appearance(Some(appearance.into_core()?));
+        }
+        if let Some(reserve) = self.tsa_reserve {
+            // The core refuses anything above its maximum (4 MiB).
+            let reserve = integer_in(reserve, 0, MAX_SAFE_INTEGER, "tsaReserve")?;
+            options =
+                options.with_tsa_reserve(Some(usize::try_from(reserve).unwrap_or(usize::MAX)));
+        }
         Ok(folioxide::PrepareRequest::new(chain, algorithm, signing_time).with_options(options))
+    }
+}
+
+/// The appearance of a visible signature (the core `SignatureAppearance`, M4 brief §4.7). Its
+/// text font is not embedded, so it makes a PDF/A document non-conformant (embedding is M7).
+#[napi(object)]
+#[derive(Default)]
+pub struct SignatureAppearanceOptions {
+    /// The widget rectangle in the default user space of the field's page (the facade also
+    /// takes `[llx, lly, urx, ury]`). It must be finite, have a positive area and meet the
+    /// page's crop box. Omit it to sign an existing field in its own widget rectangle.
+    pub rect: Option<Rect>,
+    /// The text lines. Default: `Digitally signed by <name>`, `Date: <signing time>`, and
+    /// `Reason: …` and `Location: …` when given.
+    pub lines: Option<Vec<String>>,
+    /// The font. Default `'Helvetica'`.
+    #[napi(ts_type = "AppearanceFont")]
+    pub font: Option<String>,
+    /// The font size in points. Default: the largest size from 4 to 12 points that fits.
+    pub font_size: Option<f64>,
+    /// A JPEG image (baseline or progressive, 8-bit gray or RGB), embedded unchanged.
+    pub image: Option<Uint8Array>,
+    /// Where the image goes. Default `'left'`.
+    #[napi(ts_type = "ImagePosition")]
+    pub image_position: Option<String>,
+    /// The border width in points; 0 (the default) draws none.
+    pub border_width: Option<f64>,
+}
+
+impl SignatureAppearanceOptions {
+    /// The core appearance. The core checks the rectangle against the page and the image.
+    ///
+    /// # Errors
+    /// `E_INVALID_ARGUMENT` for a rectangle, font size or border width that is not a finite
+    /// number (a font size must be positive, a border width not negative), or an unknown font
+    /// or image position.
+    pub fn into_core(self) -> JsResult<folioxide::SignatureAppearance> {
+        let mut appearance = match self.rect {
+            Some(rect) => {
+                let corners = [rect.llx, rect.lly, rect.urx, rect.ury];
+                if !corners.iter().all(|v| v.is_finite()) {
+                    return Err(invalid_argument(format!(
+                        "appearance.rect must hold four finite numbers, not {corners:?}"
+                    )));
+                }
+                folioxide::SignatureAppearance::new(rect.into())
+            }
+            None => folioxide::SignatureAppearance::for_existing_field(),
+        };
+        if let Some(lines) = self.lines {
+            appearance = appearance.with_text(folioxide::AppearanceText::Lines(lines));
+        }
+        if let Some(font) = self.font {
+            appearance = appearance.with_font(parse_font(&font)?);
+        }
+        if let Some(size) = self.font_size {
+            if !(size.is_finite() && size > 0.0) {
+                return Err(invalid_argument(format!(
+                    "appearance.fontSize must be a positive number of points, not {size}"
+                )));
+            }
+            appearance = appearance.with_font_size(Some(size));
+        }
+        if let Some(image) = self.image {
+            appearance = appearance.with_image(Some(image.to_vec()));
+        }
+        if let Some(position) = self.image_position {
+            appearance = appearance.with_image_position(parse_image_position(&position)?);
+        }
+        if let Some(width) = self.border_width {
+            if !(width.is_finite() && width >= 0.0) {
+                return Err(invalid_argument(format!(
+                    "appearance.borderWidth must be a number of points from 0, not {width}"
+                )));
+            }
+            appearance = appearance.with_border_width(width);
+        }
+        Ok(appearance)
+    }
+}
+
+/// Options for `PreparedSignature.timestampRequest` (the core `TimestampParams`).
+#[napi(object)]
+#[derive(Default)]
+pub struct TimestampRequestOptions {
+    /// The digest of the message imprint. Default: the signature's digest algorithm.
+    #[napi(ts_type = "DigestAlg")]
+    pub digest: Option<String>,
+    /// `reqPolicy`, the TSA policy as a dotted OID. Default: the TSA's policy.
+    pub policy: Option<String>,
+    /// The request nonce, from 1 to 2^64 - 1 (a positive INTEGER). Default: a random one.
+    pub nonce: Option<BigInt>,
+}
+
+impl TimestampRequestOptions {
+    /// The core parameters.
+    ///
+    /// # Errors
+    /// `E_INVALID_ARGUMENT` for an unknown digest or a nonce outside 1 to 2^64 - 1 (M4 brief
+    /// §4.1: a positive INTEGER; manager ruling R-24). (A policy that is not a dotted OID is
+    /// refused by `timestampRequest`.)
+    pub fn into_core(self) -> JsResult<folioxide::TimestampParams> {
+        let mut params = folioxide::TimestampParams::new().with_policy(self.policy);
+        if let Some(digest) = self.digest {
+            params = params.with_digest(Some(parse_digest(&digest, "digest")?));
+        }
+        if let Some(nonce) = self.nonce {
+            let (negative, value, lossless) = nonce.get_u64();
+            if negative || !lossless || value == 0 {
+                return Err(invalid_argument(
+                    "the timestamp nonce must be a bigint from 1 to 2^64 - 1",
+                ));
+            }
+            params = params.with_nonce(Some(value));
+        }
+        Ok(params)
     }
 }
 
@@ -383,9 +589,12 @@ pub struct VerifyOptions {
     /// paths, besides those the signatures carry.
     pub extra_certificates: Option<Vec<Uint8Array>>,
     /// The time at which certificates must be valid, a PDF date string (the facade also takes
-    /// a `Date`, and defaults to now). Absent: the signer's claimed signing time, with a
-    /// warning in each report.
+    /// a `Date`, and defaults to now). Absent: a trusted signature timestamp's time, else the
+    /// signer's claimed signing time, with a warning in each report.
     pub validation_time: Option<String>,
+    /// Trusted root certificates (DER, or PEM text) for timestamp authorities. Default: the
+    /// `trustAnchors`.
+    pub timestamp_trust_anchors: Option<Vec<Uint8Array>>,
 }
 
 impl VerifyOptions {
@@ -393,7 +602,7 @@ impl VerifyOptions {
     ///
     /// # Errors
     /// `E_INVALID_ARGUMENT` for a validation time that is not a PDF date; the errors of
-    /// [`certificates`].
+    /// `certificates`.
     pub fn into_core(self) -> JsResult<folioxide::VerifyOptions> {
         let anchors = certificates(&self.trust_anchors.unwrap_or_default(), "trustAnchors")?;
         let extra = certificates(
@@ -404,10 +613,15 @@ impl VerifyOptions {
             .validation_time
             .map(|text| parse_date(&text, "validationTime"))
             .transpose()?;
+        let tsa_anchors = self
+            .timestamp_trust_anchors
+            .map(|list| certificates(&list, "timestampTrustAnchors"))
+            .transpose()?;
         Ok(folioxide::VerifyOptions::new()
             .with_trust_anchors_der(anchors)
             .with_extra_certs_der(extra)
-            .with_validation_time(time))
+            .with_validation_time(time)
+            .with_timestamp_trust_anchors_der(tsa_anchors))
     }
 }
 
@@ -435,12 +649,147 @@ impl From<folioxide::ObjectId> for ObjectRef {
     }
 }
 
+/// The category of a [`SignatureProblem`]: the core `ProblemCode` values (a type-only union
+/// in `binding.d.ts`; the reports pass the core's strings through, and a test checks the union
+/// lists every one). The facade's `index.d.ts` documents each.
+#[napi(string_enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProblemCode {
+    /// `sigValueNotIndirect`.
+    #[napi(value = "sigValueNotIndirect")]
+    SigValueNotIndirect,
+    /// `sigDictNotDictionary`.
+    #[napi(value = "sigDictNotDictionary")]
+    SigDictNotDictionary,
+    /// `byteRangeMissing`.
+    #[napi(value = "byteRangeMissing")]
+    ByteRangeMissing,
+    /// `byteRangeIndirect`.
+    #[napi(value = "byteRangeIndirect")]
+    ByteRangeIndirect,
+    /// `byteRangeMalformed`.
+    #[napi(value = "byteRangeMalformed")]
+    ByteRangeMalformed,
+    /// `byteRangeNotFromZero`.
+    #[napi(value = "byteRangeNotFromZero")]
+    ByteRangeNotFromZero,
+    /// `byteRangeOutOfBounds`.
+    #[napi(value = "byteRangeOutOfBounds")]
+    ByteRangeOutOfBounds,
+    /// `contentsMissing`.
+    #[napi(value = "contentsMissing")]
+    ContentsMissing,
+    /// `contentsNotHex`.
+    #[napi(value = "contentsNotHex")]
+    ContentsNotHex,
+    /// `gapNotContents`.
+    #[napi(value = "gapNotContents")]
+    GapNotContents,
+    /// `sigDictCompressed`.
+    #[napi(value = "sigDictCompressed")]
+    SigDictCompressed,
+    /// `sigDictOutsideSignedRange`.
+    #[napi(value = "sigDictOutsideSignedRange")]
+    SigDictOutsideSignedRange,
+    /// `sigDictRedefinedLater`.
+    #[napi(value = "sigDictRedefinedLater")]
+    SigDictRedefinedLater,
+    /// `sigDictAmbiguous`.
+    #[napi(value = "sigDictAmbiguous")]
+    SigDictAmbiguous,
+    /// `signedRevisionNotInChain`.
+    #[napi(value = "signedRevisionNotInChain")]
+    SignedRevisionNotInChain,
+    /// `cmsMalformed`.
+    #[napi(value = "cmsMalformed")]
+    CmsMalformed,
+    /// `notSignedData`.
+    #[napi(value = "notSignedData")]
+    NotSignedData,
+    /// `signerInfoCount`.
+    #[napi(value = "signerInfoCount")]
+    SignerInfoCount,
+    /// `eContentPresent`.
+    #[napi(value = "eContentPresent")]
+    EContentPresent,
+    /// `contentTypeMismatch`.
+    #[napi(value = "contentTypeMismatch")]
+    ContentTypeMismatch,
+    /// `messageDigestMissing`.
+    #[napi(value = "messageDigestMissing")]
+    MessageDigestMissing,
+    /// `digestMismatch`.
+    #[napi(value = "digestMismatch")]
+    DigestMismatch,
+    /// `signerCertNotFound`.
+    #[napi(value = "signerCertNotFound")]
+    SignerCertNotFound,
+    /// `signingCertificateMismatch`.
+    #[napi(value = "signingCertificateMismatch")]
+    SigningCertificateMismatch,
+    /// `algorithmProtectionMismatch`.
+    #[napi(value = "algorithmProtectionMismatch")]
+    AlgorithmProtectionMismatch,
+    /// `digestSignatureAlgorithmMismatch`.
+    #[napi(value = "digestSignatureAlgorithmMismatch")]
+    DigestSignatureAlgorithmMismatch,
+    /// `unsupportedAlgorithm`.
+    #[napi(value = "unsupportedAlgorithm")]
+    UnsupportedAlgorithm,
+    /// `unsupportedSubFilter`.
+    #[napi(value = "unsupportedSubFilter")]
+    UnsupportedSubFilter,
+    /// `signatureInvalid`.
+    #[napi(value = "signatureInvalid")]
+    SignatureInvalid,
+    /// `weakAlgorithm`.
+    #[napi(value = "weakAlgorithm")]
+    WeakAlgorithm,
+    /// `structureRepaired`.
+    #[napi(value = "structureRepaired")]
+    StructureRepaired,
+    /// `orphan`.
+    #[napi(value = "orphan")]
+    Orphan,
+    /// `pendingTimestampVerification`.
+    #[napi(value = "pendingTimestampVerification")]
+    PendingTimestampVerification,
+    /// `timestampMalformed`.
+    #[napi(value = "timestampMalformed")]
+    TimestampMalformed,
+    /// `timestampImprintMismatch`.
+    #[napi(value = "timestampImprintMismatch")]
+    TimestampImprintMismatch,
+    /// `timestampSignatureInvalid`.
+    #[napi(value = "timestampSignatureInvalid")]
+    TimestampSignatureInvalid,
+    /// `timestampEssMismatch`.
+    #[napi(value = "timestampEssMismatch")]
+    TimestampEssMismatch,
+    /// `tsaCertificateUnsuitable`.
+    #[napi(value = "tsaCertificateUnsuitable")]
+    TsaCertificateUnsuitable,
+    /// `tsaCertificateNotValidAtGenTime`.
+    #[napi(value = "tsaCertificateNotValidAtGenTime")]
+    TsaCertificateNotValidAtGenTime,
+    /// `tsaNameMismatch`.
+    #[napi(value = "tsaNameMismatch")]
+    TsaNameMismatch,
+    /// `docMdpInvalid`.
+    #[napi(value = "docMdpInvalid")]
+    DocMdpInvalid,
+    /// `certificationNotFirst`.
+    #[napi(value = "certificationNotFirst")]
+    CertificationNotFirst,
+}
+
 /// Why a signature is not valid: a stable `camelCase` code and a message.
 #[napi(object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct SignatureProblem {
     /// The category, for example `"digestMismatch"` or `"gapNotContents"`.
+    #[napi(ts_type = "ProblemCode")]
     pub code: String,
     /// What exactly was wrong, in English.
     pub message: String,
@@ -528,6 +877,83 @@ impl From<folioxide::CertificateInfo> for CertificateInfo {
     }
 }
 
+/// One verified RFC 3161 timestamp token (the core `TimestampInfo`): a signature timestamp of
+/// a signature, or the token of a document timestamp.
+///
+/// `intact`, `valid` and `trusted` use pyHanko 0.37's `timestamp_validity` vocabulary; `valid`
+/// is stricter where the TSA certificate is unsuitable (as OpenSSL `ts -verify`). A broken
+/// signature timestamp token never makes the signature itself invalid: its problems stay here
+/// (an unsigned attribute that is not a well-formed attribute makes the CMS malformed).
+#[napi(object, use_nullable = true)]
+#[cfg_attr(test, derive(serde::Serialize), serde(rename_all = "camelCase"))]
+pub struct TimestampInfo {
+    /// The token's `genTime`, RFC 3339 UTC with the token's fraction digits. **It means
+    /// something only when `trusted` is `true`**: an untrusted TSA can write any time, and an
+    /// unsigned timestamp can be replaced or removed after signing.
+    pub gen_time: String,
+    /// The TSA certificate (the token's signer), when found.
+    pub tsa: Option<CertificateInfo>,
+    /// The TSTInfo `tsa` name as RFC 4514 text, when it is a directory name.
+    pub tsa_name: Option<String>,
+    /// The TSA policy, a dotted OID.
+    pub policy: Option<String>,
+    /// The serial number, uppercase hexadecimal.
+    pub serial_hex: Option<String>,
+    /// The TSTInfo `accuracy` in microseconds, when present and at most
+    /// `Number.MAX_SAFE_INTEGER` (a larger value is not exact in a JavaScript number).
+    pub accuracy_micros: Option<f64>,
+    /// The TSTInfo `ordering` flag.
+    pub ordering: bool,
+    /// The message imprint's digest algorithm, for example `"sha256"`.
+    pub imprint_algorithm: Option<String>,
+    /// The TSA's signature algorithm, for example `"sha256WithRSAEncryption"`.
+    pub signature_algorithm: Option<String>,
+    /// The message imprint is the digest of the timestamped data (the signature value, or the
+    /// byte ranges of a document timestamp).
+    pub intact: bool,
+    /// The TSA's signature verifies, the ESS signing-certificate attribute matches, and the TSA
+    /// certificate is suitable for timestamping and valid at `genTime`.
+    pub valid: bool,
+    /// Whether the TSA certificate chains to a trust anchor (the timestamp trust anchors, else
+    /// the signature's), for a token that is intact and valid; `null` without anchors.
+    pub trusted: Option<bool>,
+    /// Why the token is not intact or not valid; empty when nothing is wrong.
+    pub problems: Vec<SignatureProblem>,
+    /// Observations that do not make the token invalid.
+    pub warnings: Vec<String>,
+}
+
+impl From<folioxide::TimestampInfo> for TimestampInfo {
+    fn from(info: folioxide::TimestampInfo) -> TimestampInfo {
+        TimestampInfo {
+            gen_time: info.gen_time,
+            tsa: info.tsa.map(CertificateInfo::from),
+            tsa_name: info.tsa_name,
+            policy: info.policy,
+            serial_hex: info.serial_hex,
+            // Microseconds up to 2^53 - 1 (285 years) are exact in a JavaScript number; a larger
+            // value (only a hostile token states one) is null rather than rounded (M4 QA round
+            // 5, finding 5).
+            accuracy_micros: info
+                .accuracy_micros
+                .filter(|&micros| micros <= MAX_SAFE_INTEGER.unsigned_abs())
+                .map(|micros| micros as f64),
+            ordering: info.ordering,
+            imprint_algorithm: info.imprint_algorithm,
+            signature_algorithm: info.signature_algorithm,
+            intact: info.intact,
+            valid: info.valid,
+            trusted: info.trusted,
+            problems: info
+                .problems
+                .into_iter()
+                .map(SignatureProblem::from)
+                .collect(),
+            warnings: info.warnings,
+        }
+    }
+}
+
 /// The verification result of one signature dictionary (the core `SignatureReport`).
 ///
 /// `intact`, `signatureValid`, `trusted`, `coverage` and `modification` use pyHanko 0.37's
@@ -588,13 +1014,24 @@ pub struct SignatureReport {
     pub location: Option<String>,
     /// `/ContactInfo`.
     pub contact_info: Option<String>,
-    /// The PAdES baseline level the signature meets.
+    /// The PAdES baseline level the signature meets: `'B-T'` when its selected signature
+    /// timestamp is intact and valid. It does not mean the TSA is trusted: before relying on
+    /// the time, also require `timestamp?.trusted === true`.
     #[napi(ts_type = "PadesLevel")]
     pub pades_level: Option<String>,
-    /// For a certification signature, its DocMDP permissions `P` (1–3).
+    /// The selected timestamp token: the earliest `genTime` among the signature timestamps
+    /// that are intact, valid and not untrusted, else the first one; a document timestamp's own
+    /// token. `null` without a token.
+    pub timestamp: Option<TimestampInfo>,
+    /// Every verified timestamp token, in attribute order.
+    pub timestamps: Vec<TimestampInfo>,
+    /// The DocMDP permissions `P` (1–3) this signature sets: a certification signature's, or
+    /// its field's lock `/P` (PDF 2.0), the stricter when both are present; `null` for an
+    /// approval without a lock `/P` and for a declaration that cannot be read.
     pub docmdp: Option<u32>,
-    /// Whether later revisions respect the DocMDP permissions; `null` until certification
-    /// signatures are supported.
+    /// Whether later revisions respect the DocMDP permissions in force for this signature: its
+    /// own `P` (1 when its declaration cannot be read), else that of an earlier signature that
+    /// set permissions, else 2 (form filling and signing). `null` for a document timestamp.
     pub docmdp_ok: Option<bool>,
     /// Why the signature is not valid; empty when nothing is wrong.
     pub problems: Vec<SignatureProblem>,
@@ -638,6 +1075,12 @@ impl From<folioxide::SignatureReport> for SignatureReport {
             location: report.location,
             contact_info: report.contact_info,
             pades_level: report.pades_level.map(|level| level.as_str().to_owned()),
+            timestamp: report.timestamp.map(TimestampInfo::from),
+            timestamps: report
+                .timestamps
+                .into_iter()
+                .map(TimestampInfo::from)
+                .collect(),
             docmdp: report.docmdp.map(u32::from),
             docmdp_ok: report.docmdp_ok,
             problems: report
@@ -748,13 +1191,21 @@ impl Task for VerifyTask {
     }
 }
 
-/// What a [`FinishTask`] does with its input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a finishing call does with its input.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Finishing {
     /// `finish`: the input is a signature value.
     Signature,
     /// `embedCms`: the input is a whole CMS.
     Cms,
+    /// `finish` with a timestamp response (PAdES B-T): the input is a signature value, and the
+    /// TSA's DER `TimeStampResp` answers the DER `TimeStampReq` `request`.
+    Timestamped {
+        /// The DER `TimeStampReq` that `timestampRequest` made for the signature value.
+        request: Vec<u8>,
+        /// The TSA's DER `TimeStampResp`.
+        response: Vec<u8>,
+    },
 }
 
 /// Finishes `prepared` with `input`. A refusal gives the prepared signature back with the
@@ -762,18 +1213,21 @@ enum Finishing {
 fn finish_with(
     prepared: folioxide::PreparedSignature,
     input: &[u8],
-    how: Finishing,
+    how: &Finishing,
 ) -> Result<Vec<u8>, folioxide::FinishError> {
     match how {
         Finishing::Signature => prepared.try_finish(input),
         Finishing::Cms => prepared.try_embed_cms(input),
+        Finishing::Timestamped { request, response } => {
+            prepared.try_finish_with_timestamp(input, request, response)
+        }
     }
 }
 
 /// Finishes a prepared signature on the libuv thread pool (`finishAsync`, `embedCmsAsync`).
 ///
 /// It holds the core value while it runs. `resolve` puts a refused value back into the
-/// JavaScript object's [`Slot`], so the caller can try again.
+/// JavaScript object's `Slot`, so the caller can try again.
 pub struct FinishTask {
     /// The slot of the `PreparedSignature` this task finishes.
     slot: Arc<Mutex<Slot>>,
@@ -795,7 +1249,7 @@ impl Task for FinishTask {
             )
             .into()));
         };
-        Ok(match finish_with(prepared, &self.input, self.how) {
+        Ok(match finish_with(prepared, &self.input, &self.how) {
             Ok(pdf) => Ok(pdf),
             Err(refused) => {
                 let (error, prepared) = refused.into_parts();
@@ -857,20 +1311,25 @@ impl Task for SignTask {
 
 #[napi]
 impl PdfDocument {
-    /// The first phase of signing: builds the incremental update that adds an invisible
-    /// signature (the document's pending changes, the field and the signature dictionary with
-    /// its placeholders), digests the signed byte ranges and builds the signed attributes. The
+    /// The first phase of signing: builds the incremental update that adds a signature (the
+    /// document's pending changes, the field and its widget, invisible or with an `appearance`,
+    /// and the signature dictionary with its placeholders and, for `certify`, its DocMDP
+    /// reference), digests the signed byte ranges and builds the signed attributes. The
     /// document is not changed.
     ///
     /// Sign the returned object's `toBeSigned` (or `toBeSignedDigest`) with the key of the
-    /// first certificate, then call its `finish` with the signature value.
+    /// first certificate, then call its `finish` with the signature value (after
+    /// `timestampRequest`, with the TSA's response, for PAdES B-T).
     ///
     /// Throws `E_INVALID_ARGUMENT` for invalid options (an empty chain, an algorithm that does
-    /// not match the certificate, …), `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` for a
-    /// `contentsReserve` below what the CMS needs, `E_UNSUPPORTED` for a document whose
-    /// structure was repaired or that has bytes before its header (save it in full first),
-    /// `E_DOC_MDP_FORBIDS` for a certified document that allows no changes,
-    /// `E_PAGE_OUT_OF_RANGE`, `E_NOT_FOUND`, `E_CERTIFICATE`.
+    /// not match the certificate, an appearance rectangle without an area or off the page, …),
+    /// `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` for a `contentsReserve` below what the CMS needs,
+    /// `E_UNSUPPORTED` for a document whose structure was repaired or that has bytes before its
+    /// header (save it in full first) or an unsupported JPEG, `E_IMAGE` for an appearance image
+    /// that is not a JPEG, `E_DOC_MDP_FORBIDS` when a certification rule refuses the signature
+    /// (a certified document that allows no changes, a certification that is not the first
+    /// signature, a new visible field on a certified document), `E_PAGE_OUT_OF_RANGE`,
+    /// `E_NOT_FOUND`, `E_CERTIFICATE`.
     #[napi]
     pub fn prepare_signature(
         &self,
@@ -924,6 +1383,17 @@ const ALREADY_FINISHED: &str = "this PreparedSignature was already finished: the
     successful finish, finishAsync, embedCms or embedCmsAsync takes it; prepare the signature \
     again to sign once more";
 
+/// The message of the error `finish` throws for a timestamp response without a request.
+const NO_TIMESTAMP_REQUEST: &str = "a timestampResponse needs the request it answers: call \
+    timestampRequest(signature) on this PreparedSignature first (it remembers the request), or \
+    pass the request as the third argument (a deserialized PreparedSignature remembers none)";
+
+/// The message of a `finish` without a timestamp response after `timestampRequest` (QA round 1
+/// finding 1: the request would be ignored without a word, and the file B-B).
+const PENDING_TIMESTAMP_REQUEST: &str = "timestampRequest() was called on this \
+    PreparedSignature, but finish got no timestampResponse: pass the TSA's response, or call \
+    discardTimestampRequest() first to finish without a signature timestamp (PAdES B-B)";
+
 /// What a [`PreparedSignature`] shares with its running `finishAsync` or `embedCmsAsync`.
 ///
 /// Only the JavaScript thread locks it (the methods, and the task's `resolve`), so the lock is
@@ -939,6 +1409,9 @@ struct Slot {
     /// The bytes reported to V8 as external memory (the prepared file), until a finish succeeds
     /// or the object is finalized.
     reported: i64,
+    /// The DER `TimeStampReq` the last `timestampRequest` returned, which a `finish` with a
+    /// timestamp response but no request uses.
+    timestamp_request: Option<Vec<u8>>,
 }
 
 impl Slot {
@@ -960,7 +1433,53 @@ impl Slot {
     fn finished(&mut self, env: &Env) {
         self.finished = true;
         self.prepared = None;
+        self.timestamp_request = None;
         give_back(env, std::mem::take(&mut self.reported));
+    }
+
+    /// The core value, for a call that only reads it.
+    ///
+    /// # Errors
+    /// As [`Slot::take`].
+    fn get(&self) -> JsResult<&folioxide::PreparedSignature> {
+        if self.in_flight {
+            return Err(finishing());
+        }
+        self.prepared
+            .as_ref()
+            .ok_or_else(|| invalid_argument(ALREADY_FINISHED))
+    }
+
+    /// How `finish(signature, response, request)` finishes: with a timestamp when there is a
+    /// response, its request being `request` or else the remembered one; without one only when
+    /// no request is remembered.
+    ///
+    /// # Errors
+    /// As [`Slot::take`]; `E_INVALID_ARGUMENT` for a request without a response, a response
+    /// without a request (none given and none remembered), or no response while a request is
+    /// remembered (`discardTimestampRequest` forgets it).
+    fn finishing(&self, response: Option<&[u8]>, request: Option<&[u8]>) -> JsResult<Finishing> {
+        self.get()?;
+        match (response, request) {
+            (None, None) if self.timestamp_request.is_some() => {
+                Err(invalid_argument(PENDING_TIMESTAMP_REQUEST))
+            }
+            (None, None) => Ok(Finishing::Signature),
+            (None, Some(_)) => Err(invalid_argument(
+                "a timestampRequest was given without the timestampResponse it is for",
+            )),
+            (Some(response), Some(request)) => Ok(Finishing::Timestamped {
+                request: request.to_vec(),
+                response: response.to_vec(),
+            }),
+            (Some(response), None) => match &self.timestamp_request {
+                Some(request) => Ok(Finishing::Timestamped {
+                    request: request.clone(),
+                    response: response.to_vec(),
+                }),
+                None => Err(invalid_argument(NO_TIMESTAMP_REQUEST)),
+            },
+        }
     }
 }
 
@@ -1027,7 +1546,7 @@ impl PreparedSignature {
     }
 
     /// Finishes on the JavaScript thread. A refused input puts the core value back.
-    fn finish_now(&self, env: &Env, input: &[u8], how: Finishing) -> Result<Buffer, BindingError> {
+    fn finish_now(&self, env: &Env, input: &[u8], how: &Finishing) -> Result<Buffer, BindingError> {
         let prepared = lock(&self.slot).take()?;
         match finish_with(prepared, input, how) {
             Ok(pdf) => {
@@ -1156,17 +1675,72 @@ impl PreparedSignature {
         lock(&self.slot).finished
     }
 
+    /// The DER `TimeStampReq` (RFC 3161) for a signature timestamp over `signature`, the
+    /// signature value `finish` will embed: send it to a TSA (an HTTP POST of
+    /// `application/timestamp-query`), then call `finish(signature, timestampResponse)`. The
+    /// value is verified first, as `finish` does, and the imprint is the digest of the value as
+    /// it will be embedded (an ECDSA value in IEEE P1363 form is converted to DER first). The
+    /// request asks for the TSA certificate and carries a nonce (random unless given). The
+    /// prepared signature remembers the request for `finish`; calling this again replaces it.
+    ///
+    /// Throws `E_SIGNATURE_INVALID` when the value does not verify, `E_INVALID_ARGUMENT` for
+    /// invalid options (a policy that is not a dotted OID) or when a finish succeeded already,
+    /// `E_BUSY` while `finishAsync` or `embedCmsAsync` runs.
+    #[napi]
+    pub fn timestamp_request(
+        &self,
+        signature: Uint8Array,
+        options: Option<TimestampRequestOptions>,
+    ) -> Result<Buffer, BindingError> {
+        let params = options.unwrap_or_default().into_core()?;
+        let mut slot = lock(&self.slot);
+        let request = slot
+            .get()?
+            .timestamp_request(&signature, &params)
+            .map_err(|err| from_core(&err.into()))?;
+        slot.timestamp_request = Some(request.clone());
+        Ok(Buffer::from(request))
+    }
+
     /// Finishes the file with `signature`, the signature value over `toBeSigned`: returns the
     /// signed PDF. RSA: the modulus length; ECDSA: DER or IEEE P1363 (`r || s`). The value is
     /// verified with the signer certificate before it is embedded. A refused value leaves the
     /// prepared signature as it was: call `finish` again with the right one.
     ///
+    /// With `timestampResponse`, the TSA's DER `TimeStampResp` to the request of
+    /// `timestampRequest` (or to `timestampRequest`, when given), the token is validated (the
+    /// status, the imprint, the nonce, the TSA's signature and certificate) and embedded as the
+    /// signature's signature timestamp (PAdES B-T). A refused response also leaves the prepared
+    /// signature as it was. Once `timestampRequest` was called, a `finish` without a response
+    /// is refused, so that a forgotten response never gives a file without a timestamp; call
+    /// `discardTimestampRequest` first to finish without one.
+    ///
     /// Throws `E_SIGNATURE_INVALID` when the value does not verify (another key, another
-    /// digest, other bytes), `E_INVALID_ARGUMENT` when a finish succeeded already, `E_BUSY`
-    /// while `finishAsync` or `embedCmsAsync` runs.
+    /// digest, other bytes), `E_TIMESTAMP_INVALID` when the response or the request fails a
+    /// check, `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` (with `details.needed`) when the signature
+    /// with the token does not fit `contentsCapacity`, `E_INVALID_ARGUMENT` when a finish
+    /// succeeded already, a response has no request or a remembered request no response,
+    /// `E_BUSY` while `finishAsync` or `embedCmsAsync` runs.
     #[napi]
-    pub fn finish(&self, env: Env, signature: Uint8Array) -> Result<Buffer, BindingError> {
-        self.finish_now(&env, &signature, Finishing::Signature)
+    pub fn finish(
+        &self,
+        env: Env,
+        signature: Uint8Array,
+        timestamp_response: Option<Uint8Array>,
+        timestamp_request: Option<Uint8Array>,
+    ) -> Result<Buffer, BindingError> {
+        let how = lock(&self.slot)
+            .finishing(timestamp_response.as_deref(), timestamp_request.as_deref())?;
+        self.finish_now(&env, &signature, &how)
+    }
+
+    /// Forgets the request `timestampRequest` remembered, so that `finish(signature)` without
+    /// a timestamp response finishes the file without a signature timestamp (PAdES B-B), for
+    /// example when the TSA could not be reached. Without a remembered request it does
+    /// nothing.
+    #[napi]
+    pub fn discard_timestamp_request(&self) {
+        lock(&self.slot).timestamp_request = None;
     }
 
     /// Like `finish`, on the libuv thread pool. Until it settles, the other finishing methods
@@ -1175,8 +1749,12 @@ impl PreparedSignature {
     pub fn finish_async(
         &self,
         signature: Uint8Array,
+        timestamp_response: Option<Uint8Array>,
+        timestamp_request: Option<Uint8Array>,
     ) -> Result<AsyncTask<FinishTask>, BindingError> {
-        self.finish_task(signature.to_vec(), Finishing::Signature)
+        let how = lock(&self.slot)
+            .finishing(timestamp_response.as_deref(), timestamp_request.as_deref())?;
+        self.finish_task(signature.to_vec(), how)
             .map(AsyncTask::new)
     }
 
@@ -1191,7 +1769,7 @@ impl PreparedSignature {
     /// `contentsCapacity`, `E_BUSY` while `finishAsync` or `embedCmsAsync` runs.
     #[napi]
     pub fn embed_cms(&self, env: Env, cms: Uint8Array) -> Result<Buffer, BindingError> {
-        self.finish_now(&env, &cms, Finishing::Cms)
+        self.finish_now(&env, &cms, &Finishing::Cms)
     }
 
     /// Like `embedCms`, on the libuv thread pool. Until it settles, the other finishing
@@ -1204,7 +1782,8 @@ impl PreparedSignature {
 
     /// The prepared signature in the core's versioned binary form (magic `FXPS`, version 1),
     /// to finish it later or in another process with `PreparedSignature.deserialize`. It holds
-    /// the whole prepared file.
+    /// the whole prepared file, but not the remembered timestamp request: keep that too, and
+    /// pass it to `finish` after deserializing.
     ///
     /// Throws `E_INVALID_ARGUMENT` when a finish succeeded already, `E_BUSY` while
     /// `finishAsync` or `embedCmsAsync` runs.
@@ -1543,6 +2122,89 @@ mod tests {
         folioxide::verify_bytes(second, &options).expect("verifies")
     }
 
+    /// The core report's JSON, which the binding's must equal.
+    fn core_json(core: &folioxide::SignatureReport) -> serde_json::Value {
+        json(core)
+    }
+
+    /// The first certificate of a PEM file of the test PKI, as DER.
+    fn pki_der(name: &str) -> Vec<u8> {
+        folioxide::certificates_from_pem(&pki_text(name))
+            .expect("a certificate")
+            .remove(0)
+    }
+
+    /// The mock TSA of the test PKI (`tsa.pem`, `tsa.key.pem`), carrying the root.
+    fn mock_tsa() -> folioxide_testkit::tsa::MockTsa {
+        let key =
+            folioxide::LocalSigner::from_pem(&pki_text("tsa.key.pem"), &pki_text("tsa.pem"), None)
+                .expect("loads");
+        folioxide_testkit::tsa::MockTsa::new(
+            pki_der("tsa.pem"),
+            vec![pki_der("root.pem")],
+            Box::new(move |attrs| key.sign(DigestAlgorithm::Sha256, attrs).expect("signs")),
+        )
+    }
+
+    /// A PAdES B-T signature by the P-256 signer with the mock TSA, verified against the test
+    /// root.
+    fn bt_report() -> folioxide::SignatureReport {
+        let signer = p256_signer();
+        let tsa = mock_tsa();
+        let timestamper =
+            |request: &[u8]| -> folioxide::sign::Result<Vec<u8>> { Ok(tsa.respond(request)) };
+        let request = folioxide::SignRequest::new(&signer, time()).with_timestamper(
+            &timestamper,
+            folioxide::TimestampParams::new().with_nonce(Some(42)),
+        );
+        let signed = folioxide::sign(&open(one_page_pdf()), &request).expect("signs");
+        let anchors = folioxide::certificates_from_pem(&pki_text("root.pem")).expect("root");
+        let options = folioxide::VerifyOptions::new()
+            .with_trust_anchors_der(anchors)
+            .with_validation_time(Some(time()));
+        folioxide::verify_bytes(signed, &options)
+            .expect("verifies")
+            .remove(0)
+    }
+
+    /// A B-T report, its timestamp included, has the JSON shape of the core's.
+    #[test]
+    fn timestamp_report_json_matches_the_core() {
+        let core = bt_report();
+        assert_eq!(core.pades_level, Some(folioxide::PadesLevel::BT));
+        let binding = SignatureReport::from(core.clone());
+        assert_eq!(json(&binding), core_json(&core));
+        assert_eq!(binding.pades_level.as_deref(), Some("B-T"));
+        let timestamp = binding.timestamp.as_ref().expect("a timestamp");
+        assert!(timestamp.intact && timestamp.valid);
+        assert_eq!(timestamp.trusted, Some(true));
+        assert_eq!(timestamp.gen_time, "2026-10-10T12:00:30Z");
+        assert_eq!(timestamp.imprint_algorithm.as_deref(), Some("sha256"));
+        assert_eq!(timestamp.accuracy_micros, Some(1_000_000.0));
+        // M4 QA round 5, finding 5: beyond 2^53 - 1 the value is null, never rounded.
+        let mut huge = core.timestamp.clone().expect("a timestamp");
+        huge.accuracy_micros = Some(137_438_953_472_488_999);
+        assert_eq!(TimestampInfo::from(huge.clone()).accuracy_micros, None);
+        huge.accuracy_micros = Some(MAX_SAFE_INTEGER.unsigned_abs());
+        assert_eq!(
+            TimestampInfo::from(huge).accuracy_micros,
+            Some(9_007_199_254_740_991.0)
+        );
+        let tsa = timestamp.tsa.as_ref().expect("the TSA certificate");
+        assert_eq!(tsa.common_name.as_deref(), Some("Folioxide Test TSA"));
+        assert_eq!(&tsa.der[..], &pki_der("tsa.pem")[..]);
+        assert_eq!(binding.timestamps.len(), 1);
+        // A token's problems keep their code.
+        let mut info = core.timestamp.clone().expect("a timestamp");
+        info.problems.push(folioxide::Problem::new(
+            folioxide::ProblemCode::TimestampImprintMismatch,
+            "the imprint is not the digest of the signature value",
+        ));
+        let converted = TimestampInfo::from(info.clone());
+        assert_eq!(json(&converted), json(&info));
+        assert_eq!(converted.problems[0].code, "timestampImprintMismatch");
+    }
+
     /// The report objects have the JSON shape of the core's serde DTOs (ARCHITECTURE §A.7):
     /// `camelCase` names, `null` for absent values, enums as strings, `{ num, gen }` ids.
     #[test]
@@ -1551,7 +2213,7 @@ mod tests {
         assert_eq!(reports.len(), 2);
         for core in reports {
             let binding = SignatureReport::from(core.clone());
-            assert_eq!(json(&binding), json(&core));
+            assert_eq!(json(&binding), core_json(&core));
         }
         // An orphan-like report with every optional value absent and problems present.
         let mut core = two_signature_reports().remove(0);
@@ -1564,7 +2226,7 @@ mod tests {
             "no field refers to it",
         ));
         let binding = SignatureReport::from(core.clone());
-        assert_eq!(json(&binding), json(&core));
+        assert_eq!(json(&binding), core_json(&core));
         let value = json(&binding);
         assert_eq!(value["fieldName"], serde_json::Value::Null);
         assert_eq!(value["padesLevel"], serde_json::Value::Null);
@@ -1698,6 +2360,22 @@ mod tests {
             location: Some("Berlin".to_owned()),
             contact_info: Some("jane@example.com".to_owned()),
             contents_reserve: Some(16384.0),
+            certify: Some(2.0),
+            appearance: Some(SignatureAppearanceOptions {
+                rect: Some(Rect {
+                    llx: 300.0,
+                    lly: 160.0,
+                    urx: 100.0,
+                    ury: 100.0,
+                }),
+                lines: Some(vec!["Approved".to_owned()]),
+                font: Some("Helvetica-Bold".to_owned()),
+                font_size: Some(9.5),
+                image: Some(array(b"\xFF\xD8")),
+                image_position: Some("background".to_owned()),
+                border_width: Some(1.0),
+            }),
+            tsa_reserve: Some(8192.0),
             ..prepare_options()
         }
         .into_core()
@@ -1716,8 +2394,43 @@ mod tests {
             .with_reason(Some("Approved".to_owned()))
             .with_location(Some("Berlin".to_owned()))
             .with_contact_info(Some("jane@example.com".to_owned()))
-            .with_contents_reserve(Some(16384));
+            .with_contents_reserve(Some(16384))
+            .with_certification(Some(folioxide::DocMdpPermissions::FormFilling))
+            .with_appearance(Some(
+                // The corners in any order: the core rectangle is normalized.
+                folioxide::SignatureAppearance::new(folioxide::Rect::new(
+                    100.0, 100.0, 300.0, 160.0,
+                ))
+                .with_text(folioxide::AppearanceText::Lines(vec![
+                    "Approved".to_owned(),
+                ]))
+                .with_font(folioxide::Standard14Font::HelveticaBold)
+                .with_font_size(Some(9.5))
+                .with_image(Some(b"\xFF\xD8".to_vec()))
+                .with_image_position(folioxide::ImagePosition::Background)
+                .with_border_width(1.0),
+            ))
+            .with_tsa_reserve(Some(8192));
         assert_eq!(request.options, expected);
+        // Every certification level, and an appearance for an existing field's widget.
+        for (p, level) in [
+            (1.0, folioxide::DocMdpPermissions::NoChanges),
+            (2.0, folioxide::DocMdpPermissions::FormFilling),
+            (3.0, folioxide::DocMdpPermissions::FormFillingAndAnnotations),
+        ] {
+            let request = PrepareSignatureOptions {
+                certify: Some(p),
+                appearance: Some(SignatureAppearanceOptions::default()),
+                ..prepare_options()
+            }
+            .into_core()
+            .expect("valid");
+            assert_eq!(request.options.certification, Some(level));
+            assert_eq!(
+                request.options.appearance,
+                Some(folioxide::SignatureAppearance::for_existing_field())
+            );
+        }
         // The defaults are the core's.
         let defaults = prepare_options().into_core().expect("defaults");
         assert_eq!(defaults.options, folioxide::SignatureOptions::new(time()));
@@ -1796,6 +2509,75 @@ mod tests {
                 "E_INVALID_ARGUMENT",
             ),
         ];
+        // M4: the certification level, the token budget and the appearance.
+        let mut cases = cases;
+        for p in [0.0, 4.0, 1.5, f64::NAN] {
+            cases.push((
+                PrepareSignatureOptions {
+                    certify: Some(p),
+                    ..prepare_options()
+                },
+                "E_INVALID_ARGUMENT",
+            ));
+        }
+        for reserve in [-1.0, 0.5, f64::INFINITY] {
+            cases.push((
+                PrepareSignatureOptions {
+                    tsa_reserve: Some(reserve),
+                    ..prepare_options()
+                },
+                "E_INVALID_ARGUMENT",
+            ));
+        }
+        let bad_appearances = [
+            SignatureAppearanceOptions {
+                rect: Some(Rect {
+                    llx: 0.0,
+                    lly: f64::NAN,
+                    urx: 100.0,
+                    ury: 50.0,
+                }),
+                ..SignatureAppearanceOptions::default()
+            },
+            SignatureAppearanceOptions {
+                rect: Some(Rect {
+                    llx: 0.0,
+                    lly: 0.0,
+                    urx: f64::INFINITY,
+                    ury: 50.0,
+                }),
+                ..SignatureAppearanceOptions::default()
+            },
+            SignatureAppearanceOptions {
+                font: Some("Times-Roman".to_owned()),
+                ..SignatureAppearanceOptions::default()
+            },
+            SignatureAppearanceOptions {
+                image_position: Some("right".to_owned()),
+                ..SignatureAppearanceOptions::default()
+            },
+            SignatureAppearanceOptions {
+                font_size: Some(0.0),
+                ..SignatureAppearanceOptions::default()
+            },
+            SignatureAppearanceOptions {
+                font_size: Some(f64::NAN),
+                ..SignatureAppearanceOptions::default()
+            },
+            SignatureAppearanceOptions {
+                border_width: Some(-1.0),
+                ..SignatureAppearanceOptions::default()
+            },
+        ];
+        for appearance in bad_appearances {
+            cases.push((
+                PrepareSignatureOptions {
+                    appearance: Some(appearance),
+                    ..prepare_options()
+                },
+                "E_INVALID_ARGUMENT",
+            ));
+        }
         for (options, code) in cases {
             let err = options.into_core().expect_err("rejected");
             assert_eq!(err.status, code, "{}", err.reason);
@@ -1808,12 +2590,17 @@ mod tests {
             trust_anchors: Some(vec![array(&pki("root.pem"))]),
             extra_certificates: Some(vec![array(&pki("intermediate.pem"))]),
             validation_time: Some("D:20261010120000Z".to_owned()),
+            timestamp_trust_anchors: Some(vec![array(&pki("tsa-root.pem"))]),
         }
         .into_core()
         .expect("valid");
         assert_eq!(options.trust_anchors_der.len(), 1);
         assert_eq!(options.extra_certs_der.len(), 1);
         assert_eq!(options.validation_time, Some(time()));
+        assert_eq!(
+            options.timestamp_trust_anchors_der,
+            Some(vec![pki_der("tsa-root.pem")])
+        );
         assert_eq!(
             VerifyOptions::default().into_core().expect("defaults"),
             folioxide::VerifyOptions::default()
@@ -1825,6 +2612,204 @@ mod tests {
         .into_core()
         .expect_err("not a date");
         assert_eq!(err.status, "E_INVALID_ARGUMENT");
+    }
+
+    /// A bigint as napi-rs reads it.
+    fn bigint(sign_bit: bool, words: &[u64]) -> BigInt {
+        BigInt {
+            sign_bit,
+            words: words.to_vec(),
+        }
+    }
+
+    #[test]
+    fn timestamp_request_options_convert() {
+        assert_eq!(
+            TimestampRequestOptions::default()
+                .into_core()
+                .expect("defaults"),
+            folioxide::TimestampParams::new()
+        );
+        let params = TimestampRequestOptions {
+            digest: Some("sha512".to_owned()),
+            policy: Some("1.2.3.4.1".to_owned()),
+            nonce: Some(bigint(false, &[u64::MAX])),
+        }
+        .into_core()
+        .expect("valid");
+        assert_eq!(
+            params,
+            folioxide::TimestampParams::new()
+                .with_digest(Some(DigestAlgorithm::Sha512))
+                .with_policy(Some("1.2.3.4.1".to_owned()))
+                .with_nonce(Some(u64::MAX))
+        );
+        let one = TimestampRequestOptions {
+            nonce: Some(bigint(false, &[1])),
+            ..TimestampRequestOptions::default()
+        };
+        assert_eq!(one.into_core().expect("one").nonce, Some(1));
+        for bad in [
+            // R-24 (M4 QA round 5 finding 4): the nonce is positive (brief §4.1).
+            TimestampRequestOptions {
+                nonce: Some(bigint(false, &[0])),
+                ..TimestampRequestOptions::default()
+            },
+            TimestampRequestOptions {
+                nonce: Some(bigint(true, &[1])),
+                ..TimestampRequestOptions::default()
+            },
+            TimestampRequestOptions {
+                nonce: Some(bigint(false, &[0, 1])),
+                ..TimestampRequestOptions::default()
+            },
+            TimestampRequestOptions {
+                digest: Some("sha1".to_owned()),
+                ..TimestampRequestOptions::default()
+            },
+        ] {
+            let err = bad.into_core().expect_err("refused");
+            assert_eq!(err.status, "E_INVALID_ARGUMENT", "{}", err.reason);
+        }
+    }
+
+    /// The two-phase B-T flow on the JavaScript object: `timestampRequest` remembers the
+    /// request, `finish(signature, response)` uses it, a refused response leaves the prepared
+    /// signature (and the request), and an explicit request works without one remembered.
+    #[test]
+    fn a_prepared_signature_finishes_with_a_timestamp() {
+        let env = no_v8();
+        let request = PrepareSignatureOptions {
+            tsa_reserve: Some(8192.0),
+            ..prepare_options()
+        }
+        .into_core()
+        .expect("request");
+        let prepare = || folioxide::prepare(&open(one_page_pdf()), &request).expect("prepares");
+        let object = PreparedSignature::new(prepare());
+        let expected = prepare();
+        let value = p256_signer()
+            .sign(expected.digest_algorithm(), expected.to_be_signed())
+            .expect("signs");
+        let tsa = mock_tsa();
+        let nonce = |n: u64| TimestampRequestOptions {
+            nonce: Some(bigint(false, &[n])),
+            ..TimestampRequestOptions::default()
+        };
+
+        // Without a request, a response cannot be used; a request needs a response.
+        let slot = || lock(&object.slot);
+        let err = slot()
+            .finishing(Some(b"tsr"), None)
+            .expect_err("no request");
+        assert_eq!(err.status, "E_INVALID_ARGUMENT");
+        assert!(err.reason.contains("timestampRequest"), "{}", err.reason);
+        let err = slot()
+            .finishing(None, Some(b"tsq"))
+            .expect_err("no response");
+        assert_eq!(err.status, "E_INVALID_ARGUMENT");
+        assert_eq!(
+            slot().finishing(None, None).ok(),
+            Some(Finishing::Signature)
+        );
+
+        // A value that does not verify gets no request.
+        let err = object
+            .timestamp_request(array(b"not a signature"), Some(nonce(1)))
+            .err()
+            .expect("refused");
+        assert_eq!(err.status, "E_SIGNATURE_INVALID");
+        assert!(slot().timestamp_request.is_none());
+
+        // The request is the core's, and is remembered.
+        let tsq = object
+            .timestamp_request(array(&value), Some(nonce(42)))
+            .expect("a request");
+        let params = folioxide::TimestampParams::new().with_nonce(Some(42));
+        assert_eq!(
+            &tsq[..],
+            &expected
+                .timestamp_request(&value, &params)
+                .expect("request")[..]
+        );
+        assert_eq!(slot().timestamp_request.as_deref(), Some(&tsq[..]));
+
+        // With a request remembered, a finish without a response is refused (QA round 1
+        // finding 1) until the request is discarded.
+        let err = slot()
+            .finishing(None, None)
+            .expect_err("a forgotten response");
+        assert_eq!(err.status, "E_INVALID_ARGUMENT");
+        assert!(
+            err.reason.contains("discardTimestampRequest"),
+            "{}",
+            err.reason
+        );
+        object.discard_timestamp_request();
+        assert!(slot().timestamp_request.is_none());
+        assert_eq!(
+            slot().finishing(None, None).ok(),
+            Some(Finishing::Signature)
+        );
+        object.discard_timestamp_request();
+
+        // A response to another request is refused; the value and the request stay.
+        let other = object
+            .timestamp_request(array(&value), Some(nonce(43)))
+            .expect("a request");
+        let wrong = tsa.respond(&other);
+        let tsq = object
+            .timestamp_request(array(&value), Some(nonce(42)))
+            .expect("a request");
+        let how = slot().finishing(Some(&wrong), None).expect("remembered");
+        let err = object
+            .finish_now(&env, &value, &how)
+            .err()
+            .expect("refused");
+        assert_eq!(err.status, "E_TIMESTAMP_INVALID", "{}", err.reason);
+        assert!(!object.is_finished());
+        assert_eq!(slot().timestamp_request.as_deref(), Some(&tsq[..]));
+
+        // The right response finishes it, as the core would; then the request is forgotten.
+        let response = tsa.respond(&tsq);
+        let how = slot().finishing(Some(&response), None).expect("remembered");
+        let signed = object.finish_now(&env, &value, &how).expect("finishes");
+        assert_eq!(
+            &signed[..],
+            &expected
+                .clone()
+                .finish_with_timestamp(&value, &tsq, &response)
+                .expect("finishes")[..]
+        );
+        assert!(object.is_finished());
+        assert!(slot().timestamp_request.is_none());
+        let err = object
+            .timestamp_request(array(&value), None)
+            .err()
+            .expect("finished");
+        assert_eq!(err.status, "E_INVALID_ARGUMENT");
+        let report = folioxide::verify_bytes(signed.to_vec(), &folioxide::VerifyOptions::new())
+            .expect("verifies")
+            .remove(0);
+        assert_eq!(report.pades_level, Some(folioxide::PadesLevel::BT));
+
+        // A deserialized prepared signature remembers no request: pass it, here to a task.
+        let restored = PreparedSignature::new(
+            folioxide::PreparedSignature::from_bytes(&expected.to_bytes()).expect("reads"),
+        );
+        let how = lock(&restored.slot)
+            .finishing(Some(&response), Some(&tsq))
+            .expect("explicit");
+        let mut task = restored.finish_task(value.clone(), how).expect("starts");
+        // While the task runs, timestampRequest is busy too.
+        let err = restored
+            .timestamp_request(array(&value), None)
+            .err()
+            .expect("busy");
+        assert_eq!(err.status, "E_BUSY");
+        let again = task.compute().expect("compute").expect("finishes");
+        task.settle(&env, true);
+        assert_eq!(again, signed.to_vec());
     }
 
     #[test]
@@ -1889,7 +2874,7 @@ mod tests {
             (&b""[..], Finishing::Signature, "E_SIGNATURE_INVALID"),
             (&b"garbage"[..], Finishing::Cms, "E_INVALID_ARGUMENT"),
         ] {
-            let err = object.finish_now(&env, input, how).err().expect("refused");
+            let err = object.finish_now(&env, input, &how).err().expect("refused");
             assert_eq!(err.status, code);
             assert!(!object.is_finished());
             assert_eq!(
@@ -1903,7 +2888,7 @@ mod tests {
             .sign(expected.digest_algorithm(), expected.to_be_signed())
             .expect("signs");
         let signed = object
-            .finish_now(&env, &value, Finishing::Signature)
+            .finish_now(&env, &value, &Finishing::Signature)
             .expect("finishes");
         assert!(signed.starts_with(&one_page_pdf()));
         assert_eq!(
@@ -1913,7 +2898,7 @@ mod tests {
         assert!(object.is_finished());
         for how in [Finishing::Signature, Finishing::Cms] {
             let err = object
-                .finish_now(&env, &value, how)
+                .finish_now(&env, &value, &how)
                 .err()
                 .expect("finished");
             assert_eq!(err.status, "E_INVALID_ARGUMENT");
@@ -1940,7 +2925,7 @@ mod tests {
             .finish_task(wrong.clone(), Finishing::Signature)
             .expect("starts");
         for how in [Finishing::Signature, Finishing::Cms] {
-            let err = object.finish_now(&env, &wrong, how).err().expect("busy");
+            let err = object.finish_now(&env, &wrong, &how).err().expect("busy");
             assert_eq!(err.status, "E_BUSY");
             let err = object.finish_task(wrong.clone(), how).err().expect("busy");
             assert_eq!(err.status, "E_BUSY");

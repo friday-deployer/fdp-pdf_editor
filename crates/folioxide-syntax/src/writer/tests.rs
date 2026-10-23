@@ -1039,3 +1039,96 @@ fn a_trailer_edit_alone_makes_an_update() {
         String::from_utf8_lossy(&update.bytes).starts_with("xref\n0 1\n0000000000 65535 f\r\n")
     );
 }
+
+/// `bytes` with the digits after the last `/Size` (the newest trailer's, or the newest
+/// cross-reference stream's dictionary's) respelled as `size`. The respelled value is in the
+/// newest section, which only `startxref` and `%%EOF` follow, so no offset moves.
+fn with_newest_size(bytes: &[u8], size: &str) -> Vec<u8> {
+    let key = bytes.windows(6).rposition(|w| w == b"/Size ").unwrap() + 6;
+    let end = key
+        + bytes[key..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+    [&bytes[..key], size.as_bytes(), &bytes[end..]].concat()
+}
+
+#[test]
+fn an_over_declared_size_is_carried() {
+    // Manager ruling R-30 (a): an update's /Size is the highest number + 1, or the newest
+    // revision's own /Size when that is larger, a direct non-negative integer and within
+    // Limits::max_objects. An update never shrinks the /Size of the file (PDFium keeps only the
+    // objects below the newest one; the signature verifier makes such an update `Other`).
+    let table = syntax::minimal(); // objects 0-5, `/Size 6`
+    let stream = {
+        // `xref-stream` (objects 1-6) with one update of the writer's own, whose stream lists
+        // `/Index` explicitly: the respelled `/Size` changes no default subsection.
+        let mut store = open(&syntax::xref_stream());
+        store.set(id(5, 0), Object::Int(5)).unwrap();
+        store
+            .save_incremental(&IncrementalOptions::default())
+            .unwrap()
+    };
+    assert_eq!(open(&stream).trailer().get_int(keys::SIZE), Some(8));
+    let limits = crate::Limits::default().with_max_objects(1000);
+    for (source, kind) in [(&table, XrefKind::Table), (&stream, XrefKind::Stream)] {
+        for (size, max_objects, kept) in [
+            // Over-declared: kept (the QA reproductions' 100 and 99999).
+            ("100", None, Some(100)),
+            ("99999", None, Some(99999)),
+            // At the limit: kept; above it, or not a non-negative u32: the highest number + 1.
+            ("1000", Some(limits), Some(1000)),
+            ("1001", Some(limits), None),
+            ("4294967296", None, None),
+            // Under-declared or not a direct integer: the highest number + 1 (the verifier
+            // reports such a source /Size; the writer does not repeat it).
+            ("3", None, None),
+            ("0", None, None),
+            ("-5", None, None),
+            ("100.0", None, None),
+            ("5 0 R", None, None),
+        ] {
+            let bytes = with_newest_size(source, size);
+            let options = max_objects.map_or_else(OpenOptions::default, |limits| {
+                OpenOptions::default().with_limits(limits)
+            });
+            let mut store = Store::open_bytes(bytes.clone(), &options).unwrap();
+            assert_eq!(store.revisions().last().unwrap().xref_kind, kind);
+            store
+                .set(id(5, 0), Object::literal_string("edited"))
+                .unwrap();
+            // New numbers still come from the store, not from the declared /Size.
+            let next = store.next_object_number();
+            let added = store.add(Object::Int(7)).unwrap();
+            assert_eq!(added.num, next, "{size}");
+            let update = store
+                .incremental_update(&IncrementalOptions::default())
+                .unwrap();
+            assert_eq!(update.xref_kind, Some(kind), "{size}");
+            let out = [bytes.as_slice(), &update.bytes].concat();
+            let reopened = Store::open_bytes(out, &options).unwrap();
+            assert!(
+                !reopened.structure_repaired(),
+                "{size}: {:?}",
+                reopened.diagnostics()
+            );
+            assert_eq!(*reopened.resolve(added).unwrap(), Object::Int(7), "{size}");
+            let highest = reopened.max_object_number();
+            let written = reopened
+                .revisions()
+                .last()
+                .unwrap()
+                .trailer
+                .get_int(keys::SIZE);
+            let expected = kept.unwrap_or(i64::from(highest) + 1);
+            assert_eq!(written, Some(expected), "{kind:?} /Size {size}");
+            assert!(expected > i64::from(highest), "{size}");
+        }
+    }
+    // Nothing edited: nothing written, whatever the source says.
+    let store = open(&with_newest_size(&table, "100"));
+    let update = store
+        .incremental_update(&IncrementalOptions::default())
+        .unwrap();
+    assert!(update.bytes.is_empty());
+}

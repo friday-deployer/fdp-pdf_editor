@@ -23,6 +23,11 @@
 //! [`Problem`] in the [`CmsVerification`]. [`verify_raw`] and [`verify_and_normalize`] check a
 //! bare signature value with a certificate (the two-phase flow's `finish`).
 //!
+//! **Signature timestamps** (M4 brief §3.1, §4.3; RFC 3161 Appendix A):
+//! [`assemble_with_timestamp`] adds one `id-aa-signatureTimeStampToken` unsigned attribute,
+//! [`cms_len_upper_bound_with_timestamp`] sizes it, [`signature_timestamp_tokens`] reads the
+//! tokens of a SignerInfo, and [`verify_encapsulated`] verifies a token's encapsulated TSTInfo.
+//!
 //! ```
 //! use folioxide_sign::algorithms::DigestAlgorithm;
 //! use folioxide_sign::cms::{self, SignedAttrsInput};
@@ -42,6 +47,7 @@ use std::ops::Range;
 use crate::algorithms::{DigestAlgorithm, KeyKind, SignatureAlgorithm, oid};
 use crate::error::Result;
 use crate::problem::Problem;
+use crate::tsp::{MAX_TIMESTAMP_TOKENS, OID_AA_SIGNATURE_TIME_STAMP_TOKEN};
 
 mod build;
 pub(crate) mod decode;
@@ -54,7 +60,9 @@ pub(crate) use decode::oid_to_string;
 pub const MAX_DEPTH: usize = 32;
 /// The most certificates [`parse`] accepts in `SignedData.certificates` (M3 brief R-18).
 pub const MAX_CERTIFICATES: usize = 64;
-/// The most attributes [`parse`] accepts in one `signedAttrs` or `unsignedAttrs` (M3 brief R-18).
+/// The most attributes [`parse`] accepts in one `signedAttrs` (M3 brief R-18), and the most it
+/// reads of one `unsignedAttrs`: unsigned attributes are not signed, so more of them are not
+/// an error; the ones after the limit are not read (M4 QA round 1 finding F10).
 pub const MAX_ATTRIBUTES: usize = 64;
 
 /// The inputs of [`build_signed_attrs`].
@@ -182,7 +190,7 @@ pub fn verify_and_normalize(
 /// # Errors
 /// [`Error::Syntax`](crate::Error::Syntax) with code `Syntax` when the bytes are not a
 /// well-formed ContentInfo, and with code `LimitExceeded` when a limit ([`MAX_DEPTH`],
-/// [`MAX_CERTIFICATES`], [`MAX_ATTRIBUTES`]) is exceeded.
+/// [`MAX_CERTIFICATES`], [`MAX_ATTRIBUTES`] signed attributes) is exceeded.
 pub fn parse(cms: &[u8]) -> Result<ParsedCms> {
     decode::parse(cms)
 }
@@ -278,8 +286,10 @@ impl AlgorithmId {
 /// bytes re-tagged `0x31`. Every failure is a [`Problem`]; the function never panics.
 ///
 /// - Signature algorithms: RSA PKCS#1 v1.5 (also under `rsaEncryption`), RSA-PSS (MGF1 on the
-///   same hash), ECDSA on P-256 and P-384 (DER or IEEE P1363 values; high-S accepted). RSA keys
-///   of 1024 to 8192 bits; below 2048 bits a warning is added.
+///   same hash), ECDSA on P-256 and P-384 (the value must be a minimal DER `ECDSA-Sig-Value`,
+///   as OpenSSL and pyHanko verify it: IEEE P1363 `r || s` and redundant leading zero octets
+///   make `signature_valid` false; high-S accepted). RSA keys of 1024 to 8192 bits; below 2048
+///   bits a warning is added.
 /// - The ESS signing-certificate-v2 attribute is checked when present, else v1 (as pyHanko);
 ///   the first ESSCertID must match the certHash, and the issuerSerial when present.
 /// - Without signed attributes the signature covers the content itself and `intact` equals
@@ -292,6 +302,184 @@ pub fn verify_detached(
     extra_certs: &[Vec<u8>],
 ) -> CmsVerification {
     verify::verify_detached(parsed, document_digest_for, extra_certs)
+}
+
+/// Verifies a CMS with encapsulated content: a timestamp token's TSTInfo (M4 brief §3.1, §5
+/// V7b step 4).
+///
+/// The checks: SignedData with exactly one SignerInfo, `eContentType` equals
+/// `expected_econtent_type` and eContent is present, exactly one content-type attribute equal
+/// to it and exactly one message-digest attribute equal to the digest of the eContent octets
+/// (`intact`), the signer certificate found by `sid` among the CMS certificates and
+/// `extra_certs`, a signature algorithm whose hash equals the digest algorithm, and the
+/// signature over the original signed attributes re-tagged `0x31` (`signature_valid`). The
+/// algorithms are those of [`verify_detached`]. Never fails, never panics.
+///
+/// The ESS signing-certificate attributes (v2, RFC 5035; v1, RFC 2634, whose SHA-1 certHash is
+/// not a weak-algorithm problem) are **reported** in [`pades_attrs`](CmsVerification::pades_attrs)
+/// (their first identifier) and do not change `signature_valid`: a timestamp verifier checks
+/// them as a separate step (M4 brief §4.2 step 6, §5 V7b step 5), which
+/// [`verify_token`](crate::tsp::verify_token) does as OpenSSL does: every attribute present,
+/// every identifier.
+///
+/// ```
+/// use folioxide_sign::cms;
+/// use folioxide_sign::tsp::OID_CT_TST_INFO;
+///
+/// // A ContentInfo that is not SignedData is neither intact nor valid.
+/// let id_data = [0x30, 0x0B, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
+/// let parsed = cms::parse(&id_data)?;
+/// let v = cms::verify_encapsulated(&parsed, OID_CT_TST_INFO, &[]);
+/// assert!(!v.intact && !v.signature_valid);
+/// # Ok::<(), folioxide_sign::Error>(())
+/// ```
+pub fn verify_encapsulated(
+    parsed: &ParsedCms,
+    expected_econtent_type: &str,
+    extra_certs: &[Vec<u8>],
+) -> CmsVerification {
+    verify::verify_encapsulated(parsed, expected_econtent_type, extra_certs)
+}
+
+/// [`assemble`] plus `unsignedAttrs [1]` holding exactly one `id-aa-signatureTimeStampToken`
+/// attribute with exactly one value, `token_der`, byte for byte (M4 brief §4.3; RFC 3161
+/// Appendix A). The signed attributes and the signature value are unchanged, so the signature
+/// stays valid; only the lengths of the SignerInfo, `signerInfos`, SignedData, `[0]` and the
+/// ContentInfo grow. A BER token is embedded verbatim (DECISIONS D13 D-12): the CMS around it
+/// stays DER.
+///
+/// The token is not verified here (see [`validate_response`](crate::tsp::validate_response)
+/// and [`verify_token`](crate::tsp::verify_token)); it must be one BER or DER `SEQUENCE`.
+///
+/// # Errors
+/// As [`assemble`]; [`Error::InvalidArgument`](crate::Error::InvalidArgument) when `token_der`
+/// is not one BER or DER `SEQUENCE`.
+#[allow(clippy::too_many_arguments)] // The brief's signature (M4 brief §3.1).
+pub fn assemble_with_timestamp(
+    signed_attrs: &[u8],
+    signature: &[u8],
+    chain_der: &[Vec<u8>],
+    alg: SignatureAlgorithm,
+    kind: KeyKind,
+    digest: DigestAlgorithm,
+    token_der: &[u8],
+) -> Result<Vec<u8>> {
+    build::assemble_with_timestamp(
+        signed_attrs,
+        signature,
+        chain_der,
+        alg,
+        kind,
+        digest,
+        token_der,
+    )
+}
+
+/// [`cms_len_upper_bound`] for a CMS that also carries a signature timestamp token of exactly
+/// `token_len` bytes (M4 brief §4.4): exact for RSA, at most a few bytes above the real length
+/// for ECDSA. A `token_len` of 0 is [`cms_len_upper_bound`].
+///
+/// # Errors
+/// As [`cms_len_upper_bound`]; [`Error::InvalidArgument`](crate::Error::InvalidArgument) for a
+/// `token_len` above [`MAX_CONTENTS_RESERVE`](crate::placeholder::MAX_CONTENTS_RESERVE).
+pub fn cms_len_upper_bound_with_timestamp(
+    signed_attrs: &[u8],
+    chain_der: &[Vec<u8>],
+    alg: SignatureAlgorithm,
+    kind: KeyKind,
+    digest: DigestAlgorithm,
+    token_len: usize,
+) -> Result<usize> {
+    build::cms_len_upper_bound_with_timestamp(signed_attrs, chain_der, alg, kind, digest, token_len)
+}
+
+/// The signature timestamp tokens of a SignerInfo: the raw bytes of every value of every
+/// `id-aa-signatureTimeStampToken` attribute of its `unsignedAttrs`, in order (RFC 3161
+/// Appendix A; M4 brief §5 V7b).
+///
+/// At most [`MAX_TIMESTAMP_TOKENS`]` + 1` tokens are returned, so a caller can tell that there
+/// were more than it verifies, and only the first [`MAX_ATTRIBUTES`] attributes are read.
+/// Unsigned attributes that do not parse end the list (it never fails): what was read before
+/// is returned. The verifier says in its report when that happened (M4 QA round 3 finding 1).
+pub fn signature_timestamp_tokens(si: &ParsedSignerInfo) -> Vec<Vec<u8>> {
+    signature_timestamp_tokens_read(si).0
+}
+
+/// [`signature_timestamp_tokens`], and whether the unsigned attributes it read (up to the
+/// limits) all parsed: `false` when an attribute, or a value of a timestamp token attribute,
+/// could not be read, for example a token with a truncated or huge declared length or nested
+/// deeper than [`MAX_DEPTH`]. A caller cannot tell such a damaged signature timestamp from no
+/// timestamp at all, and says so (M4 QA round 3 finding 1): unsigned attributes are not
+/// signed, so anyone can damage them.
+pub(crate) fn signature_timestamp_tokens_read(si: &ParsedSignerInfo) -> (Vec<Vec<u8>>, bool) {
+    let mut tokens = Vec::new();
+    let Some(raw) = si.unsigned_attrs.as_deref() else {
+        return (tokens, true);
+    };
+    let Ok(outer) = tlv::read_exact(raw, MAX_DEPTH) else {
+        return (tokens, false);
+    };
+    for attribute in tlv::children(raw, &outer, 0, MAX_DEPTH).take(MAX_ATTRIBUTES) {
+        let Ok(attribute) = attribute else {
+            return (tokens, false);
+        };
+        let mut parts = tlv::children(raw, &attribute, 1, MAX_DEPTH);
+        let (Some(Ok(attr_type)), Some(Ok(values))) = (parts.next(), parts.next()) else {
+            return (tokens, false);
+        };
+        if attribute.tag != tlv::TAG_SEQUENCE
+            || attr_type.tag != tlv::TAG_OID
+            || values.tag != tlv::TAG_SET
+        {
+            return (tokens, false);
+        }
+        let is_token = oid_to_string(attr_type.content(raw)).as_deref()
+            == Some(OID_AA_SIGNATURE_TIME_STAMP_TOKEN);
+        if !is_token {
+            continue;
+        }
+        for value in tlv::children(raw, &values, 2, MAX_DEPTH) {
+            let Ok(value) = value else {
+                return (tokens, false);
+            };
+            tokens.push(value.raw(raw).to_vec());
+            if tokens.len() > MAX_TIMESTAMP_TOKENS {
+                return (tokens, true);
+            }
+        }
+    }
+    (tokens, true)
+}
+
+/// The byte ranges, within `input`, of every value of every `id-aa-signatureTimeStampToken`
+/// attribute of the `unsignedAttrs` element `attrs` (read at `depth`): what a DER check treats
+/// as opaque, because a TSA's token is embedded verbatim (M4 brief §4.3, DECISIONS D13 D-12).
+pub(crate) fn timestamp_value_ranges(
+    input: &[u8],
+    attrs: &tlv::Element,
+    depth: usize,
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    for attribute in tlv::children(input, attrs, depth, MAX_DEPTH).take(MAX_ATTRIBUTES) {
+        let Ok(attribute) = attribute else {
+            break;
+        };
+        let mut parts = tlv::children(input, &attribute, depth + 1, MAX_DEPTH);
+        let (Some(Ok(attr_type)), Some(Ok(values))) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let is_token = attr_type.tag == tlv::TAG_OID
+            && oid_to_string(attr_type.content(input)).as_deref()
+                == Some(OID_AA_SIGNATURE_TIME_STAMP_TOKEN);
+        if is_token && values.tag == tlv::TAG_SET {
+            ranges.extend(
+                tlv::children(input, &values, depth + 2, MAX_DEPTH)
+                    .map_while(std::result::Result::ok)
+                    .map(|value| value.start..value.end),
+            );
+        }
+    }
+    ranges
 }
 
 /// The result of [`verify_detached`].
@@ -414,6 +602,114 @@ mod tests {
         assert_eq!(v.problems.len(), 1);
         assert_eq!(v.problems[0].code, ProblemCode::CmsMalformed);
         assert!(v.signer_cert.is_none() && v.digest.is_none());
+    }
+
+    /// A SignerInfo whose `unsignedAttrs` is `unsigned` (raw, `[1]` tag included).
+    fn signer_info_with(unsigned: Option<Vec<u8>>) -> ParsedSignerInfo {
+        let algorithm = AlgorithmId {
+            oid: oid::SHA256.to_owned(),
+            parameters: None,
+        };
+        ParsedSignerInfo {
+            version: 1,
+            sid: SignerIdentifier::SubjectKeyIdentifier(vec![1]),
+            digest_algorithm: algorithm.clone(),
+            signed_attrs: None,
+            signature_algorithm: algorithm,
+            signature: vec![0; 4],
+            unsigned_attrs: unsigned,
+            raw: 0..0,
+        }
+    }
+
+    /// An `Attribute` of type `oid_content` (DER content octets) with `values`.
+    fn attribute(oid_content: &[u8], values: &[&[u8]]) -> Vec<u8> {
+        tlv::tlv_parts(
+            tlv::TAG_SEQUENCE,
+            &[
+                &tlv::tlv(tlv::TAG_OID, oid_content),
+                &tlv::tlv_parts(tlv::TAG_SET, values),
+            ],
+        )
+    }
+
+    #[test]
+    fn signature_timestamp_tokens_in_order() {
+        const TST: &[u8] = &[
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E,
+        ];
+        const SIGNING_TIME: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05];
+        let token = |n: u8| tlv::tlv(tlv::TAG_SEQUENCE, &[0x02, 0x01, n]);
+        let (one, two, three) = (token(1), token(2), token(3));
+        let unsigned = tlv::tlv_parts(
+            tlv::TAG_CONTEXT_1,
+            &[
+                &attribute(TST, &[&one, &two]),
+                &attribute(SIGNING_TIME, &[&tlv::tlv(tlv::TAG_UTC_TIME, b"x")]),
+                &attribute(TST, &[&three]),
+            ],
+        );
+        let si = signer_info_with(Some(unsigned.clone()));
+        assert_eq!(signature_timestamp_tokens(&si), [one, two, three]);
+
+        assert!(signature_timestamp_tokens(&signer_info_with(None)).is_empty());
+        // Garbage and truncations: nothing or a prefix, never a panic.
+        for len in 0..unsigned.len() {
+            let si = signer_info_with(Some(unsigned[..len].to_vec()));
+            assert!(signature_timestamp_tokens(&si).len() <= 3);
+        }
+
+        // At most MAX_TIMESTAMP_TOKENS + 1 tokens.
+        let many: Vec<Vec<u8>> = (0..20).map(token).collect();
+        let refs: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
+        let flood = tlv::tlv(tlv::TAG_CONTEXT_1, &attribute(TST, &refs));
+        let tokens = signature_timestamp_tokens(&signer_info_with(Some(flood)));
+        assert_eq!(tokens.len(), MAX_TIMESTAMP_TOKENS + 1);
+        assert_eq!(tokens[0], many[0]);
+    }
+
+    #[test]
+    fn timestamp_additions_refuse_bad_inputs() {
+        let parsed = ParsedCms {
+            content_type: oid::ID_SIGNED_DATA.to_owned(),
+            econtent_type: Some(crate::tsp::OID_CT_TST_INFO.to_owned()),
+            econtent: Some(vec![0x30, 0x00]),
+            signer_infos: Vec::new(),
+            certificates: Vec::new(),
+            raw: 0..0,
+        };
+        let v = verify_encapsulated(&parsed, crate::tsp::OID_CT_TST_INFO, &[]);
+        assert!(!v.intact && !v.signature_valid);
+        assert_eq!(v.problems[0].code, ProblemCode::SignerInfoCount);
+        let kind = KeyKind::EcP256;
+        let (alg, digest) = (SignatureAlgorithm::Ecdsa, DigestAlgorithm::Sha256);
+        assert!(assemble_with_timestamp(&[0x31, 0], &[], &[], alg, kind, digest, &[]).is_err());
+        assert!(cms_len_upper_bound_with_timestamp(&[0x31, 0], &[], alg, kind, digest, 1).is_err());
+        let too_long = crate::placeholder::MAX_CONTENTS_RESERVE + 1;
+        let err = cms_len_upper_bound_with_timestamp(&[0x31, 0], &[], alg, kind, digest, too_long)
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot fit"), "{err}");
+    }
+
+    #[test]
+    fn timestamp_value_ranges_find_every_token() {
+        const TST: &[u8] = &[
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E,
+        ];
+        let one = tlv::tlv(tlv::TAG_SEQUENCE, &[0x05, 0x00]);
+        let unsigned = tlv::tlv_parts(
+            tlv::TAG_CONTEXT_1,
+            &[
+                &attribute(&[0x2A, 0x03], &[&one]),
+                &attribute(TST, &[&one, &one]),
+            ],
+        );
+        let element = tlv::read_exact(&unsigned, MAX_DEPTH).unwrap();
+        let ranges = timestamp_value_ranges(&unsigned, &element, 0);
+        assert_eq!(ranges.len(), 2);
+        for range in ranges {
+            assert_eq!(&unsigned[range], one.as_slice());
+        }
     }
 
     #[test]

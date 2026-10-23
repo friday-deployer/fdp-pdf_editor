@@ -6,6 +6,7 @@
 
 pub mod corpus;
 pub mod oracle;
+pub mod visible;
 
 use std::path::{Path, PathBuf};
 
@@ -159,4 +160,209 @@ pub fn summary(r: &SignatureReport) -> String {
         "field={:?} byteRangeOk={} intact={} valid={} coverage={} modification={} problems={codes:?}",
         r.field_name, r.byte_range_ok, r.intact, r.signature_valid, r.coverage, r.modification
     )
+}
+
+/// A signature [`sign_raw`] writes without the signing API's placement rules: the field's
+/// name, `/Rect` and appearance, and extra entries for the field, the signature dictionary and
+/// the catalog (M4 corpus cases that Folioxide refuses to sign: FieldMDP, a new visible approval
+/// on a certified document, invalid or late DocMDP declarations).
+#[derive(Clone, Debug, Default)]
+pub struct RawSignature {
+    /// The field's partial name (default `Raw1`).
+    pub name: String,
+    /// The widget's `/Rect` (default `[0 0 0 0]`, invisible).
+    pub rect: [i64; 4],
+    /// The content of a new `/AP /N` form XObject for the widget.
+    pub appearance: Option<Vec<u8>>,
+    /// Extra entries of the merged field and widget.
+    pub field: Vec<(&'static str, folioxide_syntax::Object)>,
+    /// Extra entries of the signature dictionary (before `/ByteRange`).
+    pub sig: Vec<(&'static str, folioxide_syntax::Object)>,
+    /// Name the signature dictionary in the catalog's `/Perms /DocMDP` (a direct `/Perms`).
+    pub perms: bool,
+    /// Sign the existing field named [`RawSignature::name`] (a merged field and widget of the
+    /// source): its `/V`, appearance and extra entries are set, nothing else is created.
+    pub existing: bool,
+    /// The dictionary of the appearance stream instead of `/Type /XObject /Subtype /Form
+    /// /BBox [0 0 w h]` (M4 QA round 1, finding R5: appearances that are no form XObject).
+    pub appearance_dict: Option<folioxide_syntax::Dict>,
+    /// Byte replacements of equal length applied to the signing revision's bytes before they are
+    /// signed, each at its last occurrence: a key written under a stand-in name (`/Referencf`)
+    /// renamed to a key the dictionary has already (`/Reference`), which writes that key twice
+    /// (M4 QA round 2, finding 8: duplicate keys in what the signature itself signs).
+    pub renames: Vec<(&'static [u8], &'static [u8])>,
+}
+
+/// Signs `source` with `signer` (SHA-256, PAdES B-B attributes) in a new merged signature field
+/// and widget built from `raw`, appended to the first page's `/Annots` and the AcroForm's
+/// `/Fields` (an AcroForm is created when there is none, with `/SigFlags 3`): a genuine,
+/// verifiable signature, written with `folioxide-syntax` edits and `folioxide_sign::cms` only.
+pub fn sign_raw(source: &[u8], signer: &LocalSigner, raw: &RawSignature) -> Vec<u8> {
+    use folioxide_sign::algorithms::DigestAlgorithm;
+    use folioxide_sign::cms::{self, SignedAttrsInput};
+    use folioxide_syntax::{Dict, IncrementalOptions, Object, Store, Stream, StreamData};
+    use folioxide_testkit::fixtures::forms;
+
+    const RESERVE: usize = 8192;
+    let placeholder = b"[0 9999999999 9999999999 9999999999]";
+    let mut store = Store::open_bytes(source.to_vec(), &OpenOptions::default()).unwrap();
+    let page = forms::page_id(&store, 0).unwrap();
+    let mut sig = Dict::new();
+    sig.insert("Type", Object::name("Sig"));
+    sig.insert("Filter", Object::name("Adobe.PPKLite"));
+    sig.insert("SubFilter", Object::name("ETSI.CAdES.detached"));
+    sig.insert("M", Object::literal_string("D:20261010120000Z"));
+    for (key, value) in &raw.sig {
+        sig.insert(*key, value.clone());
+    }
+    sig.insert(
+        "ByteRange",
+        Object::Array(vec![
+            Object::Int(0),
+            Object::Int(9_999_999_999),
+            Object::Int(9_999_999_999),
+            Object::Int(9_999_999_999),
+        ]),
+    );
+    sig.insert("Contents", Object::hex_string(vec![0u8; RESERVE]));
+    let sig = store.add(Object::Dict(sig)).unwrap();
+    let rect = Object::Array(raw.rect.iter().copied().map(Object::Int).collect());
+    let name = if raw.name.is_empty() {
+        "Raw1"
+    } else {
+        &raw.name
+    };
+    let existing = raw.existing.then(|| {
+        store
+            .object_ids()
+            .into_iter()
+            .find(|&id| {
+                store.resolve(id).ok().is_some_and(|o| {
+                    o.as_dict()
+                        .is_some_and(|d| d.get_str_bytes(b"T") == Some(name.as_bytes()))
+                })
+            })
+            .unwrap_or_else(|| panic!("no field {name}"))
+    });
+    let mut widget = match existing {
+        Some(id) => store.resolve(id).unwrap().as_dict().unwrap().clone(),
+        None => {
+            let mut widget = Dict::new();
+            widget.insert("Type", Object::name("Annot"));
+            widget.insert("Subtype", Object::name("Widget"));
+            widget.insert("FT", Object::name("Sig"));
+            widget.insert("T", Object::literal_string(name));
+            widget.insert("F", Object::Int(132));
+            widget.insert("Rect", rect);
+            widget.insert("P", Object::Ref(page));
+            widget
+        }
+    };
+    widget.insert("V", Object::Ref(sig));
+    if let Some(content) = &raw.appearance {
+        let [x1, y1, x2, y2] = raw.rect;
+        let form = raw.appearance_dict.clone().unwrap_or_else(|| {
+            let mut form = Dict::new();
+            form.insert("Type", Object::name("XObject"));
+            form.insert("Subtype", Object::name("Form"));
+            form.insert(
+                "BBox",
+                Object::Array(vec![
+                    Object::Int(0),
+                    Object::Int(0),
+                    Object::Int((x2 - x1).abs()),
+                    Object::Int((y2 - y1).abs()),
+                ]),
+            );
+            form
+        });
+        let stream = Stream::new(form, StreamData::Decoded(content.clone()));
+        let ap = store.add(Object::Stream(Box::new(stream))).unwrap();
+        let mut dict = Dict::new();
+        dict.insert("N", Object::Ref(ap));
+        widget.insert("AP", Object::Dict(dict));
+    }
+    for (key, value) in &raw.field {
+        widget.insert(*key, value.clone());
+    }
+    let root = store.root_id().unwrap();
+    let mut catalog = store.resolve(root).unwrap().as_dict().unwrap().clone();
+    if let Some(id) = existing {
+        store.set(id, Object::Dict(widget)).unwrap();
+    } else {
+        let widget = store.add(Object::Dict(widget)).unwrap();
+        forms::append_to_annots(&mut store, page, widget).unwrap();
+        match catalog.get(b"AcroForm").cloned() {
+            Some(Object::Ref(acroform)) => {
+                let mut dict = store.resolve(acroform).unwrap().as_dict().unwrap().clone();
+                let mut fields = dict.get_array(b"Fields").unwrap_or_default().to_vec();
+                fields.push(Object::Ref(widget));
+                dict.insert("Fields", Object::Array(fields));
+                store.set(acroform, Object::Dict(dict)).unwrap();
+            }
+            _ => {
+                let mut dict = Dict::new();
+                dict.insert("Fields", Object::Array(vec![Object::Ref(widget)]));
+                dict.insert("SigFlags", Object::Int(3));
+                let acroform = store.add(Object::Dict(dict)).unwrap();
+                catalog.insert("AcroForm", Object::Ref(acroform));
+            }
+        }
+    }
+    if raw.perms {
+        let mut perms = Dict::new();
+        perms.insert("DocMDP", Object::Ref(sig));
+        catalog.insert("Perms", Object::Dict(perms));
+    }
+    store.set(root, Object::Dict(catalog)).unwrap();
+    let mut pdf = store
+        .save_incremental(&IncrementalOptions::default())
+        .unwrap();
+    for (from, to) in &raw.renames {
+        assert_eq!(from.len(), to.len(), "a rename keeps the offsets");
+        let at = pdf
+            .windows(from.len())
+            .rposition(|w| w == *from)
+            .unwrap_or_else(|| panic!("{} is not written", String::from_utf8_lossy(from)));
+        pdf[at..at + to.len()].copy_from_slice(to);
+    }
+
+    // §12.8.1: patch /ByteRange around the /Contents token, then digest and sign.
+    let token = format!("<{}>", "0".repeat(RESERVE * 2));
+    let a = pdf
+        .windows(token.len())
+        .rposition(|w| w == token.as_bytes())
+        .unwrap();
+    let b = a + token.len();
+    let at = pdf
+        .windows(placeholder.len())
+        .rposition(|w| w == placeholder)
+        .unwrap();
+    let text = format!("[0 {a} {b} {}", pdf.len() - b);
+    let mut patched = text.into_bytes();
+    patched.resize(placeholder.len() - 1, b' ');
+    patched.push(b']');
+    pdf[at..at + placeholder.len()].copy_from_slice(&patched);
+    let digest = DigestAlgorithm::Sha256;
+    let document_digest = digest.digest(&[&pdf[..a], &pdf[b..]]);
+    let chain = signer.certificate_chain().to_vec();
+    let signed_attrs = cms::build_signed_attrs(&SignedAttrsInput {
+        digest,
+        document_digest: &document_digest,
+        signer_cert_der: &chain[0],
+    })
+    .unwrap();
+    let value = signer.sign(digest, &signed_attrs).unwrap();
+    let der = cms::assemble(
+        &signed_attrs,
+        &value,
+        &chain,
+        signer.algorithm(),
+        signer.key_kind(),
+        digest,
+    )
+    .unwrap();
+    let hex: String = der.iter().map(|byte| format!("{byte:02X}")).collect();
+    pdf[a + 1..a + 1 + hex.len()].copy_from_slice(hex.as_bytes());
+    pdf
 }

@@ -17,6 +17,8 @@ folioxide-model = { path = "../crates/folioxide-model" }
 folioxide-sign = { path = "../crates/folioxide-sign" }
 # `exercise` (open, resolve, decode, page count) for fuzz_parse_document. Test support only.
 folioxide-testkit = { path = "../crates/folioxide-testkit" }
+# fuzz_jpeg_header (M4 WP4.1A).
+folioxide-content = { path = "../crates/folioxide-content" }
 
 # An empty workspace table keeps this crate out of the root workspace (which also lists it under
 # `exclude`), so `cargo test --workspace` never needs nightly or libFuzzer.
@@ -60,6 +62,20 @@ bench = false
 [[bin]]
 name = "fuzz_verify"
 path = "fuzz_targets/fuzz_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_jpeg_header"
+path = "fuzz_targets/fuzz_jpeg_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tsp_parse"
+path = "fuzz_targets/fuzz_tsp_parse.rs"
 test = false
 doc = false
 bench = false

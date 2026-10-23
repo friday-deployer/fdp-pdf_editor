@@ -178,7 +178,7 @@ fn parse_signer_info(cms: &[u8], element: &Element, depth: usize) -> Result<Pars
         tlv::octet_string_value(cms, &signature_element, depth + 1, MAX_DEPTH).map_err(from_tlv)?;
     let unsigned_attrs = match fields.optional(TAG_CONTEXT_1)? {
         Some(attrs) => {
-            check_attributes(cms, &attrs, depth + 1)?;
+            check_unsigned_attributes(cms, &attrs, depth + 1)?;
             Some(attrs.raw(cms).to_vec())
         }
         None => None,
@@ -203,16 +203,125 @@ fn check_attributes(cms: &[u8], set: &Element, depth: usize) -> Result<()> {
         if count >= MAX_ATTRIBUTES {
             return Err(limit(format!("more than {MAX_ATTRIBUTES} attributes")));
         }
-        let attribute = attribute.map_err(from_tlv)?;
-        if attribute.tag != TAG_SEQUENCE {
-            return Err(malformed("an attribute is not a SEQUENCE"));
-        }
-        let mut fields = Fields::new(cms, &attribute, depth + 1);
-        fields.expect(TAG_OID, "attrType")?;
-        fields.expect(TAG_SET, "attrValues")?;
-        fields.finish()?;
+        check_attribute(cms, attribute, depth)?;
     }
     Ok(())
+}
+
+/// [`check_attributes`] for `unsignedAttrs`, which are not signed and which anyone can change
+/// (RFC 5652 §5.3; M4 brief §0.3): only the first [`MAX_ATTRIBUTES`] attributes are checked
+/// and read, and more are not an error (M4 QA round 1 finding F10). The verifier warns about
+/// the rest ([`unsigned_attributes_beyond_limit`]).
+fn check_unsigned_attributes(cms: &[u8], set: &Element, depth: usize) -> Result<()> {
+    for attribute in tlv::children(cms, set, depth, MAX_DEPTH).take(MAX_ATTRIBUTES) {
+        check_attribute(cms, attribute, depth)?;
+    }
+    Ok(())
+}
+
+/// One `Attribute ::= SEQUENCE { attrType OID, attrValues SET }` of a set read at `depth`.
+fn check_attribute(
+    cms: &[u8],
+    attribute: std::result::Result<Element, TlvError>,
+    depth: usize,
+) -> Result<()> {
+    let attribute = attribute.map_err(from_tlv)?;
+    if attribute.tag != TAG_SEQUENCE {
+        return Err(malformed("an attribute is not a SEQUENCE"));
+    }
+    let mut fields = Fields::new(cms, &attribute, depth + 1);
+    fields.expect(TAG_OID, "attrType")?;
+    fields.expect(TAG_SET, "attrValues")?;
+    fields.finish()
+}
+
+/// Whether the raw `unsignedAttrs` element `raw` holds more than [`MAX_ATTRIBUTES`] attributes,
+/// so that the ones after the limit were not read (finding F10).
+pub(crate) fn unsigned_attributes_beyond_limit(raw: &[u8]) -> bool {
+    let Ok(set) = tlv::read_exact(raw, MAX_DEPTH) else {
+        return false;
+    };
+    tlv::children(raw, &set, 0, MAX_DEPTH)
+        .nth(MAX_ATTRIBUTES)
+        .is_some()
+}
+
+/// The most `digestAlgorithms` members [`signed_data_layout`] accepts.
+pub(crate) const MAX_DIGEST_ALGORITHMS: usize = 16;
+
+/// What [`parse`] skips in a `SignedData` (RFC 5652 §5.1), as byte ranges into the parsed
+/// input, for the whitelist checks of a timestamp token (M4 QA round 1 findings F5, F6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SignedDataLayout {
+    /// The content octets of `version`.
+    pub version: Vec<u8>,
+    /// Every `digestAlgorithms` member, whole.
+    pub digest_algorithms: Vec<std::ops::Range<usize>>,
+    /// Every `CertificateChoices` element of `certificates [0]`, whole, with its first
+    /// identifier octet.
+    pub certificate_choices: Vec<(u8, std::ops::Range<usize>)>,
+    /// Every `RevocationInfoChoice` element of `crls [1]`, whole, with its first identifier
+    /// octet.
+    pub crls: Vec<(u8, std::ops::Range<usize>)>,
+}
+
+/// The [`SignedDataLayout`] of the ContentInfo(SignedData) at the start of `cms`.
+///
+/// # Errors
+/// As [`parse`], and `LimitExceeded` beyond [`MAX_DIGEST_ALGORITHMS`] digest algorithms or
+/// [`MAX_CERTIFICATES`] certificates or CRLs.
+pub(crate) fn signed_data_layout(cms: &[u8]) -> Result<SignedDataLayout> {
+    let content_info = tlv::read(cms, 0, cms.len(), 0, MAX_DEPTH).map_err(from_tlv)?;
+    let mut fields = Fields::new(cms, &content_info, 0);
+    if oid_string(cms, &fields.expect(TAG_OID, "contentType")?)? != oid::ID_SIGNED_DATA {
+        return Err(malformed("the ContentInfo is not SignedData"));
+    }
+    let explicit = fields.expect(TAG_CONTEXT_0, "content [0]")?;
+    let signed_data = Fields::new(cms, &explicit, 1).expect(TAG_SEQUENCE, "SignedData")?;
+    let depth = 2;
+    let mut fields = Fields::new(cms, &signed_data, depth);
+    let version = fields
+        .expect(TAG_INTEGER, "SignedData.version")?
+        .content(cms)
+        .to_vec();
+    let digest_set = fields.expect(TAG_SET, "digestAlgorithms")?;
+    let digest_algorithms = tlv::children_vec(
+        cms,
+        &digest_set,
+        depth + 1,
+        MAX_DEPTH,
+        MAX_DIGEST_ALGORITHMS,
+    )
+    .map_err(|_| {
+        limit(format!(
+            "more than {MAX_DIGEST_ALGORITHMS} digest algorithms"
+        ))
+    })?
+    .iter()
+    .map(|element| element.start..element.end)
+    .collect();
+    fields.expect(TAG_SEQUENCE, "encapContentInfo")?;
+    let mut choices = |tag: u8| -> Result<Vec<(u8, std::ops::Range<usize>)>> {
+        let Some(set) = fields.optional(tag)? else {
+            return Ok(Vec::new());
+        };
+        tlv::children_vec(cms, &set, depth + 1, MAX_DEPTH, MAX_CERTIFICATES)
+            .map_err(|_| limit(format!("more than {MAX_CERTIFICATES} certificates or CRLs")))
+            .map(|elements| {
+                elements
+                    .iter()
+                    .map(|element| (element.tag, element.start..element.end))
+                    .collect()
+            })
+    };
+    let certificate_choices = choices(TAG_CONTEXT_0)?;
+    let crls = choices(TAG_CONTEXT_1)?;
+    Ok(SignedDataLayout {
+        version,
+        digest_algorithms,
+        certificate_choices,
+        crls,
+    })
 }
 
 /// The attributes of a raw `signedAttrs`/`unsignedAttrs` element: `(attrType content octets,
@@ -405,6 +514,54 @@ mod tests {
         ];
         ci.extend([0u8; 16]);
         assert_eq!(parse(&ci).unwrap().raw, 0..13);
+    }
+
+    #[test]
+    fn unsigned_attributes_beyond_the_limit_are_counted() {
+        let attribute = tlv::tlv(TAG_SEQUENCE, &[0x06, 0x01, 0x2A, 0x31, 0x00]);
+        let set = |n: usize| tlv::tlv(TAG_CONTEXT_1, &attribute.repeat(n));
+        assert!(!unsigned_attributes_beyond_limit(&set(MAX_ATTRIBUTES)));
+        assert!(unsigned_attributes_beyond_limit(&set(MAX_ATTRIBUTES + 1)));
+        assert!(!unsigned_attributes_beyond_limit(b"garbage"));
+    }
+
+    #[test]
+    fn signed_data_layout_reads_what_parse_skips() {
+        // ContentInfo { signedData, [0] { SignedData { version, digestAlgorithms, encap,
+        //   certificates [0], signerInfos } } } with `n` digest algorithms.
+        let signed_data = |n: usize| {
+            let sha256 = tlv::tlv(TAG_SEQUENCE, &[0x06, 0x01, 0x2A]);
+            let encap = tlv::tlv(TAG_SEQUENCE, &[0x06, 0x01, 0x2A]);
+            let certs = tlv::tlv(TAG_CONTEXT_0, &[0x30, 0x00, 0xA1, 0x00]);
+            let body = tlv::tlv_parts(
+                TAG_SEQUENCE,
+                &[
+                    &[0x02, 0x01, 0x03],
+                    &tlv::tlv(TAG_SET, &sha256.repeat(n)),
+                    &encap,
+                    &certs,
+                    &tlv::tlv(TAG_SET, &[]),
+                ],
+            );
+            let oid = [
+                0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02,
+            ];
+            tlv::tlv_parts(TAG_SEQUENCE, &[&oid, &tlv::tlv(TAG_CONTEXT_0, &body)])
+        };
+        let cms = signed_data(2);
+        let layout = signed_data_layout(&cms).unwrap();
+        assert_eq!(layout.version, [3]);
+        assert_eq!(layout.digest_algorithms.len(), 2);
+        let tags: Vec<u8> = layout.certificate_choices.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags, [TAG_SEQUENCE, TAG_CONTEXT_1]);
+        assert!(layout.crls.is_empty());
+        let err = signed_data_layout(&signed_data(MAX_DIGEST_ALGORITHMS + 1)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        let id_data = [
+            0x30, 0x0B, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01,
+        ];
+        assert!(signed_data_layout(&id_data).is_err());
+        assert!(signed_data_layout(b"garbage").is_err());
     }
 
     #[test]

@@ -16,8 +16,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - [`Error::Syntax`]: opening, parsing, editing or writing a document (the syntax and model
 ///   layers' [`SyntaxError`](crate::SyntaxError)).
 /// - [`Error::Sign`] (feature `signatures`): key loading, signing and verification
-///   ([`sign::Error`](folioxide_sign::Error)). A signing error that wraps a syntax error is
-///   converted to [`Error::Syntax`], so the same failure always has the same variant.
+///   ([`sign::Error`](folioxide_sign::Error)), timestamps
+///   ([`ErrorCode::TimestampInvalid`]: a TSA refused the request, its response failed a
+///   check, or the [`Timestamper`](crate::Timestamper) could not reach it) and certification
+///   ([`ErrorCode::DocMdpForbids`]: the DocMDP permissions of a certified document forbid the
+///   signature). A signing error that wraps a syntax error is converted to [`Error::Syntax`],
+///   so the same failure always has the same variant.
+///
+/// The content layer ([`content`](crate::content): fonts, images, content streams) reports
+/// syntax-layer errors, so an unreadable image is an [`Error::Syntax`] with
+/// [`ErrorCode::Image`].
 ///
 /// `Display` and `source()` are the wrapped error's. Match on [`Error::code`] for a stable
 /// category; the enum is `#[non_exhaustive]` and gains a variant per error-bearing layer.
@@ -146,6 +154,11 @@ mod tests {
                 SignError::DocMdpForbids("d".into()),
                 ErrorCode::DocMdpForbids,
             ),
+            // M4.
+            (
+                SignError::TimestampInvalid("TSA refused: status 2".into()),
+                ErrorCode::TimestampInvalid,
+            ),
         ];
         for (inner, code) in cases {
             let message = inner.to_string();
@@ -164,6 +177,58 @@ mod tests {
         assert!(matches!(err, Error::Syntax(_)), "{err:?}");
         assert_eq!(err.code(), ErrorCode::Xref);
         assert_eq!(err.to_string(), "no xref");
+    }
+
+    /// Content-layer errors (M4: JPEG headers for visible signatures) are syntax errors with
+    /// their own codes.
+    #[test]
+    fn content_errors_are_syntax_errors_with_their_code() {
+        let err =
+            Error::from(folioxide_content::image::jpeg::parse_header(b"not a JPEG").unwrap_err());
+        assert!(matches!(err, Error::Syntax(_)), "{err:?}");
+        assert_eq!(err.code(), ErrorCode::Image);
+    }
+
+    /// The M4 signing refusals reach the facade with their codes: an invalid timestamp
+    /// response, and a DocMDP refusal on a document certified with `P = 1`.
+    #[cfg(feature = "signatures")]
+    #[test]
+    fn m4_signing_errors_keep_their_codes() {
+        use folioxide_sign::bt::TimestampParams;
+        use folioxide_sign::docmdp::DocMdpPermissions;
+        use folioxide_sign::sign::{SignRequest, sign};
+        use folioxide_sign::signer::LocalSigner;
+
+        let signer = LocalSigner::from_pem(
+            include_str!("../../../fixtures/pki/signer-p256.key.pem"),
+            include_str!("../../../fixtures/pki/signer-p256.pem"),
+            None,
+        )
+        .unwrap();
+        let time = folioxide_model::PdfDate::parse(b"D:20261010120000Z").unwrap();
+        let open = |pdf: Vec<u8>| {
+            folioxide_model::Document::open(pdf, &folioxide_syntax::OpenOptions::default()).unwrap()
+        };
+        let minimal = folioxide_testkit::fixtures::syntax::minimal();
+
+        // A TSA that answers with garbage.
+        let tsa = |_: &[u8]| -> folioxide_sign::Result<Vec<u8>> { Ok(b"garbage".to_vec()) };
+        let params = TimestampParams::new().with_nonce(Some(7));
+        let request = SignRequest::new(&signer, time).with_timestamper(&tsa, params);
+        let err = Error::from(sign(&open(minimal.clone()), &request).unwrap_err());
+        assert_eq!(err.code(), ErrorCode::TimestampInvalid, "{err}");
+        assert!(matches!(err, Error::Sign(_)));
+
+        // P = 1 forbids any later signature.
+        let request = SignRequest::new(&signer, time);
+        let options = request
+            .options
+            .clone()
+            .with_certification(Some(DocMdpPermissions::NoChanges));
+        let certified = sign(&open(minimal), &request.with_options(options)).unwrap();
+        let err =
+            Error::from(sign(&open(certified), &SignRequest::new(&signer, time)).unwrap_err());
+        assert_eq!(err.code(), ErrorCode::DocMdpForbids, "{err}");
     }
 
     #[test]

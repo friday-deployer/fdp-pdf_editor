@@ -10,7 +10,7 @@ and the acceptance criteria for each milestone follow it.
 | M1 | Syntax layer, read path | ✅ done |
 | M2 | Writers, document model v1, Node open/save | ✅ done |
 | M3 | Signatures I: PAdES B-B, external signing, verification | ✅ done |
-| M4 | Signatures II: B-T timestamps, certification, visible signatures | ⏳ in progress |
+| M4 | Signatures II: B-T timestamps, certification, visible signatures | ✅ done |
 | M5 | Encryption ∥ page operations | pending |
 | M6 | Document structure ∥ optimization | pending |
 | M7 | Content creation (text, fonts, images, shapes, watermarks) | pending |
@@ -302,6 +302,20 @@ Rendering and extraction come later.
    - `pdftoppm` probe shows the fill color in each region
    - `pdfimages` re-extracted images have black pixels in the region
 3. Oracle suite `edit`: `pdftotext` shows the new text and not the old; `pdffonts` still valid.
+
+## Verification-hardening backlog (from the M4 QA gate)
+Items the M4 adversarial pass and the expert deferred: new mechanism classes that were not reproduced Blockers (manager rulings R-25 and R-28), probes of viewers that are not installed here (R-16), and refinements of rules that fail closed today. Each row names where the item is recorded. The manager adds rows; the next milestone that touches the named code picks them up.
+
+| Item | What remains | Record |
+|---|---|---|
+| pypdfium2 probe of the `/Size` rule | The R-26 rule rests on the expert's recollection that PDFium shrinks its object table to the newest `/Size` (`ShrinkObjectMap`); PDFium is not installed. Probe `parser_trailer_size_shrunk`, `_off_by_one` and `_over_declared_*` with pypdfium2, and relax the rule if PDFium keeps the objects. | M4 brief §9; D14 |
+| Trust-anchor extensions | Anchors are trusted as given (RFC 5280 §6.1.1 (d), pyHanko parity). OpenSSL's `check_chain_extensions` also checks the anchor, so `openssl ts -verify` refuses a token whose anchor has a critical extension OpenSSL does not handle (or is not a CA), while Folioxide trusts it. Decide whether to model OpenSSL there (stricter than pyHanko). | Node README (`trusted`); D14 |
+| Signing-time warning for TSA paths that cannot become trusted | A well-formed RFC 3779 block or `proxyCertInfo` on a TSA path makes the token untrusted at verification (stricter than pyHanko), yet `signPdf` embeds such a token without a warning (closing round, nit 9). Warn in `validate_response`. | D14 |
+| Acrobat `/F 28` sticky notes | New Text annotations with NoZoom or NoRotate are `other` (A3, R-2), and Acrobat is believed to write `/F 28`. Get an Acrobat-made sample and render-probe such notes, with an `/AP`, on an upright page at several zoom levels. Then the manager decides whether D-1 may admit them. | M4 brief §0.2; D14 |
+| Document timestamps under P = 1, stricter variant | A timestamp's window is judged under the P in force for markup annotations only. So under a P = 1 certification, a form fill after a timestamp reports `formFilling` with `docmdp_ok` `None` (pyHanko parity; the certification's own report shows `false`). Reporting such a timestamp entry as `other` is stricter and safe, if the manager prefers that to parity (at the latest with LTA in M11). | M4 brief §0.3; D14 |
+| Finer single-precision bound | The 2^20 amplification bound (reach × scale onto the `/Rect`) refuses some placements PDFium gets right, such as a 1-unit `/BBox` translated by 10^4 to 5·10^4 (ours `other`, pyHanko `formFilling`, 0 px outside; closing round, nit 4). Model PDFium's error as \|mapped left\| × scale instead. | M4 brief §0.1; D14 |
+| pdf.js rebuild | pdf.js's `XRef.indexObjects` ends an object body at the word `xref` inside a line, so a fill value `see xref table` would hide later objects from such a rebuild. Folioxide's rules leave pdf.js nothing to rebuild for; probe it when pdf.js is available. | M4 brief §0.3 |
+| Viewers not installed | MuPDF, pdf.js, PDFium and Acrobat probes of the §0.3 residuals: the implicit NoZoom of Text annotations when zoomed out, the `/DR` fallback, the JavaScript calculate, format and validate actions, and shared `/Annots` arrays. | M4 brief §0.3, §9 |
 
 ## M11 and later (unordered backlog)
 - **Rendering:** `folioxide-render` on hayro 0.8 → RGBA and PNG, `render(page, dpi)`; oracle comparison with `pdftoppm` (PSNR threshold); image extraction.

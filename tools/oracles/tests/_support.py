@@ -62,14 +62,16 @@ def load_signer(name: str) -> Any:
     return signer
 
 
-def dummy_tsa(identity: str = "tsa") -> Any:
-    """An in-process RFC 3161 TSA backed by ``fixtures/pki/<identity>.pem`` (no network)."""
+def dummy_tsa(identity: str = "tsa", key: str | None = None) -> Any:
+    """An in-process RFC 3161 TSA backed by ``fixtures/pki/<identity>.pem`` and its key
+    (``<key>.key.pem``, default ``<identity>.key.pem``; the TSA certificate variants share
+    ``tsa.key.pem``) (no network)."""
     from pyhanko.keys import load_cert_from_pemder, load_private_key_from_pemder
     from pyhanko.sign.timestamps.dummy_client import DummyTimeStamper
 
     return DummyTimeStamper(
         tsa_cert=load_cert_from_pemder(str(PKI / f"{identity}.pem")),
-        tsa_key=load_private_key_from_pemder(str(PKI / f"{identity}.key.pem"), passphrase=None),
+        tsa_key=load_private_key_from_pemder(str(PKI / f"{key or identity}.key.pem"), passphrase=None),
     )
 
 
@@ -80,8 +82,10 @@ def sign(
     field: str = "Signature1",
     pades: bool = True,
     timestamp: bool = False,
+    tsa: str = "tsa",
 ) -> bytes:
-    """Append a signature revision to ``data`` with pyHanko."""
+    """Append a signature revision to ``data`` with pyHanko (with ``timestamp``, a signature
+    timestamp from the TSA certificate ``tsa``, which uses ``tsa.key.pem``)."""
     from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
     from pyhanko.sign import fields, signers
 
@@ -91,7 +95,7 @@ def sign(
     )
     writer = IncrementalPdfFileWriter(io.BytesIO(data))
     out = signers.sign_pdf(writer, meta, signer=load_signer(signer),
-                           timestamper=dummy_tsa() if timestamp else None)
+                           timestamper=dummy_tsa(tsa, key="tsa") if timestamp else None)
     return out.getvalue()
 
 

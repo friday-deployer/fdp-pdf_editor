@@ -70,4 +70,13 @@ A milestone may only be committed with zero open Blockers/Majors.
 - **M3:** security classifiers (for example "what changed after signing") must be **whitelist-based** from day one. Emulating a reference validator rule by rule produced a new bypass in every QA round, and so did "safe" exceptions such as `/DA` added when fields have appearances. Each stricter-than-reference result gets a corpus case and a deliberate-difference row, so the oracle keeps confirming it.
 - **M3:** expert design briefs that fix the reference behaviour up front (pyHanko) paid off. The QA rounds found policy gaps, not misunderstandings.
 - **M3:** adversarial reviewers sometimes stop partway (a safety filter on attack-crafting). The manager then runs the gates and an end-to-end check personally, and schedules the missing pass for the next milestone's QA.
-
+- **M4:** an open-ended adversarial pass does not converge by itself. Five rounds over about 2,000 crafted files found a new mechanism class each time. What closed it:
+  - **Close a whole class by design.** The canonical-input gate (only unambiguous syntax may earn a level below `Other`) and the rebuild-proof update rules each closed an entire class of differentials, where per-variant fixes kept missing spellings.
+  - **Define the closure criterion before the gate starts.** Saved variants are re-run, every fix gets targeted variants, new exploration is capped, and new classes that are not reproduced go to a tracked backlog (R-25, R-28). Future briefs state this criterion up front.
+- **M4:** issue manager rulings as one numbered file (`R-n`) that every agent reads, rather than editing prompts. The rulings survive restarts and replays, keep the developers and QA consistent, and become the source of the decision log.
+- **M4:** long workflows must survive container restarts.
+  - Keep variant generators and `run_all.sh` scripts on disk, so a later round re-checks every earlier variant.
+  - Resume workflows from their journal.
+  - Have each fix agent commit when it finishes. If a restart leaves uncommitted work, add a restart note to the rulings so the resumed developer reviews the diff instead of discarding it.
+- **M4:** disk. Incremental compilation grew a worktree target to more than 13 GB. Agents build with `CARGO_INCREMENTAL=0` and one shared QA target, and the manager cleans scratch builds between rounds.
+- **M4:** a security fix can introduce an availability bug (a quadratic rebuild-text scan). Every scanner over attacker-controlled bytes gets a multi-megabyte step-budget test.

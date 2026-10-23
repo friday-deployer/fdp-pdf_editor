@@ -1,5 +1,6 @@
 //! The verification report (M3 brief §3.2, DECISIONS D10 D-4): [`SignatureReport`] and its enums
-//! [`SignatureKind`], [`Coverage`], [`ModificationLevel`] and [`PadesLevel`].
+//! [`SignatureKind`], [`Coverage`], [`ModificationLevel`] and [`PadesLevel`], and the
+//! [`TimestampInfo`] of an RFC 3161 timestamp token (M4 brief §3.3).
 //!
 //! [`Coverage`] and [`ModificationLevel`] mirror pyHanko's `SignatureCoverageLevel` and
 //! `ModificationLevel` one to one, so that a report can be compared with the reference validator
@@ -147,7 +148,8 @@ impl fmt::Display for ModificationLevel {
     }
 }
 
-/// The PAdES baseline level a signature meets (ETSI EN 319 142-1 §6; brief §4.6, §5 V8).
+/// The PAdES baseline level a signature meets (ETSI EN 319 142-1 §6; M3 brief §4.6, §5 V8; M4
+/// brief §4.8, §5 V8), ordered `BB < BT`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -155,15 +157,82 @@ pub enum PadesLevel {
     /// PAdES-B-B: basic signature. With the `serde` feature, `"B-B"`.
     #[cfg_attr(feature = "serde", serde(rename = "B-B"))]
     BB,
+    /// PAdES-B-T: B-B plus a signature timestamp whose selected token is intact and valid (M4
+    /// brief §5 V8); its TSA need not be trusted (see
+    /// [`TimestampInfo::trusted`]). With the `serde` feature, `"B-T"`.
+    #[cfg_attr(feature = "serde", serde(rename = "B-T"))]
+    BT,
 }
 
 impl PadesLevel {
-    /// `"B-B"`.
+    /// `"B-B"` or `"B-T"`.
     pub const fn as_str(self) -> &'static str {
         match self {
             PadesLevel::BB => "B-B",
+            PadesLevel::BT => "B-T",
         }
     }
+}
+
+/// One verified RFC 3161 timestamp token (M4 brief §3.3, §5 V7b and V7c): a signature
+/// timestamp of a signature's SignerInfo, or the token of a document timestamp.
+///
+/// `intact`, `valid` and `trusted` use pyHanko 0.37's `timestamp_validity` vocabulary; `valid`
+/// is stricter where the TSA certificate is unsuitable (M4 brief §0.1). The token's problems
+/// stay here, so a broken signature timestamp token never makes the signature itself invalid
+/// (DECISIONS D13 D-6). The unsigned attribute that holds it is part of the SignerInfo's syntax
+/// (RFC 5652 §5.3), though: one that is not a well-formed `Attribute` (its values not a `SET`,
+/// or none) makes the whole CMS malformed (`CmsMalformed`), as for pyHanko, which cannot read
+/// such a file either (M4 QA round 4 finding 6).
+///
+/// With the `serde` feature its fields are `camelCase` (`genTime`, `serialHex`,
+/// `accuracyMicros`, `imprintAlgorithm`, ...).
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
+pub struct TimestampInfo {
+    /// The token's `genTime` as RFC 3339 UTC, with as many fraction digits as the token has,
+    /// for example `"2026-10-11T03:51:41.825589Z"`.
+    ///
+    /// **It means something only when [`trusted`](Self::trusted) is `Some(true)`** (M4 brief
+    /// §0.3): an untrusted TSA can put any time in a token, and unsigned attributes can be
+    /// replaced or removed after signing. Trusted is judged at the validation time; without
+    /// one, at this `genTime` itself, which a retired TSA key can still backdate (see
+    /// [`VerifyOptions::validation_time`](crate::verify_pdf::VerifyOptions::validation_time)).
+    pub gen_time: String,
+    /// The TSA certificate (the token's signer), when found.
+    pub tsa: Option<CertificateInfo>,
+    /// The TSTInfo `tsa` name as RFC 4514 text, when it is a `directoryName`.
+    pub tsa_name: Option<String>,
+    /// The TSA policy, a dotted OID.
+    pub policy: Option<String>,
+    /// The serial number in uppercase hexadecimal.
+    pub serial_hex: Option<String>,
+    /// The TSTInfo `accuracy` in microseconds, when present.
+    pub accuracy_micros: Option<u64>,
+    /// The TSTInfo `ordering` flag.
+    pub ordering: bool,
+    /// The `messageImprint` digest algorithm, for example `"sha256"`.
+    pub imprint_algorithm: Option<String>,
+    /// The TSA's signature algorithm, for example `"sha256WithRSAEncryption"`.
+    pub signature_algorithm: Option<String>,
+    /// The `messageImprint` is the digest of the timestamped data (the signature value, or the
+    /// signed byte ranges of a document timestamp).
+    pub intact: bool,
+    /// The TSA's CMS signature verifies, the ESS signing-certificate attribute matches, the TSA
+    /// certificate is suitable for timestamping and valid at `genTime`.
+    pub valid: bool,
+    /// Whether the TSA certificate chains to a trust anchor (the timestamp trust anchors, else
+    /// the signature's), for a token that is intact and valid; `None` without anchors.
+    pub trusted: Option<bool>,
+    /// Why the token is not intact or not valid; empty when nothing is wrong.
+    pub problems: Vec<Problem>,
+    /// Observations that do not make the token invalid.
+    pub warnings: Vec<String>,
 }
 
 /// The verification result of one signature dictionary (brief §3.2; ARCHITECTURE §A.6.7).
@@ -209,7 +278,32 @@ pub struct SignatureReport {
     /// The index (into the revisions, oldest first) of the revision the signature covers, for
     /// [`Coverage::EntireFile`] and [`Coverage::EntireRevision`].
     pub signed_revision: Option<usize>,
-    /// What later revisions changed.
+    /// What later revisions changed (brief §5 V10), in pyHanko's vocabulary.
+    ///
+    /// [`ModificationLevel::Other`] also marks a file that a reader rebuilding the
+    /// cross-reference data (poppler without a `startxref`, PDFium after a malformed entry)
+    /// could read differently, even when nothing visible changed (manager rulings R-17 to R-19
+    /// and R-26):
+    ///
+    /// - **the file's tail:** more than two bytes, or any byte other than CR and LF, after the
+    ///   final `%%EOF`, or a final `startxref` farther than 1,024 bytes from the end, makes
+    ///   every signature `Other`, the newest one too, even a single signature with nothing
+    ///   appended (a mail gateway that adds `\r\n` to a file ending `%%EOF\n` does this);
+    /// - **structure-like text:** inside a later revision's strings, streams, names or comments,
+    ///   an object header (`N G obj`) or `trailer <<` at the start of a line, at the start of a
+    ///   255-byte piece of a longer line or right after an `endobj`, or written as words
+    ///   anywhere; or `xref` or `startxref` at the start of a line or right after an `endobj`
+    ///   in a line, makes the earlier signatures `Other` (the scan fails closed, so a value such
+    ///   as `x endobj xref` is `Other`, while `see xref table` inside a line stays a fill);
+    /// - **new object streams:** one in an update written with a classic cross-reference table,
+    ///   or one whose members that revision's own section does not list at their index;
+    /// - **`/Size`:** a later revision's trailer (or cross-reference stream dictionary) whose
+    ///   `/Size` is not a direct integer above every object number the file lists, or is
+    ///   smaller than the previous revision's (PDFium drops the objects at or above it);
+    /// - **shared field appearances:** a field node of the signed revision (a non-terminal
+    ///   parent too) whose indirect `/AP` dictionary is named more than once makes every later
+    ///   revision above `None` `Other` (for an unsigned signature field, the revision that
+    ///   signs it).
     pub modification: ModificationLevel,
     /// The objects later revisions list, sorted (free entries included): at most
     /// [`MAX_CHANGED_OBJECTS`](crate::verify_pdf::MAX_CHANGED_OBJECTS) of them, the first by
@@ -239,12 +333,33 @@ pub struct SignatureReport {
     pub location: Option<String>,
     /// `/ContactInfo`.
     pub contact_info: Option<String>,
-    /// The PAdES baseline level the signature meets, if any.
+    /// The PAdES baseline level the signature meets, if any (M4 brief §5 V8). `B-T` says that
+    /// the selected signature timestamp token is intact and valid over this signature's value;
+    /// it does **not** say that its TSA is trusted (a valid token of an untrusted TSA, or one
+    /// verified without trust anchors, still gives `B-T`). Before relying on the time, also
+    /// require
+    /// [`timestamp`](Self::timestamp)`.trusted == Some(true)`.
     pub pades_level: Option<PadesLevel>,
-    /// For a certification signature, its DocMDP permissions `P` (1–3, §12.8.2.2); read only in
-    /// M3.
+    /// The selected timestamp token (M4 brief §5 V7b step 10): the earliest `genTime` among the
+    /// signature timestamps that are intact, valid and not untrusted, else the first one; for a
+    /// document timestamp, its own token. `None` without a token.
+    pub timestamp: Option<TimestampInfo>,
+    /// Every verified timestamp token, in attribute order (for a document timestamp, its own
+    /// token).
+    pub timestamps: Vec<TimestampInfo>,
+    /// The DocMDP permissions `P` (1–3) this signature sets for the document: a certification
+    /// signature's (`/TransformParams /P`, §12.8.2.2), or the `/P` of its field's lock
+    /// dictionary (§12.7.5.5, PDF 2.0), the stricter when both are present. `None` for an
+    /// approval signature without a lock `/P`, and for a declaration that cannot be read
+    /// (problem `DocMdpInvalid`; `P = 1` is then in force).
     pub docmdp: Option<u8>,
-    /// Whether the later revisions respect the DocMDP permissions; `None` until M4.
+    /// Whether the later revisions respect the DocMDP permissions in force for this signature
+    /// (M4 brief §5.3): the smallest of its own `P` ([`docmdp`](Self::docmdp), 1 when its
+    /// declaration cannot be read) and those of the earlier signatures that set permissions
+    /// (ISO 32000-2 §12.7.5.5: a field lock's `/P` cannot grant more than the permissions
+    /// already in effect), else 2. `None` for a
+    /// document timestamp, which has no DocMDP of its own (as in pyHanko; its integrity is
+    /// [`modification`](Self::modification)).
     pub docmdp_ok: Option<bool>,
     /// Why the signature is not valid; empty when nothing is wrong.
     pub problems: Vec<Problem>,
@@ -280,6 +395,8 @@ impl SignatureReport {
             location: None,
             contact_info: None,
             pades_level: None,
+            timestamp: None,
+            timestamps: Vec::new(),
             docmdp: None,
             docmdp_ok: None,
             problems: Vec::new(),
@@ -310,14 +427,37 @@ impl SignatureReport {
     }
 
     /// The fail-safe verdict for accepting the signed document: [`is_valid`](Self::is_valid),
-    /// and what was appended after the signed revision is at most `max_modification`.
+    /// what was appended after the signed revision is at most `max_modification`, **and** the
+    /// DocMDP permissions in force are respected: [`docmdp_ok`](Self::docmdp_ok) is not
+    /// `Some(false)` (M4 brief §3.3, DECISIONS D13 D-13). `docmdp_ok` is computed for every
+    /// signature from the permissions in force for it: the smallest of its own `P` (a
+    /// certification's, or its field's `/Lock /P`) and those of the earlier signatures that set
+    /// permissions (a field lock grants no more than a certification in force, ISO 32000-2
+    /// §12.7.5.5), else 2 (form filling and signing); a document timestamp's is `None`, which
+    /// does not refuse it. So a certification
+    /// with `P = 1` makes any change refuse the document, even an `/Info` change that
+    /// `max_modification` would allow (`P = 1` allows only re-listings, orphans, cross-reference
+    /// streams and document timestamps), and `Annotations` is acceptable only under `P = 3`
+    /// even when `max_modification` allows it. That refusal is the certification's own report:
+    /// a document timestamp's window is judged with the permissions in force only for markup
+    /// annotations (manager ruling R-20), so a timestamp after a `P = 1` certification that a
+    /// form fill, an `/Info` change or an approval signature follows reports `FormFilling` or
+    /// `LtaUpdates` with `docmdp_ok` `None`, as pyHanko does, and this returns `true` for it
+    /// (M4 final fix round 2, finding 3). Check every report, not only the newest.
     ///
     /// [`ModificationLevel::FormFilling`] accepts later signatures and filled signature fields
     /// (sequential signing), [`ModificationLevel::LtaUpdates`] only metadata and invisible
     /// signature fields, [`ModificationLevel::None`] nothing at all. Anything Folioxide cannot
     /// attribute to an allowed change is [`ModificationLevel::Other`], which no lower maximum
-    /// accepts. Trust is a separate question: also require `trusted == Some(true)` when the
-    /// signer must chain to a trust anchor.
+    /// accepts, and so is any change whose bytes readers read differently (M4 QA round 3,
+    /// manager ruling R-12): a dictionary key written twice, a number written with several
+    /// signs, an integer beyond ±(2³¹ − 1) or a real beyond ±3.403 × 10³⁸ (or longer than 40
+    /// characters), or a name with `#00`, in an object written after signing, in the signed copy
+    /// of an object a later revision changes, or in a page-tree object a rule consults. So is
+    /// a file that a reader rebuilding the cross-reference data could read differently
+    /// (manager rulings R-17 to R-19; see [`modification`](Self::modification)), even when
+    /// nothing visible changed. Trust is a separate question: also require
+    /// `trusted == Some(true)` when the signer must chain to a trust anchor.
     ///
     /// **`FormFilling` includes visible signature appearances added after signing**, which can
     /// cover signed content: a new visible signature field with an appearance stream (signed or
@@ -343,16 +483,58 @@ impl SignatureReport {
     /// viewers construct an appearance for), any `/Q` change, changing or removing a `/DR`
     /// resource name, and any other key.
     ///
+    /// **`FormFilling` includes filling the document's form fields** (M4 brief §5.1), by a
+    /// whitelist: a field's value `/V` (a direct string, array of strings or name of the field's
+    /// type), a check box's or radio button's appearance state `/AS` that the value selects
+    /// among the signed states, and a text or choice field's new appearance stream (or its
+    /// signed one rewritten) when its value changes; nothing else of the field or its widget may
+    /// change (no `/F`, `/DA`, `/Q`, `/Ff`, `/Rect`, ...), a ReadOnly field or a pushbutton may
+    /// not be filled, a widget that is a kid of its field may not change at all (as pyHanko),
+    /// and generic form filling is `Other` in a document with `/XFA` and for a signature with
+    /// FieldMDP (M11). Residual risk: a filled field shows any text the filler chooses inside
+    /// its widget's unchanged `/Rect`, and an opaque field can cover signed content beneath it
+    /// (inherent to forms; pyHanko and Acrobat allow it too).
+    ///
+    /// **`Annotations`** (M4 brief §5.2, D-1, the one level more lenient than pyHanko, which
+    /// reports `Other`): new markup annotations (`Text`, `FreeText`, `Line`, `Square`,
+    /// `Circle`, `Polygon`, `PolyLine`, the text markups, `Caret`, `Ink`, `Stamp`, and their
+    /// popups) appended to a page's `/Annots`, with no change to any existing annotation, after
+    /// an approval signature or a certification with `P = 3` only (after `P = 1` or `P = 2`
+    /// they are `Other`). Each is held to a whitelist that keeps what it draws inside its
+    /// `/Rect` (brief §5.2 A1–A7, manager ruling R-2): allowed keys only (no actions, optional
+    /// content or structure); annotation flags among Invisible, Print, ReadOnly, Locked and
+    /// LockedContents only (Hidden, NoZoom, NoRotate, NoView, ToggleNoView and the reserved
+    /// bits are `Other`); an appearance stream `/AP /N` of its own, a form XObject with a
+    /// `/BBox` (a popup excepted), so no viewer synthesizes one; its geometry (`/QuadPoints`,
+    /// `/InkList`, `/L` and leader lines, `/Vertices`, `/Path`, `/CL`, with `/RD`, `/BE` and the
+    /// border width) inside its `/Rect`; a `Text` annotation, which viewers draw upright and
+    /// unscaled at its `/Rect`'s corner (ISO 32000-2 §12.5.6.4), only on a page whose effective
+    /// `/Rotate` is 0; and only on a page every reader places the same way (manager ruling
+    /// R-13: reached once by the page tree's `/Kids`, with a `/Parent` chain that is the
+    /// reverse of that walk, in a tree where no page has `/Kids`). Residual risk: such an annotation can cover signed content inside
+    /// its `/Rect`, which is what a certification with `P = 3` grants, so `docmdp_ok` accepts
+    /// it only then; and a viewer that implements NoZoom draws a sticky note at its unscaled
+    /// size when zoomed out below 100 %, past its `/Rect` (brief §0.3; poppler does not).
+    ///
     /// What `FormFilling` still allows besides signature appearances, and its residual risk
     /// (pyHanko allows it too, at the same level): **new `/DR` resource names** (in `/Font
     /// /XObject /ColorSpace /ExtGState /Pattern /Shading /ProcSet`) that the signed revision
-    /// does not name. It names every name token of every default appearance string (`/DA`) of
-    /// the AcroForm, of its fields and widgets and of every annotation on every page (with the
-    /// `/DA` it inherits from its field), and of every appearance stream of those annotations
-    /// and widgets that has no `/Resources` of its own; when these cannot all be read within
-    /// the verifier's limits, no new name is allowed. Not read: names that a form XObject
-    /// nested in an appearance stream uses, and names that a viewer looks up in `/DR` after
-    /// failing to find them in an appearance stream's own `/Resources`.
+    /// does not name (brief §5.1 F7). It names every name token (decoded, and as written) of
+    /// every default appearance string (`/DA`) of the AcroForm, of its fields and widgets and
+    /// of every annotation on every page (with the `/DA` it inherits from its field), and of
+    /// every appearance stream of those annotations and widgets with every content stream it
+    /// draws, nested, whether or not a stream has resources of its own: form XObjects (their
+    /// `/Subtype` read through a reference too), tiling patterns, Type 3 glyph procedures, and
+    /// the soft-mask groups and Type 3 fonts of its graphics states; and, when such a stream has
+    /// no `/Resources` of its own or resources that lack a category (`/ExtGState /ColorSpace
+    /// /Pattern /Shading /XObject /Font /Properties`), what the resources of every page and
+    /// page-tree node draw, inherited along both each page's `/Parent` chain and the `/Kids` walk
+    /// from the catalog's `/Pages` (ISO 32000-2 §7.8.3, §7.7.3.4; M4 QA round 5, finding 29).
+    /// When these cannot all be read within the verifier's limits, or an object they are read
+    /// from does not read the same in every reader (ruling R-12), no new name is allowed. A
+    /// viewer that looks up in `/DR` a name an appearance stream and the page's resources lack
+    /// thus finds nothing new; names that only page content uses are not read, since viewers
+    /// resolve those in the page's resources, never in `/DR`.
     ///
     /// ```
     /// use folioxide_model::{Document, PdfDate};
@@ -391,7 +573,7 @@ impl SignatureReport {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn is_acceptable(&self, max_modification: ModificationLevel) -> bool {
-        self.is_valid() && self.modification <= max_modification
+        self.is_valid() && self.modification <= max_modification && self.docmdp_ok != Some(false)
     }
 
     /// Whether a problem with `code` was reported.
@@ -486,6 +668,27 @@ mod tests {
         assert!(!broken.is_acceptable(Other));
     }
 
+    /// D-13: `is_acceptable` requires `docmdp_ok != Some(false)`; `None` does not refuse.
+    #[test]
+    fn is_acceptable_requires_docmdp_ok() {
+        for (docmdp_ok, acceptable) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let mut report = good();
+            report.modification = ModificationLevel::LtaUpdates;
+            report.docmdp_ok = docmdp_ok;
+            assert_eq!(
+                report.is_acceptable(ModificationLevel::FormFilling),
+                acceptable,
+                "{docmdp_ok:?}"
+            );
+            // A permissive maximum does not override DocMDP.
+            assert_eq!(
+                report.is_acceptable(ModificationLevel::Other),
+                acceptable,
+                "{docmdp_ok:?}"
+            );
+        }
+    }
+
     #[test]
     fn modification_levels_are_ordered() {
         use ModificationLevel::*;
@@ -516,6 +719,16 @@ mod tests {
         assert_eq!(ModificationLevel::LtaUpdates.to_string(), "ltaUpdates");
         assert_eq!(SignatureKind::DocTimeStamp.as_str(), "docTimeStamp");
         assert_eq!(PadesLevel::BB.as_str(), "B-B");
+        assert_eq!(PadesLevel::BT.as_str(), "B-T");
+        assert!(PadesLevel::BB < PadesLevel::BT);
+    }
+
+    #[test]
+    fn a_new_report_has_no_timestamp() {
+        let report = SignatureReport::new(SignatureKind::Signature, ObjectId::new(1, 0));
+        assert_eq!(report.timestamp, None);
+        assert!(report.timestamps.is_empty());
+        assert_eq!(TimestampInfo::default().trusted, None);
     }
 
     #[cfg(feature = "serde")]
@@ -545,8 +758,53 @@ mod tests {
             "claimedTime",
             "contactInfo",
             "docmdpOk",
+            "timestamp",
+            "timestamps",
         ] {
             assert!(json.get(key).is_some(), "missing {key}: {json}");
+        }
+        let back: SignatureReport = serde_json::from_value(json).unwrap();
+        assert_eq!(back, report);
+
+        // M4: B-T and the timestamp fields.
+        let info = TimestampInfo {
+            gen_time: "2026-10-11T03:51:41.825589Z".into(),
+            policy: Some("1.2.3.4.1".into()),
+            serial_hex: Some("2A".into()),
+            accuracy_micros: Some(1_000_000),
+            imprint_algorithm: Some("sha256".into()),
+            intact: true,
+            valid: true,
+            trusted: Some(true),
+            ..TimestampInfo::default()
+        };
+        let mut report = good();
+        report.pades_level = Some(PadesLevel::BT);
+        report.timestamp = Some(info.clone());
+        report.timestamps = vec![info];
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["padesLevel"], "B-T");
+        assert_eq!(json["timestamp"]["genTime"], "2026-10-11T03:51:41.825589Z");
+        for key in [
+            "genTime",
+            "tsa",
+            "tsaName",
+            "policy",
+            "serialHex",
+            "accuracyMicros",
+            "ordering",
+            "imprintAlgorithm",
+            "signatureAlgorithm",
+            "intact",
+            "valid",
+            "trusted",
+            "problems",
+            "warnings",
+        ] {
+            assert!(
+                json["timestamps"][0].get(key).is_some(),
+                "missing {key}: {json}"
+            );
         }
         let back: SignatureReport = serde_json::from_value(json).unwrap();
         assert_eq!(back, report);

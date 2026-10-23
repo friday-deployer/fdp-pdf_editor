@@ -38,12 +38,19 @@
  * - `E_CERTIFICATE`: a certificate does not parse.
  * - `E_CRYPTO`: a cryptographic operation failed, or an external signer's `sign()` threw (the
  *   signer's error is the `cause`).
- * - `E_SIGNATURE_PLACEHOLDER_TOO_SMALL`: the CMS does not fit the `/Contents` placeholder;
- *   `details` is `{ needed, reserved }` (bytes of DER).
+ * - `E_SIGNATURE_PLACEHOLDER_TOO_SMALL`: the CMS (with its signature timestamp, if any) does
+ *   not fit the `/Contents` placeholder; `details` is `{ needed, reserved }` (bytes of DER).
  * - `E_SIGNATURE_INVALID`: a signature value or CMS does not verify with the signer
  *   certificate over the prepared bytes (another key, another digest).
- * - `E_DOC_MDP_FORBIDS`: the document is certified with permissions that forbid signing.
- * - `E_FONT`, `E_IMAGE`, `E_TIMESTAMP_INVALID`: fonts, images and timestamps (later releases).
+ * - `E_DOC_MDP_FORBIDS`: a certification rule refuses the signature (ISO 32000-2 §12.8.2.2): the
+ *   document is certified with `P = 1`; a certification that is not the first signature; a new
+ *   visible field on a certified document. The message names the rule.
+ * - `E_TIMESTAMP_INVALID`: an RFC 3161 timestamp could not be used: the TSA refused the request
+ *   (the message has its status and text), its response or token fails a check (the message names
+ *   it: the imprint, the nonce, the TSA's signature or certificate, …), or the `timestamp`
+ *   callback of {@link signPdf} threw (its error is the `cause`).
+ * - `E_IMAGE`: the image of a visible signature is not a JPEG this version reads.
+ * - `E_FONT`: fonts (later releases).
  * - `E_IO`: an I/O operation failed.
  * - `E_BUSY`: a synchronous method was called while an asynchronous one (`saveAsync`,
  *   `saveIncrementalAsync`, `prepareSignatureAsync`, `verifySignatures`) is using the document,
@@ -110,8 +117,10 @@ export declare class FolioxideError extends Error {
   readonly code: ErrorCode
   /**
    * Structured details, when there are any: `{ needed, reserved }` (numbers, bytes of DER) for
-   * `E_SIGNATURE_PLACEHOLDER_TOO_SMALL`; the napi status for an argument that the native addon
-   * could not convert (`{ status: 'NumberExpected' }`).
+   * `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` (thrown when preparing with too small a
+   * `contentsReserve`, or when finishing with a timestamp token larger than `tsaReserve`); the
+   * napi status for an argument that the native addon could not convert
+   * (`{ status: 'NumberExpected' }`).
    */
   readonly details?: Record<string, unknown>
 }
@@ -551,22 +560,29 @@ export declare class PdfDocument implements Disposable {
   saveIncrementalAsync(options?: IncrementalSaveOptions): Promise<Buffer>
 
   /**
-   * The first phase of signing: builds the incremental update that adds an invisible PAdES
-   * signature (the document's unsaved changes, the signature field and the signature dictionary
-   * with its placeholders), digests the signed byte ranges and builds the bytes to sign. The
-   * document is not changed.
+   * The first phase of signing: builds the incremental update that adds a PAdES signature (the
+   * document's unsaved changes, the signature field and its widget, invisible or drawn with
+   * `appearance`, and the signature dictionary with its placeholders and, with `certify`, its
+   * DocMDP reference), digests the signed byte ranges and builds the bytes to sign. The document
+   * is not changed.
    *
    * Sign {@link PreparedSignature.toBeSigned} (or its digest) with the key of the first
-   * certificate, then call {@link PreparedSignature.finish}. {@link signPdf} does all of it.
+   * certificate, then call {@link PreparedSignature.finish} (for B-T, after
+   * {@link PreparedSignature.timestampRequest}). {@link signPdf} does all of it.
    *
    * @throws {FolioxideError} `E_INVALID_ARGUMENT` for invalid options (an empty chain, an
    *   algorithm that does not match the certificate, a signing time that is not a date, a field
-   *   name with a `.`, …); `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` (with `details.needed`) for a
+   *   name with a `.`, a `certify` other than 1, 2 or 3, an appearance rectangle without an area
+   *   or off the page, …); `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` (with `details.needed`) for a
    *   `contentsReserve` below what the signature needs; `E_UNSUPPORTED` when opening repaired
-   *   the file's structure or the file has bytes before its header (save it in full first);
-   *   `E_DOC_MDP_FORBIDS` for a certified document that allows no changes;
-   *   `E_PAGE_OUT_OF_RANGE`, `E_NOT_FOUND` (an existing field asked for), `E_CERTIFICATE`;
-   *   `E_BUSY`, `E_CLOSED`.
+   *   the file's structure or the file has bytes before its header (save it in full first), for
+   *   a JPEG this version does not embed (CMYK), or for a signer certificate whose key is
+   *   restricted to RSASSA-PSS (`id-RSASSA-PSS`, RFC 4055: Folioxide signs RSA with PKCS #1
+   *   v1.5, which no verifier accepts with such a key); `E_IMAGE` for an appearance image that
+   *   is not a JPEG; `E_DOC_MDP_FORBIDS` when a certification rule refuses the signature (a document
+   *   certified with `P = 1`, a certification that is not the first signature, a new visible field
+   *   on a certified document); `E_PAGE_OUT_OF_RANGE`, `E_NOT_FOUND` (an existing field asked
+   *   for), `E_CERTIFICATE`; `E_BUSY`, `E_CLOSED`.
    */
   prepareSignature(options: PrepareSignatureOptions): PreparedSignature
 
@@ -590,7 +606,9 @@ export declare class PdfDocument implements Disposable {
    * ```
    *
    * @throws {FolioxideError} `E_INVALID_ARGUMENT` when the document has unsaved changes (verify
-   *   the saved file) or an option is invalid; `E_CLOSED`.
+   *   the saved file) or an option is invalid; `E_XREF` when a trailer or cross-reference stream
+   *   gives `/Prev` or `/XRefStm` twice with different values, so other readers may follow a
+   *   revision chain (and see signatures) this one does not; `E_CLOSED`.
    */
   verifySignatures(options?: VerifyOptions): Promise<SignatureReport[]>
 }
@@ -622,7 +640,10 @@ export type SubFilter = 'ETSI.CAdES.detached' | 'adbe.pkcs7.detached'
  */
 export type FieldMode = 'createOrUse' | 'existingOnly' | 'createOnly'
 
-/** Which signature field to sign or create. New fields are invisible (a zero-size widget). */
+/**
+ * Which signature field to sign or create. New fields are invisible (a zero-size widget) unless
+ * the options have an `appearance`.
+ */
 export interface SignatureFieldSpec {
   /**
    * The field name: an existing field's fully qualified name, or a new field's partial name
@@ -666,11 +687,107 @@ export interface PrepareSignatureOptions {
   contactInfo?: string
   /**
    * The bytes of DER the `/Contents` placeholder holds. Default: the exact size of the CMS plus
-   * a margin, at least 8192. A value below what the CMS needs throws
+   * a margin (and `tsaReserve`), at least 8192. A value below what the CMS needs throws
    * `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` with `details.needed` ({@link signPdf} then prepares
    * once more with that size).
    */
   contentsReserve?: number
+  /**
+   * Make this a certification signature with these DocMDP permissions (ISO 32000-2 §12.8.2.2):
+   * the document's author signs first and says which later changes keep the certification
+   * valid. Refused with `E_DOC_MDP_FORBIDS` when a signature field is signed already, or the
+   * document is certified already. Default: an approval signature.
+   */
+  certify?: DocMdpLevel
+  /**
+   * Make the signature visible: a widget with this appearance on the field's page (`field.page`),
+   * in the signature's own incremental update. Default: invisible. On a certified document
+   * (`P = 2` or `3`) a new visible field is refused with `E_DOC_MDP_FORBIDS` (it would break the
+   * certification); sign an existing empty field instead. The text's font is not embedded, so a
+   * visible signature makes a PDF/A document non-conformant (see
+   * {@link SignatureAppearanceOptions}).
+   */
+  appearance?: SignatureAppearanceOptions
+  /**
+   * The bytes of signature timestamp token (PAdES B-T) to budget in `/Contents`. Default 0;
+   * {@link signPdf} with a `timestamp` callback uses 8192, enough for a TSA chain of about three
+   * certificates. A larger token makes `finish` throw `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` with
+   * `details.needed`.
+   */
+  tsaReserve?: number
+}
+
+/**
+ * The DocMDP permissions `P` of a certification signature (ISO 32000-2 §12.8.2.2): `1` no
+ * changes at all; `2` filling in forms and signing (the usual choice); `3` as `2` plus creating
+ * annotations (comments).
+ */
+export type DocMdpLevel = 1 | 2 | 3
+
+/** The standard-14 font of a visible signature's text. */
+export type AppearanceFont = 'Helvetica' | 'Helvetica-Bold'
+
+/** Where a visible signature's image goes: a column on the left, or behind the text. */
+export type ImagePosition = 'left' | 'background'
+
+/**
+ * The appearance of a visible signature (ISO 32000-2 §12.7.5.5, §12.5.5): a box with text lines
+ * and an optional JPEG image, upright on rotated pages.
+ *
+ * The text uses a standard-14 font (Helvetica) that is **not embedded**: a visible signature added
+ * to a PDF/A document makes it non-conformant (PDF/A requires embedded fonts, and PDF 2.0
+ * deprecates the standard-14 exemption, ISO 32000-2 §9.6.2.2). Font embedding comes in M7; until
+ * then sign PDF/A documents invisibly.
+ *
+ * ```js
+ * await signPdf(doc, {
+ *   signer,
+ *   field: { page: 0 },
+ *   appearance: { rect: [360, 40, 560, 100], image: await readFile('logo.jpg'), borderWidth: 1 },
+ * })
+ * ```
+ */
+export interface SignatureAppearanceOptions {
+  /**
+   * The widget rectangle in the page's default user space (points, origin at the bottom left of
+   * the unrotated page): `[llx, lly, urx, ury]` or a {@link Rect}, corners in any order. On a page
+   * with `/Rotate` 90 or 270 its width appears on screen as height and its height as width, so a
+   * box that should look wide there needs a tall rectangle (the appearance itself is turned to
+   * stay upright). It must hold finite numbers, have a positive area, meet the page's crop box
+   * and keep its coordinates, width and height within ±10^5 (`E_INVALID_ARGUMENT`). Omit it to
+   * sign an existing empty field in its own widget rectangle.
+   */
+  rect?: [number, number, number, number] | Rect
+  /**
+   * The text lines. Default: `Digitally signed by <name>` (the `name` option, else the signer
+   * certificate's common name), `Date: <signing time>`, and `Reason: …` and `Location: …` when
+   * given. Characters the standard-14 fonts cannot show (outside Windows-1252) become `?`, with
+   * a warning.
+   */
+  lines?: string[]
+  /** The font. Default `'Helvetica'`. */
+  font?: AppearanceFont
+  /** The font size in points. Default: the largest size from 4 to 12 that fits. */
+  fontSize?: number
+  /**
+   * A JPEG image (baseline or progressive, 8-bit gray or RGB), embedded unchanged. Anything else
+   * is `E_IMAGE`; CMYK and other unsupported JPEGs are `E_UNSUPPORTED`.
+   */
+  image?: Uint8Array
+  /** Where the image goes. Default `'left'`. */
+  imagePosition?: ImagePosition
+  /** The border width in points; 0 (the default) draws none. */
+  borderWidth?: number
+}
+
+/** Options for {@link PreparedSignature.timestampRequest} and {@link signPdf}'s `timestampOptions`. */
+export interface TimestampRequestOptions {
+  /** The digest of the message imprint. Default: the signature's digest algorithm. */
+  digest?: DigestAlg
+  /** The TSA policy to ask for (`reqPolicy`), as a dotted OID. Default: the TSA's policy. */
+  policy?: string
+  /** The request nonce, from 1 to 2^64 - 1 (a positive INTEGER). Default: a random one. */
+  nonce?: bigint
 }
 
 /**
@@ -734,23 +851,88 @@ export declare class PreparedSignature {
   readonly isFinished: boolean
 
   /**
+   * The DER `TimeStampReq` (RFC 3161) for a signature timestamp (PAdES B-T) over `signature`, the
+   * signature value {@link PreparedSignature.finish} will embed. Send it to a TSA (an HTTP POST
+   * with `Content-Type: application/timestamp-query`), then call `finish(signature, response)`
+   * with the TSA's DER `TimeStampResp`.
+   *
+   * The value is verified first, as `finish` does, and the imprint is the digest of the value as
+   * it will be embedded (an ECDSA value in IEEE P1363 form is converted to DER first). The request
+   * asks for the TSA certificate and has a nonce (random unless given). The prepared signature
+   * remembers the request for `finish`; calling this again replaces it. `serialize` does not
+   * keep it: after {@link PreparedSignature.deserialize}, pass it to `finish`. Once it is
+   * remembered, `finish` without a response throws `E_INVALID_ARGUMENT` (a forgotten response
+   * never gives a file without a timestamp): {@link PreparedSignature.discardTimestampRequest}
+   * finishes without one after all.
+   *
+   * ```js
+   * const signature = await kms.sign(prepared.toBeSignedDigest)
+   * const request = prepared.timestampRequest(signature)
+   * const response = await fetch(tsaUrl, {
+   *   method: 'POST',
+   *   headers: { 'content-type': 'application/timestamp-query' },
+   *   body: request,
+   * })
+   * const signed = prepared.finish(signature, new Uint8Array(await response.arrayBuffer()))
+   * ```
+   *
+   * @throws {FolioxideError} `E_SIGNATURE_INVALID` when the value does not verify;
+   *   `E_INVALID_ARGUMENT` for invalid options (a policy that is not a dotted OID, a nonce out of
+   *   range) or when a finish succeeded already; `E_BUSY` while `finishAsync` or `embedCmsAsync`
+   *   runs.
+   */
+  timestampRequest(signature: Uint8Array, options?: TimestampRequestOptions): Buffer
+
+  /**
+   * Forgets the request {@link PreparedSignature.timestampRequest} remembered, so that
+   * `finish(signature)` without a response finishes the file without a signature timestamp
+   * (PAdES B-B), for example when the TSA could not be reached. Without a remembered request it
+   * does nothing.
+   */
+  discardTimestampRequest(): void
+
+  /**
    * Finishes the file with the signature value over {@link PreparedSignature.toBeSigned}, made
    * with the key of the first certificate: returns the signed PDF. The value is verified before
    * it is embedded; a refused value leaves the prepared signature as it was.
    *
+   * With `timestampResponse` (the TSA's DER `TimeStampResp` to the request of
+   * {@link PreparedSignature.timestampRequest}, or to `timestampRequest` when given), the response
+   * is validated (the status, the imprint and nonce of the request, the TSA's signature, its
+   * signing-certificate attribute and its certificate's timestamping purpose) and its token is
+   * embedded as the signature timestamp: PAdES B-T. A refused response also leaves the prepared
+   * signature as it was.
+   *
+   * After {@link PreparedSignature.timestampRequest}, a `finish` without `timestampResponse`
+   * (omitted or `null`) throws `E_INVALID_ARGUMENT`, so that a forgotten response never gives a
+   * file without a signature timestamp; call {@link PreparedSignature.discardTimestampRequest}
+   * first to finish without one (PAdES B-B).
+   *
    * @param signature RSA: the modulus length; ECDSA: DER or IEEE P1363 (`r || s`, as WebCrypto
    *   and `dsaEncoding: 'ieee-p1363'` return it).
+   * @param timestampResponse The TSA's DER `TimeStampResp`.
+   * @param timestampRequest The DER `TimeStampReq` it answers. Default: the one
+   *   `timestampRequest` returned last.
    * @throws {FolioxideError} `E_SIGNATURE_INVALID` when the value does not verify (another key,
-   *   another digest, other bytes); `E_INVALID_ARGUMENT` when a finish succeeded already;
-   *   `E_BUSY` while `finishAsync` or `embedCmsAsync` runs.
+   *   another digest, other bytes); `E_TIMESTAMP_INVALID` when the response or the request fails a
+   *   check (the message names it); `E_SIGNATURE_PLACEHOLDER_TOO_SMALL` with `details.needed` when
+   *   the signature with its token does not fit `contentsCapacity` (prepare again with
+   *   `contentsReserve: details.needed`); `E_INVALID_ARGUMENT` when a finish succeeded already, a
+   *   response comes without a request, or a remembered request without a response; `E_BUSY`
+   *   while `finishAsync` or `embedCmsAsync` runs.
    */
-  finish(signature: Uint8Array): Buffer
+  finish(signature: Uint8Array, timestampResponse?: Uint8Array, timestampRequest?: Uint8Array): Buffer
 
   /**
-   * Like {@link PreparedSignature.finish}, on the libuv thread pool. Until it settles, the other
-   * finishing methods and `serialize` throw `E_BUSY`.
+   * Like {@link PreparedSignature.finish}, on the libuv thread pool (with the same rule for a
+   * remembered timestamp request). Until it settles, the other finishing methods,
+   * `timestampRequest` and `serialize` throw `E_BUSY`.
    */
-  finishAsync(signature: Uint8Array): Promise<Buffer>
+  finishAsync(
+    signature: Uint8Array,
+    timestampResponse?: Uint8Array,
+    timestampRequest?: Uint8Array,
+  ): Promise<Buffer>
 
   /**
    * Finishes the file with a whole CMS (`ContentInfo` with `SignedData`, DER) that a signing
@@ -775,7 +957,8 @@ export declare class PreparedSignature {
 
   /**
    * The prepared signature in a versioned binary form (it holds the whole prepared file), to
-   * finish it later or in another process with {@link PreparedSignature.deserialize}.
+   * finish it later or in another process with {@link PreparedSignature.deserialize}. It does
+   * not hold the request of {@link PreparedSignature.timestampRequest}: keep that too.
    *
    * @throws {FolioxideError} `E_INVALID_ARGUMENT` when a finish succeeded already; `E_BUSY` while
    *   `finishAsync` or `embedCmsAsync` runs.
@@ -923,10 +1106,40 @@ export interface ExternalSigner {
   ): Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer
 }
 
-/** Options for {@link signPdf}: the signer, and the signature options. */
+/**
+ * A timestamp authority for {@link signPdf}: send the DER `TimeStampReq` to an RFC 3161 TSA and
+ * return its DER `TimeStampResp` (as bytes, or an `ArrayBuffer`). Folioxide does no network I/O
+ * itself, so the caller chooses the TSA, the transport and the authentication. The `request`
+ * buffer is the callback's own copy: changing or reusing it does not change the request the
+ * response is checked against.
+ *
+ * ```js
+ * const timestamp = async (request) => {
+ *   const response = await fetch('https://tsa.example.com/', {
+ *     method: 'POST',
+ *     headers: { 'content-type': 'application/timestamp-query' },
+ *     body: request,
+ *   })
+ *   if (!response.ok) throw new Error(`TSA: HTTP ${response.status}`)
+ *   return response.arrayBuffer()
+ * }
+ * ```
+ */
+export type TimestampCallback = (
+  request: Buffer,
+) => Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer
+
+/** Options for {@link signPdf}: the signer, the timestamp authority, and the signature options. */
 export type SignPdfOptions = Omit<PrepareSignatureOptions, 'certificateChain' | 'algorithm'> & {
   /** A {@link LocalSigner}, or any {@link ExternalSigner}. */
   signer: LocalSigner | ExternalSigner
+  /**
+   * A timestamp authority: with it the signature gets an RFC 3161 signature timestamp (PAdES B-T).
+   * It may be called twice (see {@link signPdf}).
+   */
+  timestamp?: TimestampCallback
+  /** The options of the timestamp request (with `timestamp` only). */
+  timestampOptions?: TimestampRequestOptions
 }
 
 /** Options for {@link PdfDocument.verifySignatures}. */
@@ -943,12 +1156,23 @@ export interface VerifyOptions {
   extraCertificates?: Uint8Array[]
   /**
    * The time at which certificates must be valid: a `Date` or a PDF date string. Default: now.
-   * `null`: each signer's claimed signing time `/M` (with a warning in the report).
+   * `null`: each TSA at its own token's `genTime`, and each signer at the `genTime` of its
+   * trusted signature timestamp, else at its claimed signing time `/M`, each with a warning in
+   * the report. A `genTime` is the TSA's own claim, so with `null` a TSA key that outlived its
+   * certificate could backdate a token that is then trusted, and the signer with it.
    */
   validationTime?: PdfDateInput | null
+  /**
+   * Trusted root certificates (DER, or PEM text) of timestamp authorities, for the timestamps'
+   * `trusted`. Default: `trustAnchors`.
+   */
+  timestampTrustAnchors?: Uint8Array[]
 }
 
-/** What a signature dictionary is: a signature, or a document timestamp (listed, not verified). */
+/**
+ * What a signature dictionary is: a signature, or a document timestamp (ISO 32000-2 §12.8.5),
+ * whose RFC 3161 token is verified and described by the report's `timestamp`.
+ */
 export type SignatureKind = 'signature' | 'docTimeStamp'
 
 /**
@@ -962,29 +1186,60 @@ export type Coverage = 'entireFile' | 'entireRevision' | 'contiguousBlockFromSta
 /**
  * What the revisions appended after a signature changed, in pyHanko's vocabulary (its
  * `ModificationLevel`), from harmless to anything: nothing (`'none'`); updates that keep the
- * content, such as `/Info`, metadata or new invisible signature fields (`'ltaUpdates'`); signing
- * and filling signature fields (`'formFilling'`, what a later signature is, including the visible
- * appearance a later signature or a new visible signature field may add, which can cover signed
- * content); annotation changes (`'annotations'`); anything else, or a change that cannot be
- * attributed (`'other'`). Never more lenient than pyHanko: where Folioxide is stricter, the M3
- * brief's deliberate-differences table lists the case.
+ * content, such as `/Info`, metadata, new invisible signature fields or document timestamps
+ * (`'ltaUpdates'`); signing and filling in form fields (`'formFilling'`, what a later signature is,
+ * including the visible appearance a later signature or a new visible signature field may add,
+ * which can cover signed content); new markup annotations (`'annotations'`); anything else, or a
+ * change that cannot be attributed (`'other'`). Never more lenient than pyHanko except
+ * `'annotations'` (pyHanko reports `'other'`): where Folioxide is stricter, the M3 and M4 briefs'
+ * deliberate-differences tables list the case.
+ *
+ * `'other'` is also the verdict for a file a reader that rebuilds the cross-reference data could
+ * read differently, even when nothing visible changed (README, "Verifying"): more than two bytes,
+ * or a byte other than CR or LF, after the final `%%EOF`, or a final `startxref` more than 1,024
+ * bytes from the end, makes every signature `'other'`, the newest one too (a gateway that appends
+ * `\r\n` to a file ending `%%EOF\n` does this); in a later revision's strings, streams, names
+ * or comments, an object header `N G obj` or `trailer <<` anywhere, or `xref` or `startxref` at
+ * the start of a line or right after an `endobj`, makes the earlier signatures `'other'` (the scan
+ * fails closed: `x endobj xref` is `'other'`, while `see xref table` inside a line stays a fill);
+ * so does a new object stream in an update written with a classic cross-reference table, or one
+ * whose members its own section does not list, and a later trailer whose `/Size` does not exceed
+ * every object number the file lists or is below the previous revision's; and a field of the
+ * signed revision (a field node with kids too) whose appearance dictionary is shared makes every
+ * later revision above `'none'` `'other'`.
  */
 export type ModificationLevel = 'none' | 'ltaUpdates' | 'formFilling' | 'annotations' | 'other'
 
-/** The PAdES baseline level a signature meets (ETSI EN 319 142-1 §6). */
-export type PadesLevel = 'B-B'
+/**
+ * The PAdES baseline level a signature meets (ETSI EN 319 142-1 §6): `'B-B'`, or `'B-T'` when its
+ * signature timestamp is intact and valid as well.
+ */
+export type PadesLevel = 'B-B' | 'B-T'
 
 /**
  * Why a signature is not valid. The dictionary and byte range: `sigValueNotIndirect`,
  * `sigDictNotDictionary`, `byteRangeMissing`, `byteRangeIndirect`, `byteRangeMalformed`,
  * `byteRangeNotFromZero`, `byteRangeOutOfBounds`, `contentsMissing`, `contentsNotHex`,
  * `gapNotContents` (signature wrapping), `sigDictCompressed`, `sigDictOutsideSignedRange`,
- * `sigDictRedefinedLater`, `signedRevisionNotInChain`. The CMS: `cmsMalformed`, `notSignedData`,
+ * `sigDictRedefinedLater`, `sigDictAmbiguous` (the signature dictionary or its field, with its
+ * `/Lock` and DocMDP `/Reference`, is not written canonically, so readers read it differently: a
+ * key written twice, or a value the canonical-input gate refuses, such as a number with two signs
+ * or an exponent, an integer beyond ±2,147,483,647 or longer than 11 characters, a real longer than
+ * 40 characters or beyond ±3.403e38, a name with `#00`; a `/ByteRange` or `/Contents` so is not
+ * intact, a DocMDP declaration or lock so is `docMdpInvalid` with `P = 1`; M4),
+ * `signedRevisionNotInChain`. The CMS: `cmsMalformed`, `notSignedData`,
  * `signerInfoCount`, `eContentPresent`, `contentTypeMismatch`, `messageDigestMissing`,
  * `digestMismatch`, `signerCertNotFound`, `signingCertificateMismatch`,
  * `algorithmProtectionMismatch`. Algorithms: `digestSignatureAlgorithmMismatch`,
  * `unsupportedAlgorithm`, `unsupportedSubFilter`, `signatureInvalid`, `weakAlgorithm`. The file:
- * `structureRepaired`, `orphan`, `pendingTimestampVerification`.
+ * `structureRepaired`, `orphan`, `pendingTimestampVerification` (M3; retired by M4). Timestamps
+ * (M4): `timestampMalformed`, `timestampImprintMismatch`, `timestampSignatureInvalid`,
+ * `timestampEssMismatch`, `tsaCertificateUnsuitable` (the extended key usage is not exactly a
+ * critical timeStamping, or the certificate is one OpenSSL refuses in any chain: an extension
+ * twice, a known one that does not decode, or a critical one OpenSSL does not handle, such as a
+ * critical key identifier), `tsaCertificateNotValidAtGenTime`,
+ * `tsaNameMismatch` (the TSTInfo `tsa` field names another TSA than the certificate). DocMDP
+ * (M4): `docMdpInvalid`, `certificationNotFirst`.
  */
 export type ProblemCode =
   | 'sigValueNotIndirect'
@@ -1000,6 +1255,7 @@ export type ProblemCode =
   | 'sigDictCompressed'
   | 'sigDictOutsideSignedRange'
   | 'sigDictRedefinedLater'
+  | 'sigDictAmbiguous'
   | 'signedRevisionNotInChain'
   | 'cmsMalformed'
   | 'notSignedData'
@@ -1019,6 +1275,15 @@ export type ProblemCode =
   | 'structureRepaired'
   | 'orphan'
   | 'pendingTimestampVerification'
+  | 'timestampMalformed'
+  | 'timestampImprintMismatch'
+  | 'timestampSignatureInvalid'
+  | 'timestampEssMismatch'
+  | 'tsaCertificateUnsuitable'
+  | 'tsaCertificateNotValidAtGenTime'
+  | 'tsaNameMismatch'
+  | 'docMdpInvalid'
+  | 'certificationNotFirst'
 
 /** One reason a signature is not valid. */
 export interface SignatureProblem {
@@ -1044,6 +1309,76 @@ export interface KeyDescription {
   bits: number
   /** For EC keys, the curve: `"P-256"`, `"P-384"`, or a dotted OID; `null` for RSA. */
   curve: string | null
+}
+
+/**
+ * One verified RFC 3161 timestamp token: a signature timestamp (PAdES B-T), or the token of a
+ * document timestamp.
+ *
+ * `intact`, `valid` and `trusted` use the pyHanko validator's `timestamp_validity` vocabulary;
+ * `valid` is stricter where OpenSSL `ts -verify` is: the TSA certificate must be suitable for
+ * timestamping (the extended key usage exactly timeStamping, critical; no extension twice, every
+ * known one decoding, and no critical extension OpenSSL does not handle, such as a critical key
+ * identifier, which RFC 5280 forbids), every ESS
+ * signing-certificate attribute must identify it, the token's `tsa` name must be one of its names,
+ * and the token must carry only what RFC 3161 and RFC 5652 allow, in an encoding OpenSSL can
+ * decode, its optional fields included (the TSTInfo `extensions`, the ESS `policies` and issuer
+ * names), every name with strings OpenSSL converts to UTF-8 (no BMPString surrogate) and a `tsa`
+ * field that is one of the GeneralName choices OpenSSL decodes, with its signed attributes in DER,
+ * the encoding the TSA must sign (`timestampMalformed` otherwise). A broken signature timestamp
+ * token never makes the signature itself invalid: its problems are listed here. Only an unsigned
+ * attribute that is not itself a well-formed attribute (a type and a `SET` of values) makes the
+ * whole CMS malformed (`cmsMalformed`), as for pyHanko. A token value that cannot be read at all
+ * is not listed; the report's `warnings` then say that an unsigned attribute could not be read.
+ */
+export interface TimestampInfo {
+  /**
+   * The token's `genTime`, RFC 3339 UTC with the token's fraction digits
+   * (`"2026-10-10T12:00:30Z"`). **It means something only when `trusted` is `true`**: an untrusted
+   * TSA can write any time, and a signature timestamp is not covered by the signature, so it can
+   * be replaced or removed after signing. `trusted` is judged at the `validationTime` (now by
+   * default; with `null`, at this `genTime` itself).
+   */
+  genTime: string
+  /** The TSA certificate (the token's signer), when found. */
+  tsa: CertificateInfo | null
+  /** The TSA's name from the token, as RFC 4514 text, when it gives one. */
+  tsaName: string | null
+  /** The TSA policy, a dotted OID. */
+  policy: string | null
+  /** The token's serial number, uppercase hexadecimal. */
+  serialHex: string | null
+  /**
+   * The accuracy of `genTime` in microseconds, when the token states it; `null` too when it
+   * exceeds `Number.MAX_SAFE_INTEGER` (only a hostile token does), rather than a rounded value.
+   */
+  accuracyMicros: number | null
+  /** The token's `ordering` flag. */
+  ordering: boolean
+  /** The digest algorithm of the message imprint, for example `"sha256"`. */
+  imprintAlgorithm: string | null
+  /** The TSA's signature algorithm, for example `"sha256WithRSAEncryption"`. */
+  signatureAlgorithm: string | null
+  /**
+   * The message imprint is the digest of what was timestamped: the signature value, or the byte
+   * ranges of a document timestamp.
+   */
+  intact: boolean
+  /**
+   * The TSA's signature verifies, its signing-certificate attribute matches, and its certificate
+   * is suitable for timestamping and valid at `genTime`.
+   */
+  valid: boolean
+  /**
+   * Whether the TSA certificate chains to one of `timestampTrustAnchors` (else `trustAnchors`),
+   * for a token that is intact and valid; `null` without anchors. The path rules are those of
+   * `SignatureReport.trusted`.
+   */
+  trusted: boolean | null
+  /** Why the token is not intact or not valid; empty when nothing is wrong. */
+  problems: SignatureProblem[]
+  /** Observations that do not make the token invalid. */
+  warnings: string[]
 }
 
 /** Information about an X.509 certificate (RFC 5280). */
@@ -1118,7 +1453,16 @@ export interface SignatureReport {
   coverage: Coverage
   /** The index (oldest first) of the revision the signature covers. */
   signedRevision: number | null
-  /** What later revisions changed. */
+  /**
+   * What later revisions changed (see `ModificationLevel`). `'other'` covers files that a
+   * rebuilding reader could read differently: bytes beyond two end-of-line bytes after the final
+   * `%%EOF` or a final `startxref` farther than 1,024 bytes from the end (every signature, the
+   * newest included), structure-like text in a later revision's strings, streams, names or
+   * comments (`N G obj` or `trailer <<` anywhere; `xref` or `startxref` at the start of a line or
+   * right after an `endobj`), a new object stream in a classic-table update, a later `/Size` that
+   * does not exceed every object number listed or is below the previous one, and a shared field
+   * appearance dictionary.
+   */
   modification: ModificationLevel
   /**
    * The objects later revisions list, sorted: at most 1,024 of them (the first by object number),
@@ -1135,7 +1479,11 @@ export interface SignatureReport {
   chain: CertificateInfo[]
   /**
    * Whether a certification path from the signer to one of `trustAnchors` validates at the
-   * validation time (no revocation checking, no network); `null` without anchors.
+   * validation time (no revocation checking, no network); `null` without anchors. Stricter than
+   * pyHanko in places (README, "Verifying"): never through a certificate with a critical
+   * extension OpenSSL does not handle (a critical key identifier, for example), an RFC 3779 block,
+   * proxy certificate information, or name or policy constraints, which Folioxide does not
+   * process.
    */
   trusted: boolean | null
   /** The claimed signing time `/M`, RFC 3339. */
@@ -1148,11 +1496,40 @@ export interface SignatureReport {
   location: string | null
   /** `/ContactInfo`. */
   contactInfo: string | null
-  /** The PAdES baseline level the signature meets. */
+  /**
+   * The PAdES baseline level the signature meets: `'B-T'` when its selected signature timestamp
+   * token is intact and valid. `'B-T'` does **not** mean the TSA is trusted (a valid token of an
+   * untrusted TSA, or one verified without trust anchors, is still `'B-T'`): before relying on
+   * the time, also require `timestamp?.trusted === true`.
+   */
   padesLevel: PadesLevel | null
-  /** For a certification signature, its DocMDP permissions `P` (1–3). */
+  /**
+   * The selected timestamp token: the earliest `genTime` among the signature timestamps that are
+   * intact, valid and not untrusted, else the first one; for a document timestamp, its own token.
+   * `null` without a token.
+   */
+  timestamp: TimestampInfo | null
+  /** Every verified timestamp token, in the order the signature carries them. */
+  timestamps: TimestampInfo[]
+  /**
+   * The DocMDP permissions `P` (1–3) this signature sets for the document: a certification
+   * signature's, or the `/P` of its field's lock dictionary (PDF 2.0), the stricter when both are
+   * present. `null` for an approval signature without a lock `/P`, and for a declaration that
+   * cannot be read (problem `docMdpInvalid`; `P = 1` is then in force).
+   */
   docmdp: number | null
-  /** Whether later revisions respect the DocMDP permissions; `null` (not checked yet). */
+  /**
+   * Whether the later revisions respect the DocMDP permissions in force for this signature: the
+   * strictest of its own `P` (`docmdp`, 1 when its declaration cannot be read) and those of the
+   * signatures before it that set permissions (a field lock cannot grant more than a
+   * certification already in force, ISO 32000-2 §12.7.5.5), else 2 (form filling and signing). With `P = 1` only re-listed objects
+   * and document timestamps are allowed; with `P = 2` up to `'formFilling'`; with `P = 3` up to
+   * `'annotations'`. `null` for a document timestamp, which has no DocMDP of its own (its
+   * integrity is `modification`, judged with the permissions in force for markup annotations
+   * only: a form fill after a timestamp under `P = 1` leaves the timestamp at `'formFilling'`,
+   * and only the certification's `docmdpOk` is `false`, so check every report).
+   * {@link isSignatureAcceptable} requires it not to be `false`.
+   */
   docmdpOk: boolean | null
   /** Why the signature is not valid; empty when nothing is wrong. */
   problems: SignatureProblem[]
@@ -1163,33 +1540,57 @@ export interface SignatureReport {
 // ---- functions ---------------------------------------------------------------------------------
 
 /**
- * Signs a document with an invisible PAdES B-B signature in its own incremental update and
- * returns the signed PDF (the original bytes are kept as they are, so earlier signatures stay
- * valid). The document is not changed: open the returned bytes to keep working.
+ * Signs a document with a PAdES signature in its own incremental update and returns the signed
+ * PDF (the original bytes are kept as they are, so earlier signatures stay valid). The document is
+ * not changed: open the returned bytes to keep working. The signature is invisible unless
+ * `appearance` is given, an approval signature unless `certify` is, and PAdES B-B unless a
+ * `timestamp` callback is given (then B-T).
  *
  * It prepares the signature on the libuv thread pool ({@link PdfDocument.prepareSignatureAsync}),
  * awaits the signer, and finishes the file ({@link PreparedSignature.finishAsync}). When an
  * explicit `contentsReserve` is too small, it prepares once more with the size needed, before the
  * signer is called.
  *
+ * With `timestamp` it prepares with `tsaReserve` (default 8192 bytes of token), awaits the
+ * signer, makes the timestamp request for the signature value
+ * ({@link PreparedSignature.timestampRequest} with `timestampOptions`), awaits `timestamp` with
+ * it, and finishes with the response. **When the token is larger than its budget, it does all of
+ * that once more** with room for it, so **the signer and the `timestamp` callback may each be
+ * called twice**.
+ *
  * ```js
  * const signer = LocalSigner.fromPkcs12(await readFile('signer.p12'), password)
  * const signed = await signPdf(doc, { signer, reason: 'Approved', location: 'Berlin' })
+ *
+ * // Certified (form filling allowed), visible and timestamped:
+ * const certified = await signPdf(doc, {
+ *   signer,
+ *   certify: 2,
+ *   appearance: { rect: [360, 40, 560, 100] },
+ *   timestamp: (request) => postToTsa('https://tsa.example.com/', request),
+ * })
  * ```
  *
- * @throws {FolioxideError} the errors of {@link PdfDocument.prepareSignature};
+ * @throws {FolioxideError} the errors of {@link PdfDocument.prepareSignature} (among them
+ *   `E_DOC_MDP_FORBIDS` for a certified document that forbids the signature);
  *   `E_SIGNATURE_INVALID` when the signer's value does not verify with its certificate;
- *   `E_CRYPTO` when an external signer throws (its error is the `cause`); `E_INVALID_ARGUMENT`
- *   when `doc` is not a {@link PdfDocument}, the signer is neither a {@link LocalSigner} nor an
- *   {@link ExternalSigner}, or it returns something that is not bytes.
+ *   `E_CRYPTO` when an external signer throws (its error is the `cause`); `E_TIMESTAMP_INVALID`
+ *   when the `timestamp` callback throws (its error is the `cause`) or its response is refused
+ *   (the TSA's status, a wrong nonce or imprint, an unsuitable TSA certificate, …);
+ *   `E_INVALID_ARGUMENT` when `doc` is not a {@link PdfDocument}, the signer is neither a
+ *   {@link LocalSigner} nor an {@link ExternalSigner}, or it or the callback returns something
+ *   that is not bytes.
  */
 export declare function signPdf(doc: PdfDocument, options: SignPdfOptions): Promise<Buffer>
 
 /**
  * The fail-safe verdict for accepting a signed document from a report of
  * {@link PdfDocument.verifySignatures}: the signature itself is sound (`byteRangeOk`, `intact`,
- * `signatureValid`, a field name, no problems, coverage `'entireFile'` or `'entireRevision'`)
- * **and** what was appended after the signed revision is at most `maxModification`.
+ * `signatureValid`, a field name, no problems, coverage `'entireFile'` or `'entireRevision'`),
+ * what was appended after the signed revision is at most `maxModification`, **and** the DocMDP
+ * permissions in force are respected (`docmdpOk` is not `false`): after a certification with
+ * `P = 1` no change passes, not even an `/Info` change that `'ltaUpdates'` would allow, and
+ * `'annotations'` passes only under a certification with `P = 3`.
  *
  * The signature checks alone do not detect content changed after signing (an incremental saving
  * or shadow attack): only `modification` does. The default `'formFilling'` accepts later
@@ -1198,11 +1599,31 @@ export declare function signPdf(doc: PdfDocument, options: SignPdfOptions): Prom
  *
  * **`'formFilling'` includes visible signature appearances added after signing**, which can cover
  * signed content: a new visible signature field with an appearance (signed or still empty), or
- * the appearance a later signature gives the field it signs. pyHanko and Acrobat allow this at the
- * same level; it is inherent to sequential signing in PDF. No level accepts later signatures while
+ * the appearance a later signature gives the field it signs, inside its rectangle (its widget may
+ * not be hidden, unrotated or unzoomed, and its appearance is a new form XObject with a bounding
+ * box). pyHanko and Acrobat allow this at the same level; it is inherent to sequential signing in
+ * PDF. No level accepts later signatures while
  * refusing visible ones (a later signature, visible or not, is `'formFilling'`), so when no further
  * signer is expected, `'ltaUpdates'` is the strict choice. A signature field that stays unsigned
  * may change only its field flags: an appearance added to it is `'other'`.
+ *
+ * **`'formFilling'` also includes filling in the document's form fields**, by a whitelist: a
+ * field's value, a check box's or radio button's state among its signed states, and a text or
+ * choice field's new appearance when its value changes; nothing else of the field or its widget
+ * may change (no flags, `/DA`, `/Rect`, …), and read-only fields, push buttons, XFA forms and
+ * fields whose widget is unzoomed or unrotated (drawn outside its rectangle) may not be filled.
+ * **A filled field can show any text its filler chooses inside its unchanged widget rectangle,
+ * and an opaque one covers the signed content beneath it.**
+ * **`'annotations'`** (one level more lenient than pyHanko, which reports `'other'`): new markup
+ * annotations (comments, highlights, shapes, ink, stamps, with their pop-ups) added to a page, with
+ * no change to existing ones; `docmdpOk` accepts it only under a certification with `P = 3`. Each
+ * must draw inside its rectangle at 100 % zoom (an appearance is required and its geometry is
+ * checked), **but there it can cover signed content**: that is what `P = 3` grants. A sticky note
+ * (Text annotation) is drawn at a fixed size, so below 100 % zoom a viewer that honours NoZoom can
+ * draw it past its rectangle (its own appearance, at its rectangle's size). Annotations a viewer
+ * draws unzoomed or unrotated are `'other'`: sticky notes (Text annotations) on a rotated page,
+ * and any annotation whose flags set NoZoom or NoRotate, such as the `/F 28` sticky notes Acrobat
+ * is believed to write. Gate on `'ltaUpdates'` when no such change is expected.
  *
  * The AcroForm is checked against an exact whitelist: after signing, a later revision may only
  * add new top-level signature fields to `/Fields`, change `/SigFlags` as signing requires (which
@@ -1212,11 +1633,12 @@ export declare function signPdf(doc: PdfDocument, options: SignPdfOptions): Prom
  * signing, as pyHanko's signer does; pyHanko then reports `'formFilling'`), any change to `/DA`
  * (adding one too), any change to `/Q`, and changing or removing a `/DR` resource name. The
  * signed revision names every name in a `/DA` of the AcroForm, its fields and widgets and every
- * annotation on every page (with the `/DA` it inherits), and every name in an appearance stream of those without `/Resources`
- * of its own; when these cannot all be read within the limits, no new `/DR` name is allowed.
- * Residual risk: names that a form XObject nested in an appearance stream uses, and names a viewer
- * looks up in `/DR` after failing to find them in an appearance stream's own resources, are not
- * read.
+ * annotation on every page (with the `/DA` it inherits), every name in an appearance stream of
+ * those without `/Resources` of its own, and every name a signed appearance stream uses, with
+ * every content stream it draws (form XObjects, however their `/Subtype` is written, tiling
+ * patterns, Type 3 glyphs and the soft-mask groups of its graphics states, nested, and what the
+ * page's resources draw when such a stream has no `/Resources` of its own); when these cannot all
+ * be read within the limits, no new `/DR` name is allowed. So a viewer that falls back to `/DR` cannot pick up a new resource.
  *
  * ```js
  * const reports = await doc.verifySignatures({ trustAnchors: [root] })

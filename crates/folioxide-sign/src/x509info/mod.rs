@@ -6,7 +6,11 @@
 //! - [`certificate_key_kind`]: the [`KeyKind`] of a certificate's public key.
 //! - [`build_trust`]: path building from a signer certificate through a pool of candidates to
 //!   caller-supplied trust anchors, and validation of that path at a given [`UnixTime`]
-//!   (RFC 5280 §6.1 without revocation, policies or name constraints; no network).
+//!   (RFC 5280 §6.1 without revocation, policies or name constraints, which make a path that
+//!   carries them untrusted; no network).
+//! - [`build_trust_for`] and [`check_tsa_certificate`] (M4 brief §3.1): trust for a purpose,
+//!   document signing or timestamping, and OpenSSL's TSA certificate purpose check
+//!   (`check_purpose_timestamp_sign`, DECISIONS D13 D-4).
 
 use folioxide_model::PdfDate;
 use sha2::Digest as _;
@@ -18,7 +22,10 @@ use crate::problem::Problem;
 
 pub(crate) mod cert;
 mod chain;
+mod extensions;
+pub(crate) mod names;
 
+pub(crate) use chain::linked_issuers;
 pub use chain::{
     KNOWN_CRITICAL_EXTENSIONS, MAX_CANDIDATES, MAX_COMPLETE_PATHS, MAX_EXPANSIONS,
     MAX_PATH_CERTIFICATES, MAX_SIGNATURE_CHECKS, MIN_RSA_TRUST_BITS,
@@ -271,12 +278,25 @@ fn key_description(spki_der: &[u8]) -> KeyDescription {
 /// The [`KeyKind`] of a DER certificate's public key: what `prepare` records for the signer
 /// certificate and what sizes the CMS.
 ///
+/// A certificate whose key is an `id-RSASSA-PSS` key is refused: RFC 4055 §1.2 restricts such a
+/// key to RSASSA-PSS signatures, and Folioxide signs with RSA PKCS #1 v1.5, which no verifier
+/// accepts with it (manager ruling R-22 (b), M4 QA round 5 finding 36).
+///
 /// # Errors
 /// [`Error::Certificate`](crate::Error::Certificate) when the certificate or its key does not
 /// parse, [`Error::Unsupported`](crate::Error::Unsupported) for keys other than RSA, P-256 and
-/// P-384.
+/// P-384, and for an `id-RSASSA-PSS` key.
 pub fn certificate_key_kind(der: &[u8]) -> Result<KeyKind> {
-    Ok(cert::CertParts::parse(der)?.public_key()?.kind())
+    let key = cert::CertParts::parse(der)?.public_key()?;
+    if key.is_rsa_pss_only() {
+        return Err(crate::Error::Unsupported(
+            "the certificate's key is an id-RSASSA-PSS key, which may only make RSASSA-PSS \
+             signatures (RFC 4055 §1.2); Folioxide signs with RSA PKCS#1 v1.5, so it cannot \
+             sign with this certificate"
+                .to_owned(),
+        ));
+    }
+    Ok(key.kind())
 }
 
 /// A point in time: whole seconds since 1970-01-01T00:00:00Z, ignoring leap seconds (POSIX
@@ -361,13 +381,23 @@ pub struct TrustResult {
 ///
 /// - **Building:** a bounded depth-first search over the anchors, then the pool (for a PDF
 ///   signature: the CMS certificates plus the caller's extra certificates), matching each
-///   certificate's issuer name to a candidate's subject and verifying the signature with the
-///   candidate's key (RSA PKCS#1 v1.5, RSA-PSS, ECDSA P-256/P-384). At most
+///   certificate's issuer name to a candidate's subject, requiring its `authorityKeyIdentifier`
+///   (key identifier, issuer name, serial number) to describe the candidate, as OpenSSL's
+///   `X509_check_akid` and pyhanko-certvalidator do (manager ruling R-22 (a)), and verifying the
+///   signature with the candidate's key (RSA PKCS#1 v1.5, RSA-PSS, ECDSA P-256/P-384; an
+///   `id-RSASSA-PSS` key verifies RSASSA-PSS only, R-22 (b)). At most
 ///   [`MAX_PATH_CERTIFICATES`] certificates below the anchor and [`MAX_CANDIDATES`] candidates
 ///   are considered.
 /// - **Validation:** every certificate below the anchor must be valid at `at` and free of
-///   unknown critical extensions ([`KNOWN_CRITICAL_EXTENSIONS`]), and must not be signed with a
-///   weak hash (MD2, MD5, SHA-1: problem `WeakAlgorithm`); issuers need `basicConstraints cA`
+///   critical extensions outside [`KNOWN_CRITICAL_EXTENSIONS`] (unknown ones, the ones OpenSSL
+///   does not handle as critical, such as a key identifier, and the ones Folioxide does not
+///   process), no extension may occur twice
+///   and every extension of a type Folioxide knows must decode as RFC 5280 defines it, critical
+///   or not (as pyHanko and OpenSSL require), and it must not be signed with a weak hash (MD2, MD5, SHA-1: problem
+///   `WeakAlgorithm`); no issuer may carry `nameConstraints`, `policyMappings` or
+///   `policyConstraints`, critical or not, nor the signer `policyConstraints` (Folioxide does
+///   not process them, so a path with one is untrusted even when it satisfies it; M4 QA round 4
+///   finding 5); issuers need `basicConstraints cA`
 ///   (with every `pathLenConstraint` respected) and, when key usage is present, `keyCertSign`;
 ///   the signer's key usage, when present, needs digitalSignature **or** nonRepudiation (D-10;
 ///   pyHanko accepts nonRepudiation only).
@@ -378,8 +408,9 @@ pub struct TrustResult {
 ///   [`MIN_RSA_TRUST_BITS`] (2048) for the signer or any issuer, the anchor included, makes the
 ///   path untrusted with `WeakAlgorithm`, as in pyHanko.
 ///
-/// There is no revocation checking, no policy or name-constraint processing and no network
-/// access. The function never panics and never fails: every defect is a reason.
+/// There is no revocation checking, no policy or name-constraint processing (a path that
+/// carries such constraints is untrusted, above) and no network access. The function never
+/// panics and never fails: every defect is a reason.
 ///
 /// ```
 /// use folioxide_sign::x509info::{UnixTime, build_trust};
@@ -399,9 +430,175 @@ pub fn build_trust(
     chain::build_trust(signer_der, pool, anchors, at)
 }
 
+/// What a certification path is validated for (M4 brief §3.1).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustPurpose {
+    /// A document signer: the rules of [`build_trust`] (M3).
+    DocumentSigning,
+    /// A time-stamping authority: the rules of [`build_trust`], plus
+    /// [`check_tsa_certificate`] on the leaf (M4 brief §5 V7b step 6).
+    TimeStamping,
+}
+
+/// [`build_trust`] for `purpose`: [`TrustPurpose::DocumentSigning`] is exactly
+/// [`build_trust`]; [`TrustPurpose::TimeStamping`] also requires the leaf to pass
+/// [`check_tsa_certificate`] (M4 brief §5 V7b step 9, at `genTime` or the validation time).
+/// Never fails, never panics.
+///
+/// ```
+/// use folioxide_sign::x509info::{TrustPurpose, UnixTime, build_trust_for};
+///
+/// let leaf = b"not a certificate";
+/// let result = build_trust_for(TrustPurpose::DocumentSigning, leaf, &[], &[], UnixTime(0));
+/// assert!(!result.trusted);
+/// let result = build_trust_for(TrustPurpose::TimeStamping, leaf, &[], &[], UnixTime(0));
+/// assert!(!result.trusted);
+/// ```
+pub fn build_trust_for(
+    purpose: TrustPurpose,
+    leaf_der: &[u8],
+    pool: &[Vec<u8>],
+    anchors: &[Vec<u8>],
+    at: UnixTime,
+) -> TrustResult {
+    let mut result = build_trust(leaf_der, pool, anchors, at);
+    if purpose == TrustPurpose::TimeStamping
+        && let Err(reason) = check_tsa_certificate(leaf_der)
+    {
+        result.trusted = false;
+        result.reasons.push(format!(
+            "the TSA certificate is not suitable for timestamping: {reason}"
+        ));
+    }
+    result
+}
+
+/// OpenSSL's `check_purpose_timestamp_sign` for a TSA certificate (DECISIONS D13 D-4; RFC 3161
+/// §2.3): the extended key usage extension is present, critical, and exactly
+/// `{id-kp-timeStamping}`; the key usage extension is absent, or non-empty and within
+/// `{digitalSignature, nonRepudiation}`.
+///
+/// RFC 3161 §2.3: "The corresponding certificate MUST contain only one instance of the extended
+/// key usage field extension ... with KeyPurposeID having the value: id-kp-timeStamping. This
+/// extension MUST be critical." Folioxide is stricter than OpenSSL in one point: OpenSSL ignores
+/// extended key usages it does not know, Folioxide refuses any other purpose.
+///
+/// Before the purpose, the extension list itself: no extension type twice, and every extension
+/// of a type Folioxide decodes decoding as RFC 5280 defines it, critical or not. OpenSSL's
+/// `ossl_x509v3_cache_extensions` marks a certificate with such a defect invalid, so `openssl ts
+/// -verify` refuses its token whatever the trust anchors (manager ruling R-22 (c), M4 QA round 5
+/// finding 37); on a document signer's path the same defect makes the path untrusted
+/// ([`build_trust`]). So does a critical extension that OpenSSL's `X509_supported_extension`
+/// does not list, such as a critical subjectKeyIdentifier, authorityKeyIdentifier (RFC 5280
+/// §4.2.1.1, §4.2.1.2: both MUST be non-critical), authorityInfoAccess, freshestCRL,
+/// qcStatements or private extension: OpenSSL refuses every chain with it ("unhandled critical
+/// extension"; M4 closing round, findings 8 and 11), where pyHanko trusts some of them.
+///
+/// ```
+/// use folioxide_sign::x509info::check_tsa_certificate;
+///
+/// assert!(check_tsa_certificate(b"not a certificate").is_err());
+/// ```
+///
+/// # Errors
+/// The reason the certificate is unsuitable, in English.
+pub fn check_tsa_certificate(cert_der: &[u8]) -> std::result::Result<(), String> {
+    use x509_cert::ext::pkix::{ExtendedKeyUsage, KeyUsage};
+
+    let certificate = cert::decode(cert_der).map_err(|err| err.to_string())?;
+    let tbs = certificate.tbs_certificate();
+    if let Some(extensions) = tbs.extensions()
+        && let Some(defect) = extensions::integrity_defects(extensions)
+            .into_iter()
+            .chain(extensions::unhandled_critical(extensions))
+            .next()
+    {
+        return Err(format!("it has {defect}"));
+    }
+    match tbs.get_extension::<ExtendedKeyUsage>() {
+        Ok(None) => return Err("it has no extended key usage extension".to_owned()),
+        Err(_) => {
+            return Err(
+                "its extended key usage extension is malformed or present more than once"
+                    .to_owned(),
+            );
+        }
+        Ok(Some((critical, usage))) => {
+            let time_stamping =
+                const_oid::ObjectIdentifier::new_unwrap(crate::tsp::OID_KP_TIME_STAMPING);
+            if usage.0.is_empty() || usage.0.iter().any(|purpose| *purpose != time_stamping) {
+                let purposes: Vec<String> = usage.0.iter().map(ToString::to_string).collect();
+                return Err(format!(
+                    "its extended key usage is {{{}}}, not exactly {{id-kp-timeStamping}}",
+                    purposes.join(", ")
+                ));
+            }
+            if !critical {
+                return Err("its extended key usage extension is not critical".to_owned());
+            }
+        }
+    }
+    match tbs.get_extension::<KeyUsage>() {
+        Ok(None) => Ok(()),
+        Err(_) => Err("its key usage extension is malformed or present more than once".to_owned()),
+        Ok(Some((_, usage))) => {
+            let signing = usage.digital_signature() || usage.non_repudiation();
+            let other = usage.key_encipherment()
+                || usage.data_encipherment()
+                || usage.key_agreement()
+                || usage.key_cert_sign()
+                || usage.crl_sign()
+                || usage.encipher_only()
+                || usage.decipher_only();
+            if !signing {
+                Err("its key usage allows neither digitalSignature nor nonRepudiation".to_owned())
+            } else if other {
+                Err("its key usage allows more than digitalSignature and nonRepudiation".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The validity period of a DER certificate as POSIX seconds `(notBefore, notAfter)`, both
+/// inclusive (RFC 5280 §4.1.2.5); `None` when it does not decode.
+pub(crate) fn validity_secs(cert_der: &[u8]) -> Option<(i64, i64)> {
+    let certificate = cert::decode(cert_der).ok()?;
+    let validity = certificate.tbs_certificate().validity();
+    let seconds = |time: x509_cert::time::Time| {
+        i64::try_from(time.to_unix_duration().as_secs()).unwrap_or(i64::MAX)
+    };
+    Some((seconds(validity.not_before), seconds(validity.not_after)))
+}
+
+/// The proleptic Gregorian day count of `days_from_civil`, for the RFC 3161 `genTime` parser.
+pub(crate) fn days_since_epoch(year: i64, month: i64, day: i64) -> i64 {
+    days_from_civil(year, month, day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_purposes() {
+        let signing = build_trust_for(TrustPurpose::DocumentSigning, &[], &[], &[], UnixTime(0));
+        assert_eq!(signing, build_trust(&[], &[], &[], UnixTime(0)));
+        let tsa = build_trust_for(TrustPurpose::TimeStamping, &[], &[], &[], UnixTime(0));
+        assert!(!tsa.trusted && tsa.path.is_empty());
+        assert!(
+            tsa.reasons
+                .last()
+                .is_some_and(|r| r.contains("not suitable for timestamping")),
+            "{:?}",
+            tsa.reasons
+        );
+        assert!(check_tsa_certificate(&[]).is_err());
+        assert_eq!(validity_secs(&[]), None);
+        assert_eq!(days_since_epoch(1970, 1, 1), 0);
+    }
 
     #[test]
     fn unix_time_from_pdf_dates() {

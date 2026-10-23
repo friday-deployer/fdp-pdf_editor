@@ -9,7 +9,7 @@ Dev-only helpers. Nothing here is linked into Folioxide: the oracles are externa
 | `requirements-dev.txt` | exact pins: pyHanko, pypdf, pikepdf, pyhanko-certvalidator, asn1crypto, PyYAML |
 | `gen-pki.sh` | generates the test PKI in `fixtures/pki/`; `--check` validates the committed files |
 | `fixtures/qpdf.py` | writes the qpdf-linearized fixtures in `fixtures/qpdf/` (oracle venv); `--check` regenerates and compares them |
-| `fixtures/sign.py` | writes the CMS vectors, key files, trust-path certificates and signed PDFs in `fixtures/sign/` (oracle venv, OpenSSL; `--only cms|chain|pdf` for one group); `--check` verifies them with OpenSSL, pyHanko, pyhanko-certvalidator and the signature oracles |
+| `fixtures/sign.py` | writes the CMS vectors, key files, trust-path certificates, signed PDFs and TSA replies in `fixtures/sign/` (oracle venv, OpenSSL, cargo for `tsa`; `--only cms|chain|pdf|tsa` for one group, `--pdf NAME` for one PDF); `--check` verifies them with OpenSSL, pyHanko, pyhanko-certvalidator and the signature oracles |
 | `tsa/openssl-tsa.cnf` | `openssl ts -reply` configuration for the fixture TSA |
 | `oracles/` | cross-validation scripts and their self-tests |
 
@@ -40,6 +40,7 @@ exits `2` only when nothing failed but something could not be evaluated.
 | `oracles/extract_cms.py` | slices `/Contents` DER and the signed byte ranges out of the file for `openssl cms -verify` / `openssl ts -verify`; structural checks: ByteRange starts at 0, gap is the dictionary's own `/Contents`, only zero padding after the CMS |
 | `oracles/pades_profile.py` | PAdES baseline: SubFilter, content-type, message-digest, signing-certificate-v2 present, signing-time absent, B-B/B-T level |
 | `oracles/text_check.py` | `pdftotext` contains / lacks strings |
+| `oracles/render_check.py` | `renderProbes`: dark pixels inside and outside a default-user-space rectangle of `pdftoppm -r 72 -gray -cropbox`, mapped through the crop box and `/Rotate` (M4 brief D-22) |
 
 ### `expect.json` reference
 
@@ -59,6 +60,9 @@ checks:
   "objectCount": 7,                             // in-use objects: pikepdf len(pdf.objects) minus its nulls
   "boxes": [{"mediaBox": [0, 0, 595, 842], "cropBox": [0, 0, 595, 842], "rotation": 90,
              "width": 842, "height": 595}], // per page (PageInfo JSON): pdfinfo -box -f 1 -l N
+  "renderProbes": [{"page": 0, "rect": [300, 100, 500, 160], "minDark": 50, "maxDarkOutside": 900}],
+                                                // dark (< 128) pixels of pdftoppm -r 72 -gray -cropbox in / outside a
+                                                // default-user-space rect (through the crop box and /Rotate); page 0-based
   "knownFailures": {"structure.pypdf": "why"},  // still run; a failure is XFAIL, a pass is FAIL (stale)
   "oracleSkip": "why",                          // SKIP: no check runs (files the oracles would repair)
   "trustRoots": ["fixtures/pki/root.pem"],      // trust anchors for "trusted"
@@ -70,7 +74,10 @@ checks:
     "modification": "none",                     // none | ltaUpdates | formFilling | annotations | other | null
     "docmdp": null, "docmdpOk": true,           // certification level P (1-3) or null
     "pades": "B-B",                             // true | false | "B-B" | "B-T"
-    "timestamp": false                          // signature timestamp token present and valid
+    "timestamp": false,                         // true: token present, pyHanko intact+valid, openssl ts -verify OK;
+                                                // false: no token; "invalid": present, pyHanko not intact+valid,
+                                                // and openssl ts -verify fails (M4 D-22)
+    "timestampTrusted": true                    // pyHanko timestamp_validity.trusted (needs trustRoots)
   }, {
     "field": "Signature2", "rejected": true     // negative case (D-3): every oracle must reject it
   }]

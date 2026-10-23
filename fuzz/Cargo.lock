@@ -420,6 +420,7 @@ dependencies = [
 name = "folioxide-fuzz"
 version = "0.0.0"
 dependencies = [
+ "folioxide-content",
  "folioxide-model",
  "folioxide-sign",
  "folioxide-syntax",
@@ -476,6 +477,8 @@ name = "folioxide-testkit"
 version = "0.1.0"
 dependencies = [
  "folioxide-syntax",
+ "sha1",
+ "sha2",
 ]
 
 [[package]]

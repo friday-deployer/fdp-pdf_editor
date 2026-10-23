@@ -85,7 +85,8 @@ fn verify_own_signature_all_fields() {
     assert_eq!(r.contact_info.as_deref(), Some("+49 30 000000"));
     assert_eq!(r.pades_level, Some(PadesLevel::BB));
     assert_eq!(r.docmdp, None);
-    assert_eq!(r.docmdp_ok, None);
+    // M4 D-13: docmdp_ok is computed for every signature (P = 2 in force for an approval).
+    assert_eq!(r.docmdp_ok, Some(true));
     assert!(r.problems.is_empty());
 
     // Without trust anchors there is no trust verdict.
@@ -282,18 +283,19 @@ fn verify_pyhanko_fixture_agrees() {
                 "{name}: {}",
                 summary(r)
             );
-            if r.kind == SignatureKind::DocTimeStamp {
-                assert!(r.has_problem(ProblemCode::PendingTimestampVerification));
-            } else {
-                assert!(r.is_valid(), "{name}: {}", summary(r));
-                assert_eq!(r.trusted, Some(true), "{name}: {:?}", r.warnings);
-            }
+            // Document timestamps too, since M4 (brief §5 V7c).
+            assert!(r.is_valid(), "{name}: {}", summary(r));
+            assert_eq!(r.trusted, Some(true), "{name}: {:?}", r.warnings);
         }
         let last = reports.last().unwrap();
         assert_eq!(last.coverage, Coverage::EntireFile, "{name}");
         assert_eq!(last.modification, ModificationLevel::None, "{name}");
         // Earlier signatures: a later signature is form filling, a document timestamp an LTA
-        // update, as pyHanko says.
+        // update, as pyHanko says. A new visible approval after a certification is `other`
+        // (pyHanko; M4 brief §5.3 C1, WP4.2A).
+        if name == "pyhanko-certified-p2-visible-approval.pdf" {
+            continue;
+        }
         for r in &reports[..reports.len() - 1] {
             assert!(
                 r.modification <= ModificationLevel::FormFilling,
@@ -339,7 +341,8 @@ fn verify_orphan_reported() {
 }
 
 /// A signed-looking file whose only signature dictionary is a document timestamp
-/// (`/SubFilter /ETSI.RFC3161`, §12.8.5) holding a CMS that is not a timestamp token.
+/// (`/SubFilter /ETSI.RFC3161`, §12.8.5) holding a CMS that is not a timestamp token (a
+/// detached `id-data` SignedData).
 fn doc_timestamp_file() -> Vec<u8> {
     let doc = open(&syntax::minimal());
     let placeholder = write_placeholder(&doc, &SignatureOptions::new(time())).unwrap();
@@ -358,19 +361,23 @@ fn doc_timestamp_file() -> Vec<u8> {
     pdf
 }
 
+/// M3's `verify_doc_timestamp_listed`, now that document timestamps are verified (M4 brief §5
+/// V7c; `verify_doc_timestamp.rs` covers real tokens): a CMS that is not a timestamp token is
+/// `TimestampMalformed`, never `PendingTimestampVerification`.
 #[test]
-fn verify_doc_timestamp_listed() {
+fn verify_doc_timestamp_not_a_token_is_malformed() {
     let reports = verify(&doc_timestamp_file());
     assert_eq!(reports.len(), 1);
     let r = &reports[0];
     assert_eq!(r.kind, SignatureKind::DocTimeStamp);
     assert_eq!(r.sub_filter.as_deref(), Some("ETSI.RFC3161"));
     assert!(
-        r.has_problem(ProblemCode::PendingTimestampVerification),
+        r.has_problem(ProblemCode::TimestampMalformed),
         "{}",
         summary(r)
     );
-    assert!(!r.signature_valid);
+    assert!(!r.has_problem(ProblemCode::PendingTimestampVerification));
+    assert!(!r.intact && !r.signature_valid);
     assert!(!r.is_valid());
     assert!(
         r.byte_range_ok,
@@ -378,6 +385,8 @@ fn verify_doc_timestamp_listed() {
         summary(r)
     );
     assert_eq!(r.coverage, Coverage::EntireFile);
+    let token = r.timestamp.as_ref().expect("the token's entry");
+    assert!(!token.intact && !token.valid);
 }
 
 #[test]
@@ -434,14 +443,22 @@ fn verify_direct_and_broken_values() {
 #[test]
 fn verify_trailing_eol_tolerated() {
     let signed = sign_default(&syntax::minimal(), &p384());
-    for tail in [&b"\r\n"[..], b"\n", b"% a comment, not an update\n"] {
+    assert!(signed.ends_with(b"%%EOF\n"));
+    // Manager ruling R-17 (b), M4 QA round 5: at most two end-of-line bytes may follow the last
+    // `%%EOF`; more (a CR LF after its LF, a comment, white-space) is a change after signing
+    // that makes poppler, once 1,024 bytes of it hide `startxref`, rebuild the file.
+    for (tail, level) in [
+        (&b"\n"[..], ModificationLevel::None),
+        (b"\r\n", ModificationLevel::Other),
+        (b"% a comment, not an update\n", ModificationLevel::Other),
+    ] {
         let mut longer = signed.clone();
         longer.extend_from_slice(tail);
         let r = &verify(&longer)[0];
         assert!(r.is_valid(), "{tail:?}: {}", summary(r));
         assert_eq!(r.coverage, Coverage::EntireRevision, "{tail:?}");
         assert_eq!(r.signed_revision, Some(1));
-        assert_eq!(r.modification, ModificationLevel::None, "{tail:?}");
+        assert_eq!(r.modification, level, "{tail:?}");
     }
     // The signed bytes may also end a byte or two before the revision's end of line: the
     // newest revision is found with up to two CR/LF bytes of slack.

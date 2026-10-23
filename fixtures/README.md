@@ -38,6 +38,7 @@ Paths are relative to `fixtures/`. "Generator" is the command that recreates the
 | `pki/*.p12` | PKCS#12 bundles: `signer-rsa2048-{modern,3des,rc2-40}.p12`, `signer-p256-modern.p12` | `bash tools/gen-pki.sh` | MIT |
 | `pki/signer-rsa2048.key.pkcs1.pem`, `pki/signer-rsa3072.key.pkcs1.pem` | the RSA signer keys as PKCS#1 (`BEGIN RSA PRIVATE KEY`), derived from `signer-*.key.pem` | `bash tools/gen-pki.sh --derive` | MIT |
 | `pki/signer-p256.key.sec1.pem`, `pki/signer-p384.key.sec1.pem` | the EC signer keys as SEC1 (`BEGIN EC PRIVATE KEY`, named curve), derived from `signer-*.key.pem` | `bash tools/gen-pki.sh --derive` | MIT |
+| `pki/tsa-eku-noncritical.pem`, `pki/tsa-no-eku.pem`, `pki/tsa-eku-extra.pem`, `pki/tsa-ku-keyenc.pem`, `pki/tsa-not-yet-valid.pem` | TSA certificate variants for `tsa.key.pem`, issued by the root (M4 brief D-21): a non-critical EKU, no EKU, EKU timeStamping + codeSigning, KU digitalSignature + keyEncipherment, and the normal TSA extensions valid only from 2070; each fails OpenSSL's timestamping purpose | `bash tools/gen-pki.sh --tsa-variants` | MIT |
 
 `bash tools/gen-pki.sh --check` validates the committed PKI without regenerating it; see
 `pki/README.md` for the hierarchy, the algorithms and the password (`folioxide`).
@@ -52,7 +53,8 @@ trust-path certificates of `sign/chain/`, and PDFs signed by other signers in `s
 
 - Regenerate with `.venv/bin/python -I tools/fixtures/sign.py` (oracle venv and OpenSSL 3.x),
   in the same change as a regenerated `pki/` (everything here uses its keys); `--only cms`,
-  `--only chain` or `--only pdf` rewrites one group. Signing times, serial numbers and ECDSA
+  `--only chain`, `--only pdf` or `--only tsa` rewrites one group, and `--pdf NAME` (with
+  `--only pdf`) only the named PDFs on top of the committed bases. Signing times, serial numbers and ECDSA
   nonces differ on every run, so the files are not reproducible byte for byte.
 - `.venv/bin/python -I tools/fixtures/sign.py --check` verifies the committed files: every CMS
   with `openssl cms -verify` and (detached ones) pyHanko's `async_validate_detached_cms`, the
@@ -84,7 +86,12 @@ trust-path certificates of `sign/chain/`, and PDFs signed by other signers in `s
 | `sign/pdf/pyhanko-certified-p1.pdf`, `sign/pdf/pyhanko-certified-p2.pdf` | certification signatures (`/Perms /DocMDP`) with P=1 (P-256) and P=2 (RSA-2048) | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0 `certify`) | MIT |
 | `sign/pdf/pyhanko-doc-timestamp.pdf` | `pyhanko-p256.pdf` plus an `ETSI.RFC3161` document timestamp `DocTimeStamp1` from an in-process TSA with `pki/tsa` | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0 `PdfTimeStamper`) | MIT |
 | `sign/pdf/pyhanko-empty-field.pdf` | `syntax/minimal.pdf` with one empty (unsigned, invisible) signature field `Approval` | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0) | MIT |
+| `sign/pdf/pyhanko-bt-rsa2048.pdf` | `syntax/minimal.pdf` with one PAdES B-T signature by RSA-2048: a signature timestamp from pyHanko's in-process TSA with `pki/tsa` (DummyTimeStamper: ESS signing-certificate v1, microsecond `genTime`) (M4) | `tools/fixtures/sign.py --only pdf --pdf pyhanko-bt-rsa2048.pdf` (pyHanko 0.37.0) | MIT |
+| `sign/pdf/pyhanko-certified-p1-dts.pdf` | `pyhanko-certified-p1.pdf` plus a document timestamp `DocTimeStamp1` (pyHanko: `ltaUpdates`, `docmdpOk` true; for the `certify` suite, M4) | `tools/fixtures/sign.py --only pdf --pdf pyhanko-certified-p1-dts.pdf` (pyHanko 0.37.0 `PdfTimeStamper`) | MIT |
+| `sign/pdf/pyhanko-certified-p2-visible-approval.pdf` | `pyhanko-certified-p2.pdf` plus an approval signature `Signature2` (P-256) in a **new visible** field at `[300 100 500 160]` (pyHanko: the certification becomes `other`, `docmdpOk` false; for the `certify` suite, M4) | `tools/fixtures/sign.py --only pdf --pdf pyhanko-certified-p2-visible-approval.pdf` (pyHanko 0.37.0) | MIT |
 | `sign/pdf/openssl-rsa2048.pdf`, `sign/pdf/openssl-p256-cades.pdf`, `sign/pdf/openssl-rsa2048-sha1.pdf` | a CMS made by `openssl cms -sign` over the byte ranges of a pyHanko placeholder, embedded unchanged: SHA-256 (`adbe.pkcs7.detached`), `-cades` (`ETSI.CAdES.detached`, with signing-time), and SHA-1 (weak: intact and valid, never trusted) | `tools/fixtures/sign.py --only pdf` (pyHanko 0.37.0, OpenSSL 3.0) | MIT |
+| `sign/tsa/openssl-reply.tsq`, `sign/tsa/openssl-reply.tsr` | the RFC 3161 request Folioxide makes for the deterministic RSA-2048 signature value of `syntax/minimal.pdf` (signed at `D:20261010120000Z`, nonce `0x0102030405060708`, written by the Rust test `bt_external_openssl_token_embedded`), and `openssl ts -reply` with `tools/tsa/openssl-tsa.cnf` (two RSA certificates, signing-certificate-v2, `tsa` name); stale when the signed bytes of `minimal.pdf` change (M4 brief R-15) | `tools/fixtures/sign.py --only tsa` (cargo, OpenSSL 3.0) | MIT |
+| `sign/tsa/pyhanko-dummy.tsq`, `sign/tsa/pyhanko-dummy.tsr` | the same request answered by pyHanko's DummyTimeStamper with `pki/tsa` (ESS signing-certificate v1, microsecond `genTime`) | `tools/fixtures/sign.py --only tsa` (pyHanko 0.37.0) | MIT |
 
 ### `syntax/`: generated syntax-layer fixtures
 
@@ -187,3 +194,24 @@ that are generated at test time and never committed.
 | `hostile/hostile-objstm-header-pairs.pdf` | `objstm_header_pairs(5000)`: an object stream whose header lists 5,000 members, all at offset 0 | `cargo xtask fixtures` | MIT |
 | `hostile/hostile-objstm-big-array.pdf` | `objstm_big_array(5000)`: an object stream holding one array of 5,000 zeros | `cargo xtask fixtures` | MIT |
 <!-- END GENERATED fixtures/hostile -->
+
+### `images/`: JPEG inputs for `folioxide-content` and visible signatures
+
+Small JPEG files for the header parser and `/DCTDecode` passthrough of
+`folioxide_content::image::jpeg` (M4 brief §4.7, decision D-17) and for the visible-signature
+tests and oracle cases (brief §6.2, §6.3). `fixtures/images/generate.py` writes all of them:
+the test pattern is 48 x 32 pixels with black and red quadrants on top and white and blue ones
+below. The output depends on the libjpeg-turbo bundled with Pillow and on poppler, so it is not
+byte-reproducible across machines; the tests rely only on the headers the rows describe.
+
+- Regenerate with `python3 -I fixtures/images/generate.py` (Pillow 12.3.0 and poppler
+  24.02.0's `pdftoppm`).
+
+| Files | What | Generator | License |
+|---|---|---|---|
+| `images/generate.py` | the generator of the files below | hand-written | MIT |
+| `images/gray-baseline.jpg` | `syntax/minimal.pdf` rendered by `pdftoppm -gray -r 10 -singlefile` (85 x 110), saved by Pillow as a one-component baseline (SOF0) JFIF; `pdftoppm -jpeg -gray` itself writes three components | `fixtures/images/generate.py` (poppler 24.02.0, Pillow 12.3.0) | MIT |
+| `images/rgb-baseline.jpg`, `images/rgb-progressive.jpg` | the test pattern as YCbCr JFIF (component IDs 1, 2, 3), baseline (SOF0) and progressive (SOF2) | `fixtures/images/generate.py` (Pillow 12.3.0) | MIT |
+| `images/rgb-adobe.jpg` | the test pattern stored as RGB (`keep_rgb=True`): component IDs `R`, `G`, `B` and an Adobe APP14 marker with transform 0 | `fixtures/images/generate.py` (Pillow 12.3.0) | MIT |
+| `images/rgb-ids.jpg` | `rgb-adobe.jpg` with the APP14 segment removed: only the component IDs say RGB, so the image XObject gets `/DecodeParms << /ColorTransform 0 >>` | `fixtures/images/generate.py` (Pillow 12.3.0) | MIT |
+| `images/cmyk.jpg` | the test pattern as CMYK (four components, Adobe APP14): refused as `Unsupported` until M7 | `fixtures/images/generate.py` (Pillow 12.3.0) | MIT |

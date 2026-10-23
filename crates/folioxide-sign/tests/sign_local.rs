@@ -16,9 +16,7 @@ use folioxide_sign::algorithms::DigestAlgorithm;
 use folioxide_sign::field::{FieldSpec, SubFilter};
 use folioxide_sign::placeholder::check_signable;
 use folioxide_sign::prepare::{PrepareRequest, PreparedSignature, SignatureOptions, prepare};
-use folioxide_sign::report::{
-    Coverage, ModificationLevel, PadesLevel, SignatureKind, SignatureReport,
-};
+use folioxide_sign::report::{Coverage, ModificationLevel, PadesLevel, SignatureReport};
 use folioxide_sign::sign::{SignRequest, sign};
 use folioxide_sign::signer::{LocalSigner, Signer};
 use folioxide_syntax::{ErrorCode, OpenOptions};
@@ -306,8 +304,12 @@ fn sign_after_pyhanko_signature() {
     for (name, source) in pyhanko_fixtures() {
         let doc = open(&source);
         if check_signable(&doc).is_err() {
-            // The certified P=1 document; sign_refuses_certified_p1 covers it.
-            assert_eq!(name, "pyhanko-certified-p1.pdf");
+            // The certified P=1 documents; sign_refuses_certified_p1 covers them.
+            assert!(name.starts_with("pyhanko-certified-p1"), "{name}");
+            continue;
+        }
+        if name == "pyhanko-certified-p2-visible-approval.pdf" {
+            // Its certification is already `other` (pyHanko; M4 brief §5.3 C1).
             continue;
         }
         let before = verify(&source).len();
@@ -315,9 +317,12 @@ fn sign_after_pyhanko_signature() {
         let reports = verify(&signed);
         assert_eq!(reports.len(), before + 1, "{name}");
         for report in &reports[..before] {
-            // A document timestamp is listed, not verified, in M3.
-            let verified = report.kind == SignatureKind::DocTimeStamp || report.signature_valid;
-            assert!(report.intact && verified, "{name}: {}", summary(report));
+            // A document timestamp is verified as a token since M4 (brief §5 V7c).
+            assert!(
+                report.intact && report.signature_valid,
+                "{name}: {}",
+                summary(report)
+            );
             assert_eq!(report.coverage, Coverage::EntireRevision, "{name}");
             assert_eq!(
                 report.modification,
@@ -482,7 +487,8 @@ fn sign_refuses_certified_p1() {
         .unwrap();
     assert!(ours.is_valid(), "{}", summary(&ours));
 
-    // The pyHanko-certified P=1 fixture is refused too, and only that one.
+    // The pyHanko-certified P=1 fixtures (M4: also with a document timestamp) are refused too,
+    // and only those.
     let mut refused = Vec::new();
     for (name, source) in pyhanko_fixtures() {
         let doc = open(&source);
@@ -492,7 +498,10 @@ fn sign_refuses_certified_p1() {
             refused.push(name);
         }
     }
-    assert_eq!(refused, ["pyhanko-certified-p1.pdf"]);
+    assert_eq!(
+        refused,
+        ["pyhanko-certified-p1-dts.pdf", "pyhanko-certified-p1.pdf"]
+    );
 }
 
 #[test]

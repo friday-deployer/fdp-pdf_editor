@@ -40,18 +40,22 @@ use folioxide_syntax::{
 use crate::algorithms::{
     DigestAlgorithm, KeyKind, SignatureAlgorithm, check_signing_combination, default_digest,
 };
+use crate::appearance::{AppearanceText, SignatureAppearance};
 use crate::cms::{self, MAX_CERTIFICATES, SignedAttrsInput};
+use crate::docmdp::DocMdpPermissions;
 use crate::error::{Error, Result};
 use crate::field::{self, FieldSpec, SubFilter};
 use crate::placeholder::{self, MAX_CONTENTS_RESERVE};
 use crate::x509info;
 
 /// The options of a signature: which field, the claimed signing time, the digest, the
-/// SubFilter, the optional text entries of the signature dictionary and the `/Contents`
-/// reserve (M3 brief §3.2).
+/// SubFilter, the optional text entries of the signature dictionary, the `/Contents` reserve
+/// (M3 brief §3.2), and certification, a visible appearance and the timestamp token budget
+/// (M4 brief §3.2).
 ///
 /// With the `serde` feature the fields are `camelCase` (`signingTime` as a PDF date string,
-/// `subFilter`, `contactInfo`, `contentsReserve`); all but `signingTime` are optional.
+/// `subFilter`, `contactInfo`, `contentsReserve`, `certification` as the number `P`,
+/// `appearance`, `tsaReserve`); all but `signingTime` are optional.
 ///
 /// ```
 /// use folioxide_model::PdfDate;
@@ -104,6 +108,36 @@ pub struct SignatureOptions {
     /// At most [`MAX_CONTENTS_RESERVE`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub contents_reserve: Option<usize>,
+    /// Certify the document with these DocMDP permissions (ISO 32000-2 §12.8.2.2; M4 brief
+    /// §4.6); `None`: an approval signature.
+    ///
+    /// A certification writes `/Reference [<</Type /SigRef /TransformMethod /DocMDP
+    /// /TransformParams <</Type /TransformParams /P n /V /1.2>>>>]` into the signature dictionary
+    /// and `/Perms <</DocMDP sig>>` into the catalog. It must be the document's first signature:
+    /// it is refused ([`Error::DocMdpForbids`]) when a signature field is signed already
+    /// (document timestamps included) or the catalog has `/Perms /DocMDP`. On a certified
+    /// document an approval signature is refused when `P = 1`, and when it would create a new
+    /// visible field.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub certification: Option<DocMdpPermissions>,
+    /// Make the signature visible with this appearance (M4 brief §4.7); `None`: invisible.
+    ///
+    /// The widget, its appearance stream, font and image are written in the signature's own
+    /// incremental update. A new field needs the appearance's
+    /// [`rect`](SignatureAppearance::rect) (default user space of
+    /// [`FieldSpec::page`](crate::field::FieldSpec)'s page); an existing empty signature field
+    /// keeps its `/Rect`. On a certified document a new visible field is refused
+    /// ([`Error::DocMdpForbids`], D-3); the certifying signature itself may be visible. See
+    /// [`appearance`](crate::appearance) for the layout.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub appearance: Option<SignatureAppearance>,
+    /// The bytes of RFC 3161 timestamp token to budget in `/Contents` (M4 brief §4.4): the
+    /// placeholder is sized for a CMS that also carries a token of exactly this length. `None`
+    /// (or 0): no token, except that [`sign`](crate::sign::sign) with a timestamper uses
+    /// [`DEFAULT_TSA_RESERVE`](crate::tsp::DEFAULT_TSA_RESERVE). At most
+    /// [`MAX_CONTENTS_RESERVE`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tsa_reserve: Option<usize>,
 }
 
 impl SignatureOptions {
@@ -119,6 +153,9 @@ impl SignatureOptions {
             location: None,
             contact_info: None,
             contents_reserve: None,
+            certification: None,
+            appearance: None,
+            tsa_reserve: None,
         }
     }
 
@@ -182,6 +219,27 @@ impl SignatureOptions {
     #[must_use]
     pub fn with_contents_reserve(mut self, contents_reserve: Option<usize>) -> Self {
         self.contents_reserve = contents_reserve;
+        self
+    }
+
+    /// Sets [`SignatureOptions::certification`].
+    #[must_use]
+    pub fn with_certification(mut self, certification: Option<DocMdpPermissions>) -> Self {
+        self.certification = certification;
+        self
+    }
+
+    /// Sets [`SignatureOptions::appearance`].
+    #[must_use]
+    pub fn with_appearance(mut self, appearance: Option<SignatureAppearance>) -> Self {
+        self.appearance = appearance;
+        self
+    }
+
+    /// Sets [`SignatureOptions::tsa_reserve`].
+    #[must_use]
+    pub fn with_tsa_reserve(mut self, tsa_reserve: Option<usize>) -> Self {
+        self.tsa_reserve = tsa_reserve;
         self
     }
 }
@@ -275,10 +333,17 @@ impl PrepareRequest {
 /// - [`Error::InvalidArgument`]: an empty certificate chain or one with more than
 ///   [`MAX_CERTIFICATES`] certificates; an algorithm that does not
 ///   match the signer certificate's key; a digest or key the combination rules refuse
-///   ([`check_signing_combination`]); a reserve of 0 or above [`MAX_CONTENTS_RESERVE`]; a file
-///   too large for the ten-digit byte range.
+///   ([`check_signing_combination`]); a reserve of 0 or above [`MAX_CONTENTS_RESERVE`], or a
+///   [`tsa_reserve`](SignatureOptions::tsa_reserve) above it; a file too large for the
+///   ten-digit byte range.
+/// - [`Error::InvalidArgument`], [`Error::Unsupported`] or an image error
+///   ([`ErrorCode::Image`](folioxide_syntax::ErrorCode::Image)) for an
+///   [`appearance`](SignatureOptions::appearance) that cannot be drawn: see
+///   [`appearance`](crate::appearance) and [`FieldSpec`].
+/// - [`Error::DocMdpForbids`]: the certification rules of M4 brief §4.6 (see
+///   [`SignatureOptions::certification`]).
 /// - [`Error::PlaceholderTooSmall`]: an explicit [`SignatureOptions::contents_reserve`] below the
-///   size the CMS needs (`needed` is that size: retry with it).
+///   size the CMS needs, with its timestamp token budget (`needed` is that size: retry with it).
 /// - The refusals of [`check_signable`](crate::placeholder::check_signable)
 ///   ([`Error::Unsupported`], [`Error::DocMdpForbids`], [`Error::InvalidArgument`]) and the field
 ///   placement errors ([`Error::PageOutOfRange`], [`Error::NotFound`], ...; see
@@ -307,10 +372,27 @@ pub(crate) fn prepare_with(
              {reserve}"
         )));
     }
-
-    // The document and the field, before any cryptography (brief §4.5 "Preconditions").
+    let tsa_reserve = options.tsa_reserve.unwrap_or(0);
+    if tsa_reserve > MAX_CONTENTS_RESERVE {
+        return Err(Error::InvalidArgument(format!(
+            "the timestamp token reserve must be at most {MAX_CONTENTS_RESERVE} bytes, not \
+             {tsa_reserve}"
+        )));
+    }
+    // The document and the field, before any cryptography (brief §4.5 "Preconditions"), with
+    // the certification rules of M4 brief §4.6.
     placeholder::check_signable(doc)?;
-    let plan = field::plan(doc, &options.field)?;
+    // The default appearance text names the signer: the certificate's common name, else its
+    // subject (M4 brief §4.7), unless the options name one.
+    let signer = match &options.appearance {
+        Some(appearance)
+            if appearance.text == AppearanceText::Default && options.name.is_none() =>
+        {
+            Some(cms.display_name(signer_cert)?)
+        }
+        _ => None,
+    };
+    let plan = field::plan(doc, options, signer.as_deref())?;
 
     // Key, algorithm and digest (brief §3.1).
     let key_kind = cms.key_kind(signer_cert)?;
@@ -325,20 +407,35 @@ pub(crate) fn prepare_with(
     check_signing_combination(key_kind, digest)?;
 
     // Exact size first (brief §4.2 step 1): the signed attributes' length does not depend on the
-    // digest value.
+    // digest value. With a timestamp token budget, the CMS also carries a token of exactly that
+    // many bytes (M4 brief §4.4).
     let zero = vec![0u8; digest.output_len()];
     let sizing_attrs = cms.build_signed_attrs(&SignedAttrsInput {
         digest,
         document_digest: &zero,
         signer_cert_der: signer_cert,
     })?;
-    let needed = cms.cms_len_upper_bound(
-        &sizing_attrs,
-        &req.chain_der,
-        req.algorithm,
-        key_kind,
-        digest,
-    )?;
+    let needed_for = |signed_attrs: &[u8]| {
+        if tsa_reserve == 0 {
+            cms.cms_len_upper_bound(
+                signed_attrs,
+                &req.chain_der,
+                req.algorithm,
+                key_kind,
+                digest,
+            )
+        } else {
+            cms.cms_len_upper_bound_with_timestamp(
+                signed_attrs,
+                &req.chain_der,
+                req.algorithm,
+                key_kind,
+                digest,
+                tsa_reserve,
+            )
+        }
+    };
+    let needed = needed_for(&sizing_attrs)?;
     let reserve = placeholder::contents_reserve(options.contents_reserve, needed)?;
 
     // The update, the byte range and the digest (steps 2–5).
@@ -352,13 +449,7 @@ pub(crate) fn prepare_with(
         signer_cert_der: signer_cert,
     })?;
     if signed_attrs.len() != sizing_attrs.len() {
-        let needed = cms.cms_len_upper_bound(
-            &signed_attrs,
-            &req.chain_der,
-            req.algorithm,
-            key_kind,
-            digest,
-        )?;
+        let needed = needed_for(&signed_attrs)?;
         if needed > reserve {
             return Err(Error::PlaceholderTooSmall {
                 needed,
@@ -412,6 +503,9 @@ fn check_chain(chain: &[Vec<u8>]) -> Result<&[u8]> {
 pub(crate) trait CmsBackend {
     /// [`x509info::certificate_key_kind`].
     fn key_kind(&self, cert_der: &[u8]) -> Result<KeyKind>;
+    /// The certificate's first common name, else its subject (RFC 4514), as
+    /// [`x509info::certificate_info`] reads them: the signer's name in a default appearance text.
+    fn display_name(&self, cert_der: &[u8]) -> Result<String>;
     /// [`cms::build_signed_attrs`].
     fn build_signed_attrs(&self, input: &SignedAttrsInput<'_>) -> Result<Vec<u8>>;
     /// [`cms::cms_len_upper_bound`].
@@ -423,6 +517,16 @@ pub(crate) trait CmsBackend {
         kind: KeyKind,
         digest: DigestAlgorithm,
     ) -> Result<usize>;
+    /// [`cms::cms_len_upper_bound_with_timestamp`].
+    fn cms_len_upper_bound_with_timestamp(
+        &self,
+        signed_attrs: &[u8],
+        chain_der: &[Vec<u8>],
+        alg: SignatureAlgorithm,
+        kind: KeyKind,
+        digest: DigestAlgorithm,
+        token_len: usize,
+    ) -> Result<usize>;
 }
 
 /// The library's CMS operations: [`x509info`] and [`cms`].
@@ -431,6 +535,11 @@ pub(crate) struct RealCms;
 impl CmsBackend for RealCms {
     fn key_kind(&self, cert_der: &[u8]) -> Result<KeyKind> {
         x509info::certificate_key_kind(cert_der)
+    }
+
+    fn display_name(&self, cert_der: &[u8]) -> Result<String> {
+        let info = x509info::certificate_info(cert_der)?;
+        Ok(info.common_name.unwrap_or(info.subject))
     }
 
     fn build_signed_attrs(&self, input: &SignedAttrsInput<'_>) -> Result<Vec<u8>> {
@@ -446,6 +555,25 @@ impl CmsBackend for RealCms {
         digest: DigestAlgorithm,
     ) -> Result<usize> {
         cms::cms_len_upper_bound(signed_attrs, chain_der, alg, kind, digest)
+    }
+
+    fn cms_len_upper_bound_with_timestamp(
+        &self,
+        signed_attrs: &[u8],
+        chain_der: &[Vec<u8>],
+        alg: SignatureAlgorithm,
+        kind: KeyKind,
+        digest: DigestAlgorithm,
+        token_len: usize,
+    ) -> Result<usize> {
+        cms::cms_len_upper_bound_with_timestamp(
+            signed_attrs,
+            chain_der,
+            alg,
+            kind,
+            digest,
+            token_len,
+        )
     }
 }
 
@@ -1374,6 +1502,8 @@ pub(crate) mod test_double {
     pub(crate) const P384_CERT: &[u8] = b"fake-cert:p384";
     /// What the double's CMS adds to the signed attributes, certificates and signature.
     pub(crate) const OVERHEAD: usize = 1500;
+    /// What the double's CMS adds around a timestamp token (the unsigned attribute).
+    pub(crate) const TIMESTAMP_ATTRIBUTE_OVERHEAD: usize = 32;
 
     /// The test double.
     pub(crate) struct FakeCms;
@@ -1406,6 +1536,11 @@ pub(crate) mod test_double {
                 P384_CERT => Ok(KeyKind::EcP384),
                 _ => Err(Error::Certificate("not a test-double certificate".into())),
             }
+        }
+
+        fn display_name(&self, cert_der: &[u8]) -> Result<String> {
+            self.key_kind(cert_der)?;
+            Ok("Test Double".to_owned())
         }
 
         fn build_signed_attrs(&self, input: &SignedAttrsInput<'_>) -> Result<Vec<u8>> {
@@ -1451,6 +1586,22 @@ pub(crate) mod test_double {
                 + chain_der.iter().map(Vec::len).sum::<usize>()
                 + kind.max_signature_len()
                 + OVERHEAD)
+        }
+
+        fn cms_len_upper_bound_with_timestamp(
+            &self,
+            signed_attrs: &[u8],
+            chain_der: &[Vec<u8>],
+            alg: SignatureAlgorithm,
+            kind: KeyKind,
+            digest: DigestAlgorithm,
+            token_len: usize,
+        ) -> Result<usize> {
+            Ok(
+                self.cms_len_upper_bound(signed_attrs, chain_der, alg, kind, digest)?
+                    + token_len
+                    + TIMESTAMP_ATTRIBUTE_OVERHEAD,
+            )
         }
     }
 }
@@ -1670,6 +1821,85 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// M4 brief §4.4: with a timestamp token budget, the placeholder is sized for the CMS plus
+    /// a token of exactly that many bytes, and an explicit reserve below that fails before
+    /// anything is signed.
+    #[test]
+    fn prepare_sizes_for_the_tsa_reserve() {
+        use super::test_double::TIMESTAMP_ATTRIBUTE_OVERHEAD;
+        let req = request(P256_CERT, SignatureAlgorithm::Ecdsa);
+        let base = needed(&req, KeyKind::EcP256, DigestAlgorithm::Sha256);
+        let doc = open(&syntax::minimal());
+        let with = |options: SignatureOptions| req.clone().with_options(options);
+
+        // None and 0 budget no token.
+        for none in [None, Some(0)] {
+            let options = req.options.clone().with_tsa_reserve(none);
+            let p = prepare_with(&doc, &with(options), &FakeCms).unwrap();
+            assert_eq!(p.contents_capacity(), default_contents_reserve(base));
+        }
+        let token = 8192;
+        let needed = base + token + TIMESTAMP_ATTRIBUTE_OVERHEAD;
+        let options = req.options.clone().with_tsa_reserve(Some(token));
+        let p = prepare_with(&doc, &with(options.clone()), &FakeCms).unwrap();
+        assert_eq!(p.contents_capacity(), default_contents_reserve(needed));
+        assert!(p.contents_capacity() > base + token);
+
+        let small = options.clone().with_contents_reserve(Some(needed - 1));
+        let err = prepare_with(&doc, &with(small), &FakeCms).unwrap_err();
+        assert!(
+            matches!(err, Error::PlaceholderTooSmall { needed: n, .. } if n == needed),
+            "{err:?}"
+        );
+        let exact = options.with_contents_reserve(Some(needed));
+        let p = prepare_with(&doc, &with(exact), &FakeCms).unwrap();
+        assert_eq!(p.contents_capacity(), needed);
+
+        let huge = req
+            .options
+            .clone()
+            .with_tsa_reserve(Some(MAX_CONTENTS_RESERVE + 1));
+        let err = prepare_with(&doc, &with(huge), &FakeCms).unwrap_err();
+        assert_eq!(err.code(), folioxide_syntax::ErrorCode::InvalidArgument);
+    }
+
+    /// M4: certification is prepared (brief §4.6), and so is a visible appearance (brief §4.7):
+    /// the widget's /Rect and /AP and the form XObject are in the update.
+    #[test]
+    fn prepare_writes_m4_options() {
+        use crate::appearance::SignatureAppearance;
+        use crate::docmdp::DocMdpPermissions;
+        let req = request(P256_CERT, SignatureAlgorithm::Ecdsa);
+        let doc = open(&syntax::minimal());
+        let certify = req
+            .options
+            .clone()
+            .with_certification(Some(DocMdpPermissions::NoChanges));
+        let prepared = prepare_with(&doc, &req.clone().with_options(certify), &FakeCms).unwrap();
+        let text = String::from_utf8_lossy(&prepared.pdf);
+        assert!(
+            text.contains("/Reference [<</Type /SigRef /TransformMethod /DocMDP"),
+            "{text}"
+        );
+        let visible = req
+            .options
+            .clone()
+            .with_appearance(Some(SignatureAppearance::new(folioxide_model::Rect::new(
+                0.0, 0.0, 100.0, 50.0,
+            ))));
+        let prepared = prepare_with(&doc, &req.clone().with_options(visible), &FakeCms).unwrap();
+        let text = String::from_utf8_lossy(&prepared.pdf);
+        assert!(
+            text.contains("/Rect [0 0 100 50] /P 3 0 R /AP <</N "),
+            "{text}"
+        );
+        assert!(text.contains("/Subtype /Form /BBox [0 0 100 50]"), "{text}");
+        assert!(
+            text.contains("/BaseFont /Helvetica /Encoding /WinAnsiEncoding"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1985,6 +2215,23 @@ mod tests {
         assert!(json.get("contactInfo").is_some());
         let back: SignatureOptions = serde_json::from_value(json).unwrap();
         assert_eq!(back, options);
+        // M4: certification is the number P, the appearance an object, the token budget a
+        // number.
+        let m4 = options
+            .clone()
+            .with_certification(Some(crate::docmdp::DocMdpPermissions::FormFilling))
+            .with_appearance(Some(
+                crate::appearance::SignatureAppearance::for_existing_field(),
+            ))
+            .with_tsa_reserve(Some(8192));
+        let json = serde_json::to_value(&m4).unwrap();
+        assert_eq!(json["certification"], 2);
+        assert_eq!(json["tsaReserve"], 8192);
+        assert!(json["appearance"].is_object());
+        assert_eq!(
+            serde_json::from_value::<SignatureOptions>(json).unwrap(),
+            m4
+        );
         // Only the signing time is required.
         let minimal: SignatureOptions =
             serde_json::from_value(serde_json::json!({"signingTime": "D:20261010120000Z"}))

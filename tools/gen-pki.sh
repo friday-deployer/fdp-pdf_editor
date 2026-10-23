@@ -5,6 +5,8 @@
 #   bash tools/gen-pki.sh [--dir DIR]           regenerate every file, then run the checks
 #   bash tools/gen-pki.sh --check [--dir DIR]   validate the committed files (no regeneration)
 #   bash tools/gen-pki.sh --derive [--dir DIR]  rewrite only the derived key files, then check
+#   bash tools/gen-pki.sh --tsa-variants [--dir DIR]
+#                                               issue only the TSA certificate variants, then check
 #
 # DIR defaults to fixtures/pki. Keys are random, so regeneration never reproduces the committed
 # bytes; that is why --check validates properties instead of comparing output. Requires OpenSSL 3.x
@@ -31,6 +33,14 @@
 #   signer-p256-modern.p12                   OpenSSL 3 defaults
 #   signer-{rsa2048,rsa3072}.key.pkcs1.pem   derived: the same RSA keys as PKCS#1 (BEGIN RSA PRIVATE KEY)
 #   signer-{p256,p384}.key.sec1.pem          derived: the same EC keys as SEC1 (BEGIN EC PRIVATE KEY)
+#   tsa-{eku-noncritical,no-eku,eku-extra,ku-keyenc,not-yet-valid}.pem
+#                                            TSA certificate variants (M4 brief D-21): issued by the
+#                                            root for the existing tsa.key.pem, each breaking one
+#                                            rule of RFC 3161 §2.3 / OpenSSL's timestamping purpose
+#                                            (non-critical EKU, no EKU, EKU timeStamping + codeSigning,
+#                                            KU digitalSignature + keyEncipherment, valid only from
+#                                            2070); --tsa-variants adds them without touching any
+#                                            other file
 # Every .p12 holds the signer key and certificate plus the intermediate and root certificates.
 # The derived files are a deterministic function of the committed keys (M3 brief §2, WP3.1B), so
 # --derive can add them without regenerating, and --check verifies they are up to date.
@@ -41,6 +51,9 @@ PASS="folioxide"
 NOT_BEFORE="20250101000000Z"
 NOT_AFTER="20751231235959Z"
 EXPIRED_NOT_AFTER="20251231235959Z"
+# The TSA variant that is not yet valid (M4 brief D-21) is valid from 2070 only.
+TSA_NOT_YET_VALID_FROM="20700101000000Z"
+TSA_VARIANTS=(tsa-eku-noncritical tsa-no-eku tsa-eku-extra tsa-ku-keyenc tsa-not-yet-valid)
 # 2075-01-01T00:00:00Z as a Unix timestamp: long-lived certificates must not expire before it.
 LONG_VALIDITY_EPOCH=3313526400
 DN_PREFIX="/O=Folioxide Test PKI/OU=TEST ONLY - DO NOT TRUST"
@@ -60,6 +73,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --check) mode="check" ;;
         --derive) mode="derive" ;;
+        --tsa-variants) mode="tsa-variants" ;;
         --dir)
             [ $# -ge 2 ] || { usage >&2; exit 2; }
             pki_dir="$2"
@@ -143,7 +157,71 @@ basicConstraints       = critical, CA:FALSE
 keyUsage               = critical, keyEncipherment, dataEncipherment
 subjectKeyIdentifier   = hash
 authorityKeyIdentifier = keyid:always
+
+[ ext_tsa_eku_noncritical ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, nonRepudiation
+extendedKeyUsage       = timeStamping
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+
+[ ext_tsa_no_eku ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, nonRepudiation
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+
+[ ext_tsa_eku_extra ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, nonRepudiation
+extendedKeyUsage       = critical, timeStamping, codeSigning
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+
+[ ext_tsa_ku_keyenc ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = critical, timeStamping
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
 EOF
+}
+
+# tsa_variant_spec <name>: "<extension section>|<CN>|<notBefore>"
+tsa_variant_spec() {
+    case "$1" in
+        tsa-eku-noncritical) echo "ext_tsa_eku_noncritical|Folioxide Test TSA (non-critical EKU)|$NOT_BEFORE" ;;
+        tsa-no-eku) echo "ext_tsa_no_eku|Folioxide Test TSA (no EKU)|$NOT_BEFORE" ;;
+        tsa-eku-extra) echo "ext_tsa_eku_extra|Folioxide Test TSA (EKU timeStamping and codeSigning)|$NOT_BEFORE" ;;
+        tsa-ku-keyenc) echo "ext_tsa_ku_keyenc|Folioxide Test TSA (KU keyEncipherment)|$NOT_BEFORE" ;;
+        tsa-not-yet-valid) echo "ext_tsa|Folioxide Test TSA (not yet valid)|$TSA_NOT_YET_VALID_FROM" ;;
+        *) echo "gen-pki: unknown TSA variant $1" >&2; exit 2 ;;
+    esac
+}
+
+# tsa_variants <dir>: issue the TSA certificate variants for <dir>/tsa.key.pem from <dir>/root.pem
+# (M4 brief D-21). Only the variant certificates are written; every other file stays unchanged.
+tsa_variants() {
+    local d="$1" name spec ext cn nb f
+    [ -f "$work/ca/ca.cnf" ] || write_ca_config
+    for f in root.pem root.key.pem tsa.key.pem; do
+        [ -f "$d/$f" ] || { echo "gen-pki: --tsa-variants needs $d/$f" >&2; exit 1; }
+    done
+    for name in "${TSA_VARIANTS[@]}"; do
+        spec="$(tsa_variant_spec "$name")"
+        ext="${spec%%|*}"
+        cn="${spec#*|}"
+        cn="${cn%|*}"
+        nb="${spec##*|}"
+        openssl req -new -config "$work/ca/ca.cnf" -key "$d/tsa.key.pem" \
+            -subj "$DN_PREFIX/CN=$cn" -out "$work/$name.csr"
+        openssl ca -batch -notext -rand_serial -config "$work/ca/ca.cnf" \
+            -cert "$d/root.pem" -keyfile "$d/root.key.pem" -md sha256 -extensions "$ext" \
+            -startdate "$nb" -enddate "$NOT_AFTER" -in "$work/$name.csr" -out "$work/$name.pem" \
+            2>"$work/$name.ca.log" || { cat "$work/$name.ca.log" >&2; exit 1; }
+        cp "$work/$name.pem" "$d/$name.pem"
+    done
+    echo "gen-pki: wrote ${#TSA_VARIANTS[@]} TSA certificate variants to $d"
 }
 
 # gen_key <out.key.pem> rsa:<bits>|ec:<curve>  -> unencrypted PKCS#8
@@ -220,6 +298,7 @@ generate() {
         -name "Folioxide Test Signer P-256" -out "$out/signer-p256-modern.p12"
 
     derive "$out"
+    tsa_variants "$out"
 
     mkdir -p "$pki_dir"
     local f
@@ -378,6 +457,9 @@ check() {
     for s in "${EC_SIGNERS[@]}"; do
         required+=("$s.key.sec1.pem")
     done
+    for s in "${TSA_VARIANTS[@]}"; do
+        required+=("$s.pem")
+    done
     local missing=0
     for f in "${required[@]}"; do
         if [ -f "$d/$f" ]; then ok; else fail "missing $d/$f"; missing=1; fi
@@ -454,6 +536,42 @@ check() {
     esac
     if cmp -s "$d/root.pem" "$d/tsa-root.pem"; then ok; else fail "tsa-root.pem is not a copy of root.pem"; fi
 
+    # TSA variants (M4 brief D-21): the TSA's key, issued by the root, and each refused by
+    # OpenSSL's timestamping purpose for exactly its own reason.
+    local v vout
+    for v in "${TSA_VARIANTS[@]}"; do
+        check_key_matches "$d/$v.pem" "$d/tsa.key.pem"
+        vout="$(openssl verify -x509_strict -no_check_time -CAfile "$d/root.pem" "$d/$v.pem" 2>&1 || true)"
+        if [ "$vout" = "$d/$v.pem: OK" ]; then ok; else fail "$v.pem chain: $vout"; fi
+        vout="$(openssl verify -purpose timestampsign -CAfile "$d/root.pem" "$d/$v.pem" 2>&1 || true)"
+        case "$v:$vout" in
+            tsa-not-yet-valid:*"not yet valid"*) ok ;;
+            tsa-not-yet-valid:*) fail "$v.pem must fail only because it is not yet valid: $vout" ;;
+            *:*"unsuitable certificate purpose"*) ok ;;
+            *) fail "$v.pem must fail OpenSSL's timestampsign purpose: $vout" ;;
+        esac
+    done
+    eku="$(ext_text "$d/tsa-eku-noncritical.pem" extendedKeyUsage)"
+    case "$eku" in
+        *critical*) fail "tsa-eku-noncritical.pem EKU is critical: $eku" ;;
+        *"Time Stamping"*) ok ;;
+        *) fail "tsa-eku-noncritical.pem EKU: $eku" ;;
+    esac
+    if [ -z "$(ext_text "$d/tsa-no-eku.pem" extendedKeyUsage)" ]; then ok; else fail "tsa-no-eku.pem has an EKU"; fi
+    case "$(ext_text "$d/tsa-eku-extra.pem" extendedKeyUsage)" in
+        *critical*"Time Stamping, Code Signing"*) ok ;;
+        *) fail "tsa-eku-extra.pem EKU is not critical timeStamping + codeSigning" ;;
+    esac
+    case "$(ext_text "$d/tsa-ku-keyenc.pem" keyUsage)" in
+        *critical*"Digital Signature, Key Encipherment"*) ok ;;
+        *) fail "tsa-ku-keyenc.pem keyUsage is not digitalSignature + keyEncipherment" ;;
+    esac
+    if [ "$(openssl x509 -in "$d/tsa-not-yet-valid.pem" -noout -startdate)" = "notBefore=Jan  1 00:00:00 2070 GMT" ]; then
+        ok
+    else
+        fail "tsa-not-yet-valid.pem notBefore is not 2070-01-01"
+    fi
+
     # Negative cases.
     if openssl x509 -in "$d/expired.pem" -noout -checkend 0 >/dev/null; then
         fail "expired.pem is not expired"
@@ -504,5 +622,7 @@ if [ "$mode" = "generate" ]; then
 elif [ "$mode" = "derive" ]; then
     derive "$pki_dir"
     echo "gen-pki: wrote the derived key files to $pki_dir"
+elif [ "$mode" = "tsa-variants" ]; then
+    tsa_variants "$pki_dir"
 fi
 check

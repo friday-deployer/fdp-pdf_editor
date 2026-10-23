@@ -22,5 +22,9 @@ shaping = []
 folioxide-syntax.workspace = true
 folioxide-model.workspace = true
 
+[dev-dependencies]
+# jpeg_parse_never_panics (M4 brief §6.2).
+proptest.workspace = true
+
 [lints]
 workspace = true

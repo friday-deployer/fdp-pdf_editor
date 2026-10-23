@@ -65,6 +65,12 @@ pub enum Error {
     /// The document's DocMDP permissions forbid the change (ISO 32000-2 §12.8.2.2).
     #[error("DocMDP permissions forbid the change: {0}")]
     DocMdpForbids(String),
+    /// An RFC 3161 timestamp could not be obtained or is not acceptable (M4 brief §4.2): the
+    /// TSA refused the request, its response or token fails a check (the message names the
+    /// check), or the [`Timestamper`](crate::tsp::Timestamper) failed to reach the TSA (by
+    /// convention `"TSA request failed: …"`).
+    #[error("timestamp invalid: {0}")]
+    TimestampInvalid(String),
 }
 
 impl Error {
@@ -96,6 +102,7 @@ impl Error {
             Error::PlaceholderTooSmall { .. } => ErrorCode::SignaturePlaceholderTooSmall,
             Error::SignatureInvalid(_) => ErrorCode::SignatureInvalid,
             Error::DocMdpForbids(_) => ErrorCode::DocMdpForbids,
+            Error::TimestampInvalid(_) => ErrorCode::TimestampInvalid,
         }
     }
 }
@@ -108,6 +115,19 @@ pub(crate) const STAGE_1: &str = "M3 stage 1";
 #[allow(dead_code)] // Kept for the PDF-side stubs of later stages.
 pub(crate) fn not_yet<T>() -> Result<T> {
     Err(Error::Unsupported(STAGE_1.to_owned()))
+}
+
+/// The error of an M4 stage-0 stub whose body is filled in M4 stage `stage` (M4 brief §2,
+/// WP4.0): `Error::Unsupported("M4 stage N")`.
+#[allow(dead_code)] // No stub is left once M4 stage 3 is built; kept like the M3 helpers.
+pub(crate) fn m4_stage_error(stage: u8) -> Error {
+    Error::Unsupported(format!("M4 stage {stage}"))
+}
+
+/// `Err(Error::Unsupported("M4 stage N"))`: the body of every fallible M4 stage-0 stub.
+#[allow(dead_code)] // No stub is left once M4 stage 3 is built; kept like the M3 helpers.
+pub(crate) fn m4_stage<T>(stage: u8) -> Result<T> {
+    Err(m4_stage_error(stage))
 }
 
 #[cfg(test)]
@@ -141,6 +161,10 @@ mod tests {
                 ErrorCode::SignatureInvalid,
             ),
             (Error::DocMdpForbids("x".into()), ErrorCode::DocMdpForbids),
+            (
+                Error::TimestampInvalid("x".into()),
+                ErrorCode::TimestampInvalid,
+            ),
         ];
         for (err, code) in cases {
             assert_eq!(err.code(), code, "{err:?}");
@@ -181,5 +205,18 @@ mod tests {
         let err = not_yet::<()>().unwrap_err();
         assert_eq!(err.code(), ErrorCode::Unsupported);
         assert_eq!(err.to_string(), "unsupported: M3 stage 1");
+    }
+
+    #[test]
+    fn m4_stage_stubs_are_unsupported_and_name_the_stage() {
+        let err = m4_stage::<()>(2).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unsupported);
+        assert_eq!(err.to_string(), "unsupported: M4 stage 2");
+        let err = Error::TimestampInvalid("TSA request failed: timeout".into());
+        assert_eq!(err.code(), ErrorCode::TimestampInvalid);
+        assert_eq!(
+            err.to_string(),
+            "timestamp invalid: TSA request failed: timeout"
+        );
     }
 }

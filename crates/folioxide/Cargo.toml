@@ -52,6 +52,10 @@ folioxide-render = { workspace = true, optional = true }
 [dev-dependencies]
 # The `serde` test checks the DTOs implement the traits (run with `--features serde`).
 serde.workspace = true
+# The M4 DTOs' JSON shape (the Node binding mirrors it).
+serde_json.workspace = true
+# The mock TSA and the test PDFs of the M4 examples and integration tests.
+folioxide-testkit.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

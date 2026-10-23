@@ -4,10 +4,13 @@
 Usage, from anywhere, with the oracle venv (bash tools/setup-venv.sh) and OpenSSL 3.x:
 
     .venv/bin/python -I tools/fixtures/sign.py                 write fixtures/sign/*
-    .venv/bin/python -I tools/fixtures/sign.py --only chain    write one group (cms, chain, pdf)
+    .venv/bin/python -I tools/fixtures/sign.py --only chain    write one group (cms, chain, pdf, tsa)
+    .venv/bin/python -I tools/fixtures/sign.py --only pdf --pdf NAME
+                                                               write only these PDFs (repeatable)
     .venv/bin/python -I tools/fixtures/sign.py --check         verify the committed files
 
-Three groups of foreign inputs for folioxide-sign's tests (M3 brief §6.2, WP3.1B and WP3.2B):
+Four groups of foreign inputs for folioxide-sign's tests (M3 brief §6.2, WP3.1B and WP3.2B; M4
+brief WP4.1B):
 
 * cms: detached CMS SignedData made by OpenSSL and by pyHanko over `data.bin`, with every
   feature the parser and the verifier must handle (BER indefinite lengths, RSA-PSS, SHA-1, no
@@ -18,8 +21,17 @@ Three groups of foreign inputs for folioxide-sign's tests (M3 brief §6.2, WP3.1
   keyCertSign, end-entity issuer, SHA-1 and RSA-PSS certificate signatures, single key usages,
   self-signed signer, impostor root);
 * pdf: PDFs signed by pyHanko (RSA and ECDSA, one and two signatures, adbe.pkcs7.detached,
-  certifications with P=1 and P=2, a document timestamp, an empty signature field) and PDFs
-  whose CMS `openssl cms -sign` made, for verification interop.
+  certifications with P=1 and P=2, a document timestamp, an empty signature field; M4: a PAdES
+  B-T signature, a P=1 certification followed by a document timestamp, a P=2 certification
+  followed by an approval in a new visible field) and PDFs whose CMS `openssl cms -sign` made,
+  for verification interop;
+* tsa (M4 brief §6.2 "Interoperability"): the RFC 3161 request Folioxide makes for the
+  deterministic RSA-2048 signature of `minimal.pdf` (written by the Rust test
+  `bt_external_openssl_token_embedded` with FOLIOXIDE_TSA_REQUEST_OUT set; nonce
+  0x0102030405060708), answered by `openssl ts -reply` with tools/tsa/openssl-tsa.cnf
+  (`openssl-reply.{tsq,tsr}`) and by pyHanko's DummyTimeStamper (`pyhanko-dummy.{tsq,tsr}`: ESS
+  v1, a fractional genTime). It needs `cargo`. The request goes stale whenever the signed bytes
+  of `minimal.pdf` change (brief R-15): the Rust test then fails and names this command.
 
 Every key here is a published **test-only** key.
 
@@ -341,6 +353,16 @@ PDFS = {
                                  {"signer": "signer-rsa2048", "field": "Signature1", "p": 2}),
     "pyhanko-doc-timestamp.pdf": ("pyhanko-p256.pdf", "timestamp", {"field": "DocTimeStamp1"}),
     "pyhanko-empty-field.pdf": ("minimal", "empty-field", {"field": "Approval"}),
+    # M4: PAdES B-T with the in-process TSA (ESS v1, fractional genTime).
+    "pyhanko-bt-rsa2048.pdf": ("minimal", "pyhanko",
+                               {"signer": "signer-rsa2048", "field": "Signature1", "timestamp": True}),
+    # M4 (fixtures for the `certify` suite, brief §6.3): P=1 then a document timestamp
+    # (ltaUpdates, docmdpOk true), and P=2 then an approval in a new visible field (other,
+    # docmdpOk false: pyHanko's valid_when_certifying=False).
+    "pyhanko-certified-p1-dts.pdf": ("pyhanko-certified-p1.pdf", "timestamp", {"field": "DocTimeStamp1"}),
+    "pyhanko-certified-p2-visible-approval.pdf": ("pyhanko-certified-p2.pdf", "pyhanko",
+                                                  {"signer": "signer-p256", "field": "Signature2",
+                                                   "box": (300, 100, 500, 160)}),
     "openssl-rsa2048.pdf": ("minimal", "openssl",
                             {"signer": "signer-rsa2048", "field": "Signature1", "md": "sha256", "cades": False}),
     "openssl-p256-cades.pdf": ("minimal", "openssl",
@@ -373,6 +395,19 @@ PDF_EXPECTED = {
          "coverage": "entireFile", "pades": False},
     ],
     "pyhanko-empty-field.pdf": [],
+    "pyhanko-bt-rsa2048.pdf": [dict(_GOOD, field="Signature1", coverage="entireFile", modification="none",
+                                    pades="B-T", timestamp=True)],
+    "pyhanko-certified-p1-dts.pdf": [
+        dict(_GOOD, field="Signature1", coverage="entireRevision", modification="ltaUpdates", pades="B-B",
+             docmdp=1, docmdpOk=True),
+        {"field": "DocTimeStamp1", "intact": True, "valid": True, "trusted": True,
+         "coverage": "entireFile", "pades": False},
+    ],
+    "pyhanko-certified-p2-visible-approval.pdf": [
+        dict(_GOOD, field="Signature1", coverage="entireRevision", modification="other", pades="B-B",
+             docmdp=2, docmdpOk=False),
+        dict(_GOOD, field="Signature2", coverage="entireFile", modification="none", pades="B-B"),
+    ],
     "openssl-rsa2048.pdf": [dict(_GOOD, field="Signature1", coverage="entireFile", modification="none",
                                  pades=False)],
     "openssl-p256-cades.pdf": [dict(_GOOD, field="Signature1", coverage="entireFile", modification="none",
@@ -384,6 +419,10 @@ PDF_EXPECTED = {
 
 #: The base document of every PDF fixture (committed, deterministic: `cargo xtask fixtures`).
 MINIMAL = REPO_ROOT / "fixtures" / "syntax" / "minimal.pdf"
+
+#: The TSA fixtures (fixtures/sign/tsa): the request Folioxide writes, answered by two TSAs.
+TSA_DIR = "tsa"
+TSA_NONCE = 0x0102030405060708
 
 
 def _pyhanko_signer(name: str):
@@ -434,7 +473,12 @@ def _sign_pdf(data: bytes, how: str, details: dict, work: Path) -> bytes:
         meta = signers.PdfSignatureMetadata(field_name=field, subfilter=subfilter, certify=True,
                                             docmdp_permissions=fields.MDPPerm(details["p"]))
     if how in ("pyhanko", "certify"):
-        return signers.sign_pdf(writer, meta, signer=_pyhanko_signer(details["signer"])).getvalue()
+        timestamper = _dummy_tsa() if details.get("timestamp") else None
+        new_field = None
+        if "box" in details:
+            new_field = fields.SigFieldSpec(sig_field_name=field, box=details["box"])
+        return signers.sign_pdf(writer, meta, signer=_pyhanko_signer(details["signer"]),
+                                timestamper=timestamper, new_field_spec=new_field).getvalue()
     if how == "openssl":
         return asyncio.run(_openssl_signed_pdf(writer, meta, details, work))
     raise ValueError(how)
@@ -469,16 +513,87 @@ async def _openssl_signed_pdf(writer, meta, details: dict, work: Path) -> bytes:
     return output.getvalue()
 
 
-def write_pdfs(out: Path, work: Path) -> None:
-    """The signed PDFs (PDFS), in order: later entries may build on earlier ones."""
+def write_pdfs(out: Path, work: Path, only: tuple[str, ...] = ()) -> None:
+    """The signed PDFs (PDFS), in order: later entries may build on earlier ones. With `only`,
+    just those PDFs are written, on top of the committed bases."""
     import logging
 
     logging.disable(logging.WARNING)
     pdf_out = out / PDF_DIR
     pdf_out.mkdir()
+    unknown = sorted(set(only) - set(PDFS))
+    if unknown:
+        raise ValueError(f"unknown PDF fixture(s) {unknown}")
     for name, (base, how, details) in PDFS.items():
-        data = MINIMAL.read_bytes() if base == "minimal" else (pdf_out / base).read_bytes()
+        if only and name not in only:
+            continue
+        if base == "minimal":
+            data = MINIMAL.read_bytes()
+        elif (pdf_out / base).is_file():
+            data = (pdf_out / base).read_bytes()
+        else:
+            data = (OUT_DIR / PDF_DIR / base).read_bytes()
         (pdf_out / name).write_bytes(_sign_pdf(data, how, details, work))
+
+
+def write_tsa(out: Path, work: Path) -> None:
+    """The TSA fixtures: Folioxide's request (from the Rust test), answered by `openssl ts
+    -reply` and by pyHanko's DummyTimeStamper."""
+    import os
+
+    tsa_out = out / TSA_DIR
+    tsa_out.mkdir()
+    request = work / "request.tsq"
+    env = dict(os.environ, FOLIOXIDE_TSA_REQUEST_OUT=str(request))
+    run(["cargo", "test", "-p", "folioxide-sign", "--test", "bt_sign", "--",
+         "--exact", "bt_external_openssl_token_embedded"], cwd=REPO_ROOT, env=env)
+    if not request.is_file():
+        raise RuntimeError("the Rust test did not write the request")
+    serial_dir = work / "openssl-tsa"
+    serial_dir.mkdir()
+    (serial_dir / "tsaserial").write_text("01\n", encoding="ascii")
+    env = dict(os.environ, FOLIOXIDE_TSA_DIR=str(serial_dir))
+    run(["openssl", "ts", "-reply", "-config", "tools/tsa/openssl-tsa.cnf", "-queryfile", str(request),
+         "-out", str(tsa_out / "openssl-reply.tsr")], cwd=REPO_ROOT, env=env)
+    shutil.copyfile(request, tsa_out / "openssl-reply.tsq")
+    shutil.copyfile(request, tsa_out / "pyhanko-dummy.tsq")
+    from asn1crypto import tsp
+
+    req = tsp.TimeStampReq.load(request.read_bytes())
+    resp = asyncio.run(_dummy_tsa().async_request_tsa_response(req))
+    (tsa_out / "pyhanko-dummy.tsr").write_bytes(resp.dump())
+
+
+def check_tsa(expect) -> None:
+    """The TSA fixtures: Folioxide's request shape, and each reply verifies with `openssl ts
+    -verify -queryfile` against the TSA root."""
+    from asn1crypto import tsp
+
+    for stem in ("openssl-reply", "pyhanko-dummy"):
+        tsq = OUT_DIR / TSA_DIR / f"{stem}.tsq"
+        tsr = OUT_DIR / TSA_DIR / f"{stem}.tsr"
+        if not (tsq.is_file() and tsr.is_file()):
+            expect(False, f"{TSA_DIR}/{stem}.tsq or .tsr is missing")
+            continue
+        req = tsp.TimeStampReq.load(tsq.read_bytes())
+        expect(req["nonce"].native == TSA_NONCE and req["cert_req"].native is True
+               and req["message_imprint"]["hash_algorithm"]["algorithm"].native == "sha256",
+               f"{stem}.tsq is not Folioxide's SHA-256 request with nonce {TSA_NONCE:#x}")
+        result = subprocess.run(
+            ["openssl", "ts", "-verify", "-queryfile", str(tsq), "-in", str(tsr),
+             "-CAfile", str(PKI / "tsa-root.pem")],
+            capture_output=True, text=True, check=False)
+        expect("Verification: OK" in result.stdout + result.stderr,
+               f"openssl ts -verify {stem}: {(result.stdout + result.stderr).strip()}")
+        resp = tsp.TimeStampResp.load(tsr.read_bytes())
+        expect(resp["status"]["status"].native == "granted", f"{stem}.tsr is not granted")
+    dummy = tsp.TimeStampResp.load((OUT_DIR / TSA_DIR / "pyhanko-dummy.tsr").read_bytes())
+    signed = dummy["time_stamp_token"]["content"]
+    attrs = {a["type"].native for a in signed["signer_infos"][0]["signed_attrs"]}
+    expect("signing_certificate" in attrs and "signing_certificate_v2" not in attrs,
+           "pyhanko-dummy.tsr does not carry ESS signing-certificate v1 only")
+    gen_time = signed["encap_content_info"]["content"].parsed["gen_time"]
+    expect(b"." in gen_time.contents, "pyhanko-dummy.tsr genTime has no fraction")
 
 
 def check_pdfs(expect) -> None:
@@ -610,10 +725,10 @@ async def write_pyhanko_cms(out: Path) -> None:
 
 
 #: The groups of files `generate` can write; `--only` picks some of them.
-GROUPS = ("cms", "chain", "pdf")
+GROUPS = ("cms", "chain", "pdf", "tsa")
 
 
-def generate(groups: tuple[str, ...] = GROUPS) -> int:
+def generate(groups: tuple[str, ...] = GROUPS, pdfs: tuple[str, ...] = ()) -> int:
     """Writes the files of `groups` (the CMS vectors and key files, the chain certificates, the
     signed PDFs), then checks everything."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -629,7 +744,9 @@ def generate(groups: tuple[str, ...] = GROUPS) -> int:
         if "chain" in groups:
             write_chain(out, work)
         if "pdf" in groups:
-            write_pdfs(out, work)
+            write_pdfs(out, work, pdfs)
+        if "tsa" in groups:
+            write_tsa(out, work)
         written = 0
         for f in sorted(out.rglob("*")):
             if f.is_file():
@@ -838,6 +955,7 @@ def check() -> int:
 
     check_chain(expect)
     check_pdfs(expect)
+    check_tsa(expect)
 
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
@@ -853,6 +971,8 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="verify the committed files")
     parser.add_argument("--only", action="append", choices=GROUPS,
                         help="regenerate only this group (repeatable); the others stay as committed")
+    parser.add_argument("--pdf", action="append", default=[], metavar="NAME",
+                        help="with the pdf group, regenerate only this PDF (repeatable)")
     args = parser.parse_args()
     if shutil.which("openssl") is None:
         print("sign.py: openssl not found", file=sys.stderr)
@@ -862,7 +982,7 @@ def main() -> int:
     except ImportError:
         print("sign.py: pyHanko is missing; run bash tools/setup-venv.sh", file=sys.stderr)
         return 2
-    return check() if args.check else generate(tuple(args.only or GROUPS))
+    return check() if args.check else generate(tuple(args.only or GROUPS), tuple(args.pdf))
 
 
 if __name__ == "__main__":

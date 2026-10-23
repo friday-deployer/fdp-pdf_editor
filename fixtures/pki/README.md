@@ -24,7 +24,8 @@ root.pem                Folioxide Test Root CA          RSA-3072, self-signed, s
 │   ├── signer-p384.pem                                 P-384     ┘
 │   ├── expired.pem     valid 2025-01-01 .. 2025-12-31 only (otherwise a normal signer, RSA-2048)
 │   └── wrong-ku.pem    keyUsage keyEncipherment + dataEncipherment only (RSA-2048)
-└── tsa.pem             Folioxide Test TSA              RSA-2048, EKU timeStamping (critical)
+├── tsa.pem             Folioxide Test TSA              RSA-2048, EKU timeStamping (critical)
+└── tsa-*.pem           TSA certificate variants for the same tsa.key.pem (see below)
 ```
 
 - Subjects are `O=Folioxide Test PKI, OU=TEST ONLY - DO NOT TRUST, CN=<name above>`.
@@ -49,6 +50,11 @@ root.pem                Folioxide Test Root CA          RSA-3072, self-signed, s
 | `tsa-root.pem` | trust anchor for timestamp tokens: a **byte-identical copy** of `root.pem` (a copy rather than a symlink, so Windows checkouts work) |
 | `expired.pem`, `expired.key.pem` | negative case: validity entirely in the past |
 | `wrong-ku.pem`, `wrong-ku.key.pem` | negative case: no digitalSignature or nonRepudiation |
+| `tsa-eku-noncritical.pem` | TSA variant: EKU timeStamping, **not critical** (RFC 3161 §2.3 requires critical) |
+| `tsa-no-eku.pem` | TSA variant: **no** extended key usage |
+| `tsa-eku-extra.pem` | TSA variant: EKU timeStamping **and codeSigning** (critical) |
+| `tsa-ku-keyenc.pem` | TSA variant: key usage digitalSignature **+ keyEncipherment** |
+| `tsa-not-yet-valid.pem` | TSA variant: the normal TSA extensions, valid only from **2070-01-01** to 2075-12-31 |
 | `signer-rsa2048-modern.p12` | OpenSSL 3 defaults: PBES2/PBKDF2/AES-256-CBC for key and certificates, SHA-256 MAC |
 | `signer-rsa2048-3des.p12` | `PBE-SHA1-3DES` for key and certificates, SHA-1 MAC |
 | `signer-rsa2048-rc2-40.p12` | `openssl pkcs12 -legacy`: certificates `PBE-SHA1-RC2-40`, key `PBE-SHA1-3DES`, SHA-1 MAC |
@@ -68,3 +74,14 @@ openssl pkcs12 -info -noout -passin pass:folioxide -in signer-p256-modern.p12
 
 `tools/tsa/openssl-tsa.cnf` configures `openssl ts -reply` to issue RFC 3161 tokens with
 `tsa.pem` (with signing-certificate-v2). See the comment at the top of that file.
+
+## TSA certificate variants (`--tsa-variants`)
+
+`bash tools/gen-pki.sh --tsa-variants` issues the five `tsa-*.pem` variants above from the
+committed `root.pem` / `root.key.pem` for the committed `tsa.key.pem`, and leaves every other file
+unchanged (M4 brief D-21). Each breaks one rule of OpenSSL's `check_purpose_timestamp_sign`
+(DECISIONS D13 D-4), so `openssl ts -reply` refuses to issue tokens with them; the tests make
+their tokens with `folioxide_testkit::tsa::MockTsa` and `tsa.key.pem`. `--check` verifies that
+each variant has the TSA's key, chains to the root, and fails
+`openssl verify -purpose timestampsign` for its own reason (`unsuitable certificate purpose`, or
+`not yet valid` for `tsa-not-yet-valid.pem`). A full regeneration issues them too.

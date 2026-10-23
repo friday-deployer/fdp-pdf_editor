@@ -12,15 +12,18 @@ import {
   version,
 } from 'folioxide'
 import type {
+  AppearanceFont,
   CertificateInfo,
   Coverage,
   Diagnostic,
   DiagnosticKind,
   DigestAlg,
   DocInfo,
+  DocMdpLevel,
   ErrorCode,
   ExternalSigner,
   FieldMode,
+  ImagePosition,
   IncrementalSaveOptions,
   InfoUpdate,
   KeyDescription,
@@ -37,12 +40,16 @@ import type {
   SaveOptions,
   SigAlg,
   SignPdfOptions,
+  SignatureAppearanceOptions,
   SignatureFieldSpec,
   SignatureKind,
   SignatureProblem,
   SignatureReport,
   StreamCompression,
   SubFilter,
+  TimestampCallback,
+  TimestampInfo,
+  TimestampRequestOptions,
   Trapped,
   VerifyOptions,
   XrefStyle,
@@ -357,6 +364,8 @@ const reportShape: Equal<
     location: string | null
     contactInfo: string | null
     padesLevel: PadesLevel | null
+    timestamp: TimestampInfo | null
+    timestamps: TimestampInfo[]
     docmdp: number | null
     docmdpOk: boolean | null
     problems: SignatureProblem[]
@@ -383,7 +392,7 @@ const certificateShape: Equal<
 const coverages: Equal<Coverage, 'entireFile' | 'entireRevision' | 'contiguousBlockFromStart' | 'unclear'> = true
 const modifications: Equal<ModificationLevel, 'none' | 'ltaUpdates' | 'formFilling' | 'annotations' | 'other'> = true
 const kinds: Equal<SignatureKind, 'signature' | 'docTimeStamp'> = true
-const padesLevels: Equal<PadesLevel, 'B-B'> = true
+const padesLevels: Equal<PadesLevel, 'B-B' | 'B-T'> = true
 const problemCode: ProblemCode = 'digestMismatch'
 const reportProblemCode: ProblemCode | undefined = report.problems[0]?.code
 const subjectText: string | undefined = report.signer?.subject
@@ -393,6 +402,105 @@ const notAProblem: ProblemCode = 'somethingWrong'
 const notACoverage: Coverage = 'entire'
 // @ts-expect-error trust anchors are bytes
 opened.verifySignatures({ trustAnchors: ['root.pem'] })
+
+// ---- M4: timestamps (B-T), certification, visible signatures ------------------------------------
+
+const timestampShape: Equal<
+  TimestampInfo,
+  {
+    genTime: string
+    tsa: CertificateInfo | null
+    tsaName: string | null
+    policy: string | null
+    serialHex: string | null
+    accuracyMicros: number | null
+    ordering: boolean
+    imprintAlgorithm: string | null
+    signatureAlgorithm: string | null
+    intact: boolean
+    valid: boolean
+    trusted: boolean | null
+    problems: SignatureProblem[]
+    warnings: string[]
+  }
+> = true
+const reportTimestamp: TimestampInfo | null = report.timestamp
+const genTime: string | undefined = report.timestamps[0]?.genTime
+const timestampTrusted: boolean | null | undefined = report.timestamp?.trusted
+// The new problem codes.
+const timestampCodes: ProblemCode[] = [
+  'timestampMalformed',
+  'timestampImprintMismatch',
+  'timestampSignatureInvalid',
+  'timestampEssMismatch',
+  'tsaCertificateUnsuitable',
+  'tsaCertificateNotValidAtGenTime',
+  'tsaNameMismatch',
+  'docMdpInvalid',
+  'certificationNotFirst',
+  'sigDictAmbiguous',
+]
+const timestampCode: ErrorCode = 'E_TIMESTAMP_INVALID'
+const docMdpCode: ErrorCode = 'E_DOC_MDP_FORBIDS'
+
+const docMdpLevels: Equal<DocMdpLevel, 1 | 2 | 3> = true
+const certifiedOptions: PrepareSignatureOptions = { ...minimalPrepareOptions, certify: 2, tsaReserve: 8192 }
+// @ts-expect-error P is 1, 2 or 3
+opened.prepareSignature({ ...minimalPrepareOptions, certify: 4 })
+
+const appearanceFonts: Equal<AppearanceFont, 'Helvetica' | 'Helvetica-Bold'> = true
+const imagePositions: Equal<ImagePosition, 'left' | 'background'> = true
+const appearance: SignatureAppearanceOptions = {
+  rect: [360, 40, 560, 100],
+  lines: ['Approved', 'Folioxide'],
+  font: 'Helvetica-Bold',
+  fontSize: 9,
+  image: buffer,
+  imagePosition: 'background',
+  borderWidth: 1,
+}
+const appearanceRect: SignatureAppearanceOptions = { rect: { llx: 0, lly: 0, urx: 100, ury: 50 } }
+const existingField: SignatureAppearanceOptions = {}
+const visibleOptions: PrepareSignatureOptions = { ...minimalPrepareOptions, appearance }
+const visiblePrepared: PreparedSignature = opened.prepareSignature(visibleOptions)
+// @ts-expect-error a rectangle has four numbers
+const threeNumbers: SignatureAppearanceOptions = { rect: [0, 0, 100] }
+// @ts-expect-error only the standard-14 Helvetica fonts
+const timesFont: SignatureAppearanceOptions = { font: 'Times-Roman' }
+// @ts-expect-error the image goes left or in the background
+const rightImage: SignatureAppearanceOptions = { imagePosition: 'right' }
+// @ts-expect-error the image is bytes
+const imagePath: SignatureAppearanceOptions = { image: 'logo.jpg' }
+
+const timestampOptions: TimestampRequestOptions = { digest: 'sha384', policy: '1.2.3.4.1', nonce: 42n }
+const timestampRequest: Buffer = prepared.timestampRequest(bytes)
+const timestampRequestWithOptions: Buffer = prepared.timestampRequest(buffer, timestampOptions)
+const finishedBT: Buffer = prepared.finish(bytes, buffer)
+const finishedBTExplicit: Buffer = prepared.finish(bytes, buffer, timestampRequest)
+const finishedBTAsync: Promise<Buffer> = prepared.finishAsync(bytes, buffer, bytes)
+const discarded: void = prepared.discardTimestampRequest()
+// @ts-expect-error the nonce is a bigint
+prepared.timestampRequest(bytes, { nonce: 'random' })
+// @ts-expect-error SHA-1 is not used for imprints
+prepared.timestampRequest(bytes, { digest: 'sha1' })
+
+const syncTsa: TimestampCallback = (request: Buffer) => request
+const asyncTsa: TimestampCallback = async (request) => new Uint8Array(request.length)
+const webTsa: TimestampCallback = (request) => Promise.resolve(new ArrayBuffer(request.length))
+const signedBT: Promise<Buffer> = signPdf(opened, {
+  signer: p12Signer,
+  timestamp: asyncTsa,
+  timestampOptions: { nonce: 7n },
+  tsaReserve: 16384,
+  certify: 2,
+  appearance: { rect: [360, 40, 560, 100] },
+})
+// @ts-expect-error a TSA returns bytes
+signPdf(opened, { signer: p12Signer, timestamp: () => 'response' })
+// @ts-expect-error the timestamp is a callback, not a URL
+signPdf(opened, { signer: p12Signer, timestamp: 'https://tsa.example.com/' })
+
+const verifyTsaAnchors: VerifyOptions = { trustAnchors: [bytes], timestampTrustAnchors: [buffer] }
 
 // ---- the generated binding agrees with the facade ----------------------------------------------
 
@@ -428,7 +536,23 @@ const bindingFieldSpec: Equal<binding.SignatureFieldSpec, SignatureFieldSpec> = 
 const bindingReportFields: Equal<Omit<binding.SignatureReport, 'problems'>, Omit<SignatureReport, 'problems'>> = true
 const bindingReport: binding.SignatureReport = report
 const bindingProblem: binding.SignatureProblem = {} as SignatureProblem
-const bindingPrepare: binding.PrepareSignatureOptions = { ...prepareOptions, signingTime: 'D:20261010120000Z' }
+// M4: the report, its problems and its timestamps are exactly the facade's types.
+const bindingReportEqual: Equal<binding.SignatureReport, SignatureReport> = true
+const bindingProblemEqual: Equal<binding.SignatureProblem, SignatureProblem> = true
+const bindingProblemCode: Equal<binding.ProblemCode, ProblemCode> = true
+const bindingTimestamp: Equal<binding.TimestampInfo, TimestampInfo> = true
+const bindingTimestampOptions: Equal<binding.TimestampRequestOptions, TimestampRequestOptions> = true
+const bindingAppearanceFont: Equal<binding.AppearanceFont, AppearanceFont> = true
+const bindingImagePosition: Equal<binding.ImagePosition, ImagePosition> = true
+// The facade takes a rectangle as a tuple too; the native addon takes a Rect.
+const bindingAppearance: binding.SignatureAppearanceOptions = { ...appearance, rect: { llx: 360, lly: 40, urx: 560, ury: 100 } }
+const bindingCertified: binding.PrepareSignatureOptions = { ...certifiedOptions, appearance: undefined, signingTime: 'D:2026' }
+// (The facade converts a tuple `appearance.rect` to a Rect; `bindingAppearance` checks the rest.)
+const bindingPrepare: binding.PrepareSignatureOptions = {
+  ...prepareOptions,
+  appearance: undefined,
+  signingTime: 'D:20261010120000Z',
+}
 const bindingVerify: binding.VerifyOptions = { ...verifyOptions, validationTime: 'D:20261010120000Z' }
 const bindingSignerChain: Equal<binding.LocalSigner['certificateChain'], LocalSigner['certificateChain']> = true
 const bindingSignerClose: Equal<binding.LocalSigner['close'], LocalSigner['close']> = true
@@ -436,6 +560,41 @@ const bindingSignerClosed: Equal<binding.LocalSigner['isClosed'], LocalSigner['i
 const bindingPreparedDigest: Equal<binding.PreparedSignature['toBeSignedDigest'], PreparedSignature['toBeSignedDigest']> = true
 
 export {
+  appearanceFonts,
+  appearanceRect,
+  bindingAppearance,
+  bindingAppearanceFont,
+  bindingCertified,
+  bindingImagePosition,
+  bindingProblemCode,
+  bindingProblemEqual,
+  bindingReportEqual,
+  bindingTimestamp,
+  bindingTimestampOptions,
+  docMdpCode,
+  docMdpLevels,
+  existingField,
+  finishedBT,
+  finishedBTAsync,
+  finishedBTExplicit,
+  genTime,
+  imagePath,
+  imagePositions,
+  reportTimestamp,
+  rightImage,
+  signedBT,
+  syncTsa,
+  threeNumbers,
+  timesFont,
+  timestampCode,
+  timestampCodes,
+  timestampRequestWithOptions,
+  discarded,
+  timestampShape,
+  timestampTrusted,
+  verifyTsaAnchors,
+  visiblePrepared,
+  webTsa,
   bindingCertificate,
   bindingCoverage,
   bindingDigestAlg,
